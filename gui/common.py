@@ -10,9 +10,15 @@ import os
 import sys
 from pathlib import Path
 
+# PROJECT_DIR: external data (rawdata/, derivatives/, subject MRIs) — NOT
+# part of this repo, set via env var per machine/user.
 fallback_manual_dir = "D:/MINDS_Project_Karim/BIDS_TI_Toolbox"
 PROJECT_DIR = os.environ.get("BIDS_TI_PROJECT_DIR", fallback_manual_dir)
 
+# RESOURCES_DIR: generic, non-personalized shared resources (atlases, common
+# cap layouts) that DO live inside this repo (code/resources/) — resolved
+# relative to this file, not PROJECT_DIR, since they travel with the code.
+RESOURCES_DIR = str(Path(__file__).resolve().parent.parent / "resources")
 
 _PIPELINE_DIR = str(Path(__file__).resolve().parent.parent / "pipeline")
 if _PIPELINE_DIR not in sys.path:

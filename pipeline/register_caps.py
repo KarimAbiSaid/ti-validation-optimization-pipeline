@@ -11,12 +11,12 @@ Must run inside the SimNIBS Apptainer container (uses simnibs Python API).
 Usage:
     python register_caps.py [--cap PATH] [subject_ids ...]
 
-    --cap PATH   MNI-space cap CSV (default: configs/caps/BioSemi32_MNE.csv)
+    --cap PATH   MNI-space cap CSV (default: ../resources/caps/BioSemi32_MNE.csv)
     subject_ids  Optional subject filter (default: all subjects in SUBJECTS)
 
 Example (inside container):
     python /mnt/BIDS_TI_Toolbox/code/pipeline/register_caps.py \\
-        --cap /mnt/BIDS_TI_Toolbox/code/pipeline/configs/caps/BioSemi32_MNE.csv \\
+        --cap /mnt/BIDS_TI_Toolbox/code/resources/caps/BioSemi32_MNE.csv \\
         002 012 035
 """
 
@@ -31,7 +31,7 @@ SUBJECTS = ["025", "41Y01", "002", "012", "035", "055", "066", "077", "086", "09
             "73T06", "73T07", "73T09", "73T10", "73T11", "73T12", "73T14"]
 # SCITAS default — override with --project-dir for local Windows runs
 PROJECT  = Path("/mnt/BIDS_TI_Toolbox")
-DEFAULT_CAP = PROJECT / "code/pipeline/configs/caps/BioSemi32_MNE.csv"
+DEFAULT_CAP = PROJECT / "code/resources/caps/BioSemi32_MNE.csv"
 
 
 def read_cap_csv(path):
@@ -97,7 +97,7 @@ def main():
                    help="Project root (default: /mnt/BIDS_TI_Toolbox). "
                         "Use D:/MINDS_Project_Karim/BIDS_TI_Toolbox for local Windows runs.")
     p.add_argument("--cap", default=None,
-                   help="MNI-space cap CSV to register (default: <project-dir>/code/pipeline/configs/caps/BioSemi32_MNE.csv)")
+                   help="MNI-space cap CSV to register (default: <project-dir>/code/resources/caps/BioSemi32_MNE.csv)")
     p.add_argument("subjects", nargs="*", help="Subject IDs (default: all)")
     args = p.parse_args()
 
@@ -105,7 +105,7 @@ def main():
     if args.project_dir:
         PROJECT = Path(args.project_dir)
 
-    cap_csv = args.cap or str(PROJECT / "code/pipeline/configs/caps/BioSemi32_MNE.csv")
+    cap_csv = args.cap or str(PROJECT / "code/resources/caps/BioSemi32_MNE.csv")
     subjects = args.subjects if args.subjects else SUBJECTS
 
     print(f"Registering cap: {cap_csv}")

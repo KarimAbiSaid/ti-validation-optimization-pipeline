@@ -22,8 +22,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 CAP_DEFAULT = os.path.join(
-    os.path.dirname(__file__),
-    "configs", "caps", "BioSemi32_MNE.csv"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "resources", "caps", "BioSemi32_MNE.csv"
 )
 
 def parse_args():

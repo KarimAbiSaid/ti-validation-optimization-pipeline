@@ -4,13 +4,13 @@ generate_biosemi32_cap.py
 
 Extracts BioSemi32 electrode positions from SimNIBS's built-in
 EEG10-10_UI_Jurak_2007 cap (MNI152 mm space) and writes them to
-configs/caps/BioSemi32_MNE.csv in SimNIBS cap format.
+../resources/caps/BioSemi32_MNE.csv in SimNIBS cap format.
 
 Usage (local, SimNIBS installed):
     python generate_biosemi32_cap.py
 
 Output:
-    configs/caps/BioSemi32_MNE.csv
+    ../resources/caps/BioSemi32_MNE.csv
 
 Coordinate system
 -----------------
@@ -63,7 +63,7 @@ print(f"Source: {jurak_csv.name}  ({len(mni_positions)} electrodes total)")
 # ---------------------------------------------------------------------------
 # Write output CSV
 # ---------------------------------------------------------------------------
-out_path = Path(__file__).parent / "configs" / "caps" / "BioSemi32_MNE.csv"
+out_path = Path(__file__).resolve().parent.parent / "resources" / "caps" / "BioSemi32_MNE.csv"
 out_path.parent.mkdir(parents=True, exist_ok=True)
 
 with open(out_path, "w", newline="") as f:

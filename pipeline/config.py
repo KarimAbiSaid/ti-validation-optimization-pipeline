@@ -172,7 +172,7 @@ class PipelineConfig:
 
     # Path to BN_Atlas_246_1mm.nii.gz (MNI space).
     # Required when any roi / non_roi / extra_rois uses bna_labels.
-    # Can be set to the project copy: "/mnt/BIDS_TI_Toolbox/BN_Atlas_246_1mm.nii.gz"
+    # Can be set to the repo copy: "/mnt/BIDS_TI_Toolbox/code/resources/atlases/BN_Atlas_246_1mm.nii.gz"
     bna_atlas_path: Optional[str] = None
 
     # ── Derived paths (read-only properties) ──────────────────────────────────

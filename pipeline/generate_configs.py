@@ -133,8 +133,10 @@ GOALS = ["mean", "focality"]
 #   4. No recon-all needed — skip straight from charm to optimization.
 # ==============================================================================
 
-# Path to the BNA atlas inside the container.
-BNA_ATLAS_PATH = "/mnt/BIDS_TI_Toolbox/BN_Atlas_246_1mm.nii.gz"
+# Path to the BNA atlas inside the container — lives in the repo itself
+# (code/resources/atlases/), not the external project-data mount, since it's
+# a generic/non-personalized resource that ships with the code.
+BNA_ATLAS_PATH = "/mnt/BIDS_TI_Toolbox/code/resources/atlases/BN_Atlas_246_1mm.nii.gz"
 
 # BNA label reference (all from BNA_subregions.xlsx):
 #   Odd label = left hemisphere, even = right hemisphere for each structure pair.
@@ -243,7 +245,9 @@ BNA_NON_ROI = {
 CAPS = {
     # BioSemi32 is the only supported cap. register_caps.py must be run first
     # to produce per-subject registered CSVs in m2m_{id}/eeg_positions/.
-    "biosemi32": "/mnt/BIDS_TI_Toolbox/code/pipeline/configs/caps/BioSemi32_MNE.csv",
+    # Source MNI-space CSV lives in the repo (code/resources/caps/), not the
+    # external project-data mount — it's a generic, non-personalized layout.
+    "biosemi32": "/mnt/BIDS_TI_Toolbox/code/resources/caps/BioSemi32_MNE.csv",
 }
 ACTIVE_CAP = "biosemi32"
 

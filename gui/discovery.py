@@ -12,7 +12,7 @@ import json
 import os
 import re
 
-from common import PROJECT_DIR, get_m2m_path, discover_subjects, nifti_shape  # noqa: F401 (re-exported)
+from common import PROJECT_DIR, RESOURCES_DIR, get_m2m_path, discover_subjects, nifti_shape  # noqa: F401 (re-exported)
 
 # Matches all three filename patterns create_masks.py's create_roi/
 # create_non_roi/create_general_mask produce:
@@ -42,7 +42,7 @@ ATLAS_REGISTRY = {
         "note": "Brainnetome atlas, MNI FSL152 space. No name lut in this project — numeric ids only.",
         "has_lut": False,
         "extra_paths": {
-            "atlas_path": os.path.join(PROJECT_DIR, "BN_Atlas_246_1mm.nii.gz"),
+            "atlas_path": os.path.join(RESOURCES_DIR, "atlases", "BN_Atlas_246_1mm.nii.gz"),
         },
     },
     "Allen": {
@@ -50,8 +50,8 @@ ATLAS_REGISTRY = {
         "note": "Allen Brain Atlas (Ding 2020), ICBM 2009b Nonlinear Symmetric space.",
         "has_lut": True,
         "extra_paths": {
-            "atlas_path": os.path.join(PROJECT_DIR, "Allen_atlas", "annotation_full.nii.gz"),
-            "roi_list_path": os.path.join(PROJECT_DIR, "Allen_atlas", "ROI_list_allen_atlas.csv"),
+            "atlas_path": os.path.join(RESOURCES_DIR, "atlases", "Allen_atlas", "annotation_full.nii.gz"),
+            "roi_list_path": os.path.join(RESOURCES_DIR, "atlases", "Allen_atlas", "ROI_list_allen_atlas.csv"),
         },
     },
     "FreeSurfer": {

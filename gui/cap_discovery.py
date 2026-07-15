@@ -17,17 +17,18 @@ import csv
 import os
 from pathlib import Path
 
-from common import PROJECT_DIR, get_m2m_path, discover_subjects  # noqa: F401 (re-exported)
+from common import PROJECT_DIR, RESOURCES_DIR, get_m2m_path, discover_subjects  # noqa: F401 (re-exported)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Cap listing
 # ═════════════════════════════════════════════════════════════════════════════
 
-def list_project_caps(project_dir: str = PROJECT_DIR) -> list[dict]:
-    """MNI-space cap CSVs living in code/pipeline/configs/caps/ (this
-    project's own, e.g. BioSemi32_MNE.csv)."""
-    caps_dir = os.path.join(project_dir, "code", "pipeline", "configs", "caps")
+def list_project_caps() -> list[dict]:
+    """MNI-space cap CSVs living in code/resources/caps/ (this project's
+    own, generic/non-personalized caps, e.g. BioSemi32_MNE.csv) — part of
+    the repo, not PROJECT_DIR-relative external data."""
+    caps_dir = os.path.join(RESOURCES_DIR, "caps")
     out = []
     if os.path.isdir(caps_dir):
         for fname in sorted(os.listdir(caps_dir)):
@@ -49,10 +50,10 @@ def list_builtin_caps() -> list[dict]:
     return out
 
 
-def list_available_caps(project_dir: str = PROJECT_DIR) -> list[dict]:
+def list_available_caps() -> list[dict]:
     """Project caps + SimNIBS built-in caps. Does not include arbitrary
     custom paths — those are validated on demand via validate_cap_path()."""
-    return list_project_caps(project_dir) + list_builtin_caps()
+    return list_project_caps() + list_builtin_caps()
 
 
 def cap_stem(cap_path: str) -> str:
