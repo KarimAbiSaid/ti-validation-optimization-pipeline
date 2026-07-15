@@ -65,35 +65,28 @@ class OptimizerConfig:
     # [max_allowed_in_non_ROI_V_m, min_required_in_ROI_V_m]
     focality_threshold: List[float] = field(default_factory=lambda: [0.24, 0.3])
 
-    # Differential evolution hyperparameters (passed via optimizer_options dict)
-    max_iterations:  int        = 200         # DE max generations
-    population_size: int        = 13          # DE population size per dimension
-    tolerance:       float      = 0.1         # convergence tolerance
-    mutation:        List[float] = field(default_factory=lambda: [0.01, 0.5])
-    recombination:   float      = 0.9         # DE crossover probability
-    n_multistart:    int        = 1           # independent restarts (keep best ROI result)
-
     # Hardware
     cpus: int = 4              # passed to opt.run(cpus=...)
 
-    # Mesh / physics
-    anisotropy_type: str  = "scalar"  # "scalar", "vn", "mc", "dir"
+    # LEGACY (TesFlexOptimization/DE — unused now that exhaustive search is
+    # the only optimization path; run_pipeline.py's Section 2 TesFlex code is
+    # commented out, not deleted, see that file). Kept here only as a record
+    # of what these meant — not read by anything anymore.
+    # max_iterations:  int        = 200         # DE max generations
+    # population_size: int        = 13          # DE population size per dimension
+    # tolerance:       float      = 0.1         # convergence tolerance
+    # mutation:        List[float] = field(default_factory=lambda: [0.01, 0.5])
+    # recombination:   float      = 0.9         # DE crossover probability
+    # n_multistart:    int        = 1           # independent restarts (keep best ROI result)
+    # anisotropy_type: str  = "scalar"  # "scalar", "vn", "mc", "dir"
+    # min_electrode_distance: float = 5.0   # mm — prevents electrode overlap
+    # use_eeg_cap_boundary:   bool  = False  # restrict scalp search to EEG cap region
+    # eeg_cap_margin_mm:      float = 10.0   # buffer beyond outermost cap electrodes (mm)
+    # detailed_results: bool = True   # store full optimization history
+    # enable_mapping:   bool = True   # map to nearest EEG net + run mapped sim
+    # use_exhaustive_search: bool = False  # now the only path — see run_exhaustive_cap_optimization()
 
-    # Electrode placement constraints
-    min_electrode_distance: float = 5.0   # mm — prevents electrode overlap
-    use_eeg_cap_boundary:   bool  = False  # restrict scalp search to EEG cap region
-    eeg_cap_margin_mm:      float = 10.0   # buffer beyond outermost cap electrodes (mm)
-
-    # Output options
-    detailed_results: bool = True   # store full optimization history
-    enable_mapping:   bool = True   # map to nearest EEG net + run mapped sim
-
-    # Exhaustive cap search (replaces DE optimization when True)
-    # Computes a leadfield once, then algebraically evaluates ALL electrode
-    # pair combinations — guaranteed global optimum over discrete cap positions.
-    use_exhaustive_search: bool = False
-
-    # Hard ROI dose constraint (only active when use_exhaustive_search=True and goal="focality").
+    # Hard ROI dose constraint (only active when goal="focality").
     # When True: skip any montage where mean TI in ROI < focality_threshold[1].
     # Among feasible montages, best focality (ROC) is selected as usual.
     # If no montage meets the threshold, falls back to best mean-ROI montage with a warning.
@@ -107,13 +100,13 @@ class OptimizerConfig:
     # Set to 0 to disable (use all elements).
     max_non_roi_elements: int = 150_000
 
-    # Prevent adjacent cap electrodes from being selected together (exhaustive search only).
+    # Prevent adjacent cap electrodes from being selected together.
     # Two electrodes are considered adjacent when their Euclidean distance is ≤ 1.5×
     # the minimum inter-electrode spacing in the cap. This eliminates montages where
     # current can shunt directly across the scalp between neighbouring electrodes.
     no_adjacent_electrodes: bool = False
 
-    # Per-subgroup non-ROI hard constraints (exhaustive search only).
+    # Per-subgroup non-ROI hard constraints.
     # A montage is rejected if mean TI in ANY listed group exceeds max_mean_V_m,
     # regardless of the overall non-ROI union mean.
     # Each entry: {"name": str, "bna_labels": {str: int}, "max_mean_V_m": float}
@@ -130,7 +123,7 @@ class PipelineFlags:
     run_recon_all:    bool = False  # FreeSurfer recon-all (separate container on SCITAS)
     run_charm:        bool = False  # SimNIBS charm head modeling
     run_roi_masks:    bool = True   # Section 1: create ROI/non-ROI NIfTI masks
-    run_optimization: bool = True   # Section 2: TesFlexOptimization
+    run_optimization: bool = True   # Section 2: exhaustive cap search (see run_exhaustive_cap_optimization)
     run_simulation:   bool = False  # Section 3: FEM simulations (redundant — optimizer already runs FEM internally)
     run_analysis:     bool = True   # Section 4: TI field analysis
     run_visualization:bool = True   # save TI_comparison.msh + 4-view images

@@ -347,14 +347,19 @@ class MaskGeneratorEngine:
                                 fallback_label_ids=fallback_label_ids)
 
     def create_non_roi(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
+        # Same "_label-{name}_mask.nii.gz" naming as create_roi (matches
+        # PipelineConfig.mask_path() in config.py, which run_pipeline.py's
+        # Section 1 uses for its own skip-if-exists check for BOTH roi and
+        # non_roi) — so a mask made here, from any atlas, is directly usable
+        # by the pipeline as long as the name matches.
         out_path = os.path.join(self.simnibs_dir, f"sub-{self.subject}", "roi",
-                                 f"sub-{self.subject}_nonroi-{name}_mask.nii.gz")
+                                 f"sub-{self.subject}_label-{name}_mask.nii.gz")
         return self.create_mask(source, label_ids, out_path, hemisphere=hemisphere,
                                 fallback_label_ids=fallback_label_ids)
 
     def create_general_mask(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
         out_path = os.path.join(self.simnibs_dir, f"sub-{self.subject}", "roi",
-                                 f"sub-{self.subject}_mask-{name}.nii.gz")
+                                 f"sub-{self.subject}_label-{name}_mask.nii.gz")
         return self.create_mask(source, label_ids, out_path, hemisphere=hemisphere,
                                 fallback_label_ids=fallback_label_ids)
 

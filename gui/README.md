@@ -124,7 +124,10 @@ code/gui/
 
 `discovery.py`, `cap_discovery.py`, `fem_discovery.py`, `comparison_discovery.py`, and `charm_discovery.py` import shared bits from `common.py` rather than duplicating them — each later phase's `*_discovery.py` should do the same.
 
-`common.py` assumes the project root is `D:/MINDS_Project_Karim/BIDS_TI_Toolbox` (`PROJECT_DIR` constant at the top) — update that if running against a different checkout.
+`common.py` defines two separate roots:
+
+- `PROJECT_DIR` — external per-project data (`rawdata/`, `derivatives/`, subject MRIs), **not** part of this repo. Read from the `BIDS_TI_PROJECT_DIR` env var, falling back to `D:/MINDS_Project_Karim/BIDS_TI_Toolbox` if unset — set that env var to point at a different checkout instead of editing the fallback.
+- `RESOURCES_DIR` — generic, non-personalized shared resources that travel with the code (`code/resources/atlases/`, `code/resources/caps/`), resolved relative to `common.py` itself, always alongside `code/gui/` regardless of machine.
 
 ---
 

@@ -2,8 +2,8 @@
 pages/cap_registration.py — Phase 2: register an EEG cap layout (MNI space)
 onto one or more subjects' scalp surfaces.
 
-Cap can come from this project's own configs/caps/*.csv, SimNIBS's built-in
-ElectrodeCaps_MNI/*.csv, or an arbitrary custom path. Registration status is
+Cap can come from this project's own code/resources/caps/*.csv, SimNIBS's
+built-in ElectrodeCaps_MNI/*.csv, or an arbitrary custom path. Registration status is
 checked per subject (m2m + subject mesh present, and whether that cap's
 registered CSV already exists in m2m_{id}/eeg_positions/) before batch
 registering across a checkbox-selected subset, with the same overwrite

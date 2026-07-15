@@ -308,221 +308,226 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EEG cap scalp boundary filter
+# LEGACY — EEG cap scalp boundary filter
+# Exclusively supported the TesFlexOptimization (DE) path above, which is now
+# commented out (see _run_optimization_tesflex_LEGACY). No caller outside this
+# cluster (_load_cap_coords, _cap_node_mask, apply_eeg_cap_boundary,
+# preview_skin_filter) remains, so it is dead code. Kept in the file, not
+# deleted.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _load_cap_coords(eeg_csv_path: str, opt_subpath: str = None) -> np.ndarray:
-    """
-    Load Electrode/ReferenceElectrode rows from an EEG cap CSV.
-    Prefers the registered version in opt_subpath/eeg_positions/ if it exists.
-    """
-    path = eeg_csv_path
-    if opt_subpath:
-        registered = os.path.join(opt_subpath, "eeg_positions",
-                                  os.path.basename(eeg_csv_path))
-        if os.path.isfile(registered):
-            path = registered
-
-    coords = []
-    with open(path) as f:
-        for line in f:
-            parts = [p.strip() for p in line.strip().split(",")]
-            if len(parts) < 4:
-                continue
-            if parts[0] in ("Electrode", "ReferenceElectrode"):
-                try:
-                    coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
-                except ValueError:
-                    continue
-    if not coords:
-        raise ValueError(f"No electrode positions found in {path}")
-    print(f"  EEG cap: {len(coords)} electrodes from {os.path.basename(path)}")
-    return np.array(coords)
-
-
-def _cap_node_mask(skin_nodes: np.ndarray, cap_coords: np.ndarray,
-                   margin_mm: float) -> np.ndarray:
-    """
-    Boolean mask of skin nodes within the EEG cap boundary.
-
-    Algorithm:
-      1. Fit a plane to the cap electrodes (PCA, least-variance axis = normal).
-         Orient the normal to point away from the scalp centroid (i.e. outward).
-      2. Project all skin nodes orthographically onto that plane.
-      3. A node is valid if its 2-D projection falls inside the convex hull of
-         the projected cap electrodes AND it is not more than margin_mm below
-         the plane (half-space guard that prevents the bottom of the head from
-         projecting back into the cap region).
-      4. Additionally include any node within margin_mm Euclidean distance of
-         any cap electrode (boundary buffer).
-    """
-    from scipy.spatial import Delaunay
-
-    scalp_centroid = skin_nodes.mean(axis=0)
-    cap_center_3d  = cap_coords.mean(axis=0)
-
-    # --- Step 1: fit plane to cap electrodes via PCA ---
-    _, _, Vt   = np.linalg.svd(cap_coords - cap_center_3d)
-    normal     = Vt[-1]                               # least-variance axis
-    # orient normal to point outward (away from scalp centroid)
-    if np.dot(normal, cap_center_3d - scalp_centroid) < 0:
-        normal = -normal
-
-    # --- Step 2: orthonormal basis for the cap plane ---
-    ref = np.array([0.0, 0.0, 1.0])
-    if abs(np.dot(normal, ref)) > 0.9:
-        ref = np.array([1.0, 0.0, 0.0])
-    u = np.cross(normal, ref);  u /= np.linalg.norm(u)
-    v = np.cross(normal, u)
-    basis = np.column_stack([u, v])                   # (3, 2)
-
-    # --- Step 3: project onto plane ---
-    c_rel  = cap_coords  - cap_center_3d
-    s_rel  = skin_nodes  - cap_center_3d
-
-    c_2d   = c_rel @ basis                            # (K, 2)
-    s_2d   = s_rel @ basis                            # (N, 2)
-    s_dist = s_rel @ normal                           # (N,) signed distance from plane
-
-    # half-space: exclude nodes more than margin_mm below the plane
-    above  = s_dist >= -margin_mm
-
-    # 2-D convex hull — expanded outward by margin_mm so the boundary region
-    # between outermost electrodes is included, not just circles around each one
-    in_hull = np.zeros(len(skin_nodes), dtype=bool)
-    try:
-        from scipy.spatial import ConvexHull
-        hull_2d   = ConvexHull(c_2d)
-        verts     = c_2d[hull_2d.vertices]              # (V, 2) outermost electrodes
-        centroid_2d = verts.mean(axis=0)
-        directions  = verts - centroid_2d
-        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-        expanded    = verts + directions * margin_mm     # push each vertex outward
-        tri         = Delaunay(expanded)
-        in_hull     = tri.find_simplex(s_2d) >= 0
-    except Exception as e:
-        print(f"  Warning: 2-D hull failed ({e}), using margin only.")
-
-    # Euclidean margin buffer as fallback for nodes near cap electrodes
-    dists_3d = np.linalg.norm(
-        skin_nodes[:, None, :] - cap_coords[None, :, :], axis=2)  # (N, K)
-    near_cap = dists_3d.min(axis=1) <= margin_mm
-
-    return (in_hull & above) | near_cap
-
-
-def apply_eeg_cap_boundary(opt, eeg_csv_path: str, margin_mm: float = 10.0) -> None:
-    """
-    Filter opt._skin_surface to only include nodes within the EEG cap boundary.
-
-    Call after opt._prepare() and before opt.run().
-    Sets opt._prepared = True so run() skips re-preparation.
-
-    Uses the same SimNIBS utilities as valid_skin_region internally:
-      create_new_connectivity_list_point_mask(points, con, point_mask)
-        - con is 0-indexed triangles
-        - returns (new_nodes, new_con_0indexed)
-      mesh_io.make_surface_mesh(nodes, con_1indexed) to rebuild the Msh object.
-    """
-    # NOTE: This is kind of stale, since it's related to the tes_flex_optimization module
-    # and it was just since the search was not across the points but rather the whole scalp surface and
-    # so we would get 
-    from simnibs.utils.transformations import create_new_connectivity_list_point_mask
-    from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import mesh_io
-
-    cap_coords = _load_cap_coords(eeg_csv_path, opt_subpath=opt.subpath)
-    skin_nodes = opt._skin_surface.nodes.node_coord    # (N, 3)
-    n_before   = len(skin_nodes)
-
-    node_mask = _cap_node_mask(skin_nodes, cap_coords, margin_mm)
-    n_after   = int(node_mask.sum())
-
-    if n_after == 0:
-        raise RuntimeError(
-            "EEG cap boundary filter removed ALL skin nodes. "
-            "Check that the cap CSV is in subject-space coordinates."
-        )
-
-    # Connectivity is 1-indexed in SimNIBS; take first 3 cols (triangles only)
-    conn_0idx = opt._skin_surface.elm.node_number_list[:, :3] - 1
-
-    # Compute which original node indices actually survive (only nodes referenced
-    # by at least one surviving triangle — mirrors create_new_connectivity_list_point_mask)
-    surviving_conn = conn_0idx[node_mask[conn_0idx].all(axis=1), :]
-    unique_pts = np.unique(surviving_conn)   # 0-indexed original node IDs
-
-    filtered_nodes, filtered_conn_0idx = create_new_connectivity_list_point_mask(
-        points=skin_nodes,
-        con=conn_0idx,
-        point_mask=node_mask,
-    )
-
-    # Rebuild Msh object the same way valid_skin_region does
-    fn = opt._skin_surface.fn
-    opt._skin_surface = mesh_io.make_surface_mesh(filtered_nodes,
-                                                  filtered_conn_0idx + 1)
-    opt._skin_surface.fn = fn
-
-    # Rebuild node→global-mesh index mapping using actual surviving node indices
-    opt._node_idx_msh = opt._node_idx_msh[unique_pts]
-
-    # Refit ellipsoid to filtered nodes
-    opt._ellipsoid.fit(points=filtered_nodes)
-
-    opt._prepared = True
-
-    pct = 100.0 * n_after / n_before
-    print(f"  Skin filter: {n_before} → {n_after} nodes ({pct:.1f}% retained), "
-          f"margin={margin_mm} mm")
-
-
-def preview_skin_filter(opt, eeg_csv_path: str, margin_mm: float = 10.0) -> None:
-    """
-    Dry-run: print node counts and save a 3-D scatter of valid (green) vs
-    excluded (red) skin nodes. Does NOT modify the optimizer.
-    """
-    # NOTE: This is also stale, as it's also related to the EEG cap boundary functionality
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
-        have_plt = True
-    except ImportError:
-        have_plt = False
-
-    cap_coords = _load_cap_coords(eeg_csv_path, opt_subpath=opt.subpath)
-    skin_nodes = opt._skin_surface.nodes.node_coord
-    n_total    = len(skin_nodes)
-    node_mask  = _cap_node_mask(skin_nodes, cap_coords, margin_mm)
-    n_valid    = int(node_mask.sum())
-
-    print(f"  Preview  : {n_total} skin nodes total")
-    print(f"  Valid    : {n_valid} ({100*n_valid/n_total:.1f}%)")
-    print(f"  Excluded : {n_total - n_valid} ({100*(n_total-n_valid)/n_total:.1f}%)")
-
-    if not have_plt:
-        return
-
-    valid_pts   = skin_nodes[ node_mask]
-    invalid_pts = skin_nodes[~node_mask]
-    step_v = max(1, len(valid_pts)   // 4000)
-    step_i = max(1, len(invalid_pts) // 4000)
-
-    fig = plt.figure(figsize=(10, 7))
-    ax  = fig.add_subplot(111, projection="3d")
-    ax.scatter(*valid_pts  [::step_v].T, c="green", s=1, alpha=0.4, label="Valid")
-    ax.scatter(*invalid_pts[::step_i].T, c="red",   s=1, alpha=0.4, label="Excluded")
-    ax.scatter(*cap_coords.T, c="blue", s=50, marker="^", zorder=5,
-               label="EEG electrodes")
-    ax.set_title(f"Skin filter preview  (margin={margin_mm} mm)\n"
-                 f"{n_valid}/{n_total} nodes retained")
-    ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)"); ax.set_zlabel("z (mm)")
-    ax.legend(markerscale=5, fontsize=8)
-    fig.tight_layout()
-    out = "/tmp/skin_filter_preview.png"
-    fig.savefig(out, dpi=120, bbox_inches="tight")
-    print(f"  Saved: {out}")
+# def _load_cap_coords(eeg_csv_path: str, opt_subpath: str = None) -> np.ndarray:
+#     """
+#     Load Electrode/ReferenceElectrode rows from an EEG cap CSV.
+#     Prefers the registered version in opt_subpath/eeg_positions/ if it exists.
+#     """
+#     path = eeg_csv_path
+#     if opt_subpath:
+#         registered = os.path.join(opt_subpath, "eeg_positions",
+#                                   os.path.basename(eeg_csv_path))
+#         if os.path.isfile(registered):
+#             path = registered
+#
+#     coords = []
+#     with open(path) as f:
+#         for line in f:
+#             parts = [p.strip() for p in line.strip().split(",")]
+#             if len(parts) < 4:
+#                 continue
+#             if parts[0] in ("Electrode", "ReferenceElectrode"):
+#                 try:
+#                     coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+#                 except ValueError:
+#                     continue
+#     if not coords:
+#         raise ValueError(f"No electrode positions found in {path}")
+#     print(f"  EEG cap: {len(coords)} electrodes from {os.path.basename(path)}")
+#     return np.array(coords)
+#
+#
+# def _cap_node_mask(skin_nodes: np.ndarray, cap_coords: np.ndarray,
+#                    margin_mm: float) -> np.ndarray:
+#     """
+#     Boolean mask of skin nodes within the EEG cap boundary.
+#
+#     Algorithm:
+#       1. Fit a plane to the cap electrodes (PCA, least-variance axis = normal).
+#          Orient the normal to point away from the scalp centroid (i.e. outward).
+#       2. Project all skin nodes orthographically onto that plane.
+#       3. A node is valid if its 2-D projection falls inside the convex hull of
+#          the projected cap electrodes AND it is not more than margin_mm below
+#          the plane (half-space guard that prevents the bottom of the head from
+#          projecting back into the cap region).
+#       4. Additionally include any node within margin_mm Euclidean distance of
+#          any cap electrode (boundary buffer).
+#     """
+#     from scipy.spatial import Delaunay
+#
+#     scalp_centroid = skin_nodes.mean(axis=0)
+#     cap_center_3d  = cap_coords.mean(axis=0)
+#
+#     # --- Step 1: fit plane to cap electrodes via PCA ---
+#     _, _, Vt   = np.linalg.svd(cap_coords - cap_center_3d)
+#     normal     = Vt[-1]                               # least-variance axis
+#     # orient normal to point outward (away from scalp centroid)
+#     if np.dot(normal, cap_center_3d - scalp_centroid) < 0:
+#         normal = -normal
+#
+#     # --- Step 2: orthonormal basis for the cap plane ---
+#     ref = np.array([0.0, 0.0, 1.0])
+#     if abs(np.dot(normal, ref)) > 0.9:
+#         ref = np.array([1.0, 0.0, 0.0])
+#     u = np.cross(normal, ref);  u /= np.linalg.norm(u)
+#     v = np.cross(normal, u)
+#     basis = np.column_stack([u, v])                   # (3, 2)
+#
+#     # --- Step 3: project onto plane ---
+#     c_rel  = cap_coords  - cap_center_3d
+#     s_rel  = skin_nodes  - cap_center_3d
+#
+#     c_2d   = c_rel @ basis                            # (K, 2)
+#     s_2d   = s_rel @ basis                            # (N, 2)
+#     s_dist = s_rel @ normal                           # (N,) signed distance from plane
+#
+#     # half-space: exclude nodes more than margin_mm below the plane
+#     above  = s_dist >= -margin_mm
+#
+#     # 2-D convex hull — expanded outward by margin_mm so the boundary region
+#     # between outermost electrodes is included, not just circles around each one
+#     in_hull = np.zeros(len(skin_nodes), dtype=bool)
+#     try:
+#         from scipy.spatial import ConvexHull
+#         hull_2d   = ConvexHull(c_2d)
+#         verts     = c_2d[hull_2d.vertices]              # (V, 2) outermost electrodes
+#         centroid_2d = verts.mean(axis=0)
+#         directions  = verts - centroid_2d
+#         directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+#         expanded    = verts + directions * margin_mm     # push each vertex outward
+#         tri         = Delaunay(expanded)
+#         in_hull     = tri.find_simplex(s_2d) >= 0
+#     except Exception as e:
+#         print(f"  Warning: 2-D hull failed ({e}), using margin only.")
+#
+#     # Euclidean margin buffer as fallback for nodes near cap electrodes
+#     dists_3d = np.linalg.norm(
+#         skin_nodes[:, None, :] - cap_coords[None, :, :], axis=2)  # (N, K)
+#     near_cap = dists_3d.min(axis=1) <= margin_mm
+#
+#     return (in_hull & above) | near_cap
+#
+#
+# def apply_eeg_cap_boundary(opt, eeg_csv_path: str, margin_mm: float = 10.0) -> None:
+#     """
+#     Filter opt._skin_surface to only include nodes within the EEG cap boundary.
+#
+#     Call after opt._prepare() and before opt.run().
+#     Sets opt._prepared = True so run() skips re-preparation.
+#
+#     Uses the same SimNIBS utilities as valid_skin_region internally:
+#       create_new_connectivity_list_point_mask(points, con, point_mask)
+#         - con is 0-indexed triangles
+#         - returns (new_nodes, new_con_0indexed)
+#       mesh_io.make_surface_mesh(nodes, con_1indexed) to rebuild the Msh object.
+#     """
+#     # NOTE: This is kind of stale, since it's related to the tes_flex_optimization module
+#     # and it was just since the search was not across the points but rather the whole scalp surface and
+#     # so we would get
+#     from simnibs.utils.transformations import create_new_connectivity_list_point_mask
+#     from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import mesh_io
+#
+#     cap_coords = _load_cap_coords(eeg_csv_path, opt_subpath=opt.subpath)
+#     skin_nodes = opt._skin_surface.nodes.node_coord    # (N, 3)
+#     n_before   = len(skin_nodes)
+#
+#     node_mask = _cap_node_mask(skin_nodes, cap_coords, margin_mm)
+#     n_after   = int(node_mask.sum())
+#
+#     if n_after == 0:
+#         raise RuntimeError(
+#             "EEG cap boundary filter removed ALL skin nodes. "
+#             "Check that the cap CSV is in subject-space coordinates."
+#         )
+#
+#     # Connectivity is 1-indexed in SimNIBS; take first 3 cols (triangles only)
+#     conn_0idx = opt._skin_surface.elm.node_number_list[:, :3] - 1
+#
+#     # Compute which original node indices actually survive (only nodes referenced
+#     # by at least one surviving triangle — mirrors create_new_connectivity_list_point_mask)
+#     surviving_conn = conn_0idx[node_mask[conn_0idx].all(axis=1), :]
+#     unique_pts = np.unique(surviving_conn)   # 0-indexed original node IDs
+#
+#     filtered_nodes, filtered_conn_0idx = create_new_connectivity_list_point_mask(
+#         points=skin_nodes,
+#         con=conn_0idx,
+#         point_mask=node_mask,
+#     )
+#
+#     # Rebuild Msh object the same way valid_skin_region does
+#     fn = opt._skin_surface.fn
+#     opt._skin_surface = mesh_io.make_surface_mesh(filtered_nodes,
+#                                                   filtered_conn_0idx + 1)
+#     opt._skin_surface.fn = fn
+#
+#     # Rebuild node→global-mesh index mapping using actual surviving node indices
+#     opt._node_idx_msh = opt._node_idx_msh[unique_pts]
+#
+#     # Refit ellipsoid to filtered nodes
+#     opt._ellipsoid.fit(points=filtered_nodes)
+#
+#     opt._prepared = True
+#
+#     pct = 100.0 * n_after / n_before
+#     print(f"  Skin filter: {n_before} → {n_after} nodes ({pct:.1f}% retained), "
+#           f"margin={margin_mm} mm")
+#
+#
+# def preview_skin_filter(opt, eeg_csv_path: str, margin_mm: float = 10.0) -> None:
+#     """
+#     Dry-run: print node counts and save a 3-D scatter of valid (green) vs
+#     excluded (red) skin nodes. Does NOT modify the optimizer.
+#     """
+#     # NOTE: This is also stale, as it's also related to the EEG cap boundary functionality
+#     try:
+#         import matplotlib
+#         matplotlib.use("Agg")
+#         import matplotlib.pyplot as plt
+#         from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
+#         have_plt = True
+#     except ImportError:
+#         have_plt = False
+#
+#     cap_coords = _load_cap_coords(eeg_csv_path, opt_subpath=opt.subpath)
+#     skin_nodes = opt._skin_surface.nodes.node_coord
+#     n_total    = len(skin_nodes)
+#     node_mask  = _cap_node_mask(skin_nodes, cap_coords, margin_mm)
+#     n_valid    = int(node_mask.sum())
+#
+#     print(f"  Preview  : {n_total} skin nodes total")
+#     print(f"  Valid    : {n_valid} ({100*n_valid/n_total:.1f}%)")
+#     print(f"  Excluded : {n_total - n_valid} ({100*(n_total-n_valid)/n_total:.1f}%)")
+#
+#     if not have_plt:
+#         return
+#
+#     valid_pts   = skin_nodes[ node_mask]
+#     invalid_pts = skin_nodes[~node_mask]
+#     step_v = max(1, len(valid_pts)   // 4000)
+#     step_i = max(1, len(invalid_pts) // 4000)
+#
+#     fig = plt.figure(figsize=(10, 7))
+#     ax  = fig.add_subplot(111, projection="3d")
+#     ax.scatter(*valid_pts  [::step_v].T, c="green", s=1, alpha=0.4, label="Valid")
+#     ax.scatter(*invalid_pts[::step_i].T, c="red",   s=1, alpha=0.4, label="Excluded")
+#     ax.scatter(*cap_coords.T, c="blue", s=50, marker="^", zorder=5,
+#                label="EEG electrodes")
+#     ax.set_title(f"Skin filter preview  (margin={margin_mm} mm)\n"
+#                  f"{n_valid}/{n_total} nodes retained")
+#     ax.set_xlabel("x (mm)"); ax.set_ylabel("y (mm)"); ax.set_zlabel("z (mm)")
+#     ax.legend(markerscale=5, fontsize=8)
+#     fig.tight_layout()
+#     out = "/tmp/skin_filter_preview.png"
+#     fig.savefig(out, dpi=120, bbox_inches="tight")
+#     print(f"  Saved: {out}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -755,8 +760,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                 lf_non_roi = leadfield[:, non_roi_indices, :]
 
     score_label = "ROC focality" if use_focality else "mean TI"
-    hard_constraint = (use_focality and cfg.optimizer.hard_roi_constraint
-                       and cfg.optimizer.use_exhaustive_search)
+    hard_constraint = use_focality and cfg.optimizer.hard_roi_constraint
     print(f"  Scoring: {score_label}")
     if hard_constraint:
         print(f"  Hard ROI constraint: mean TI in ROI >= {cfg.optimizer.focality_threshold[1]} V/m"
@@ -1062,216 +1066,234 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 2 — TesFlexOptimization
+# Section 2 — Cap Optimization (exhaustive search only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def run_optimization(cfg: PipelineConfig, force: bool = False,
                      job_id: str = "") -> str:
-    """Returns the opt_run_dir path."""
-    # Route to exhaustive search if configured
-    if cfg.optimizer.use_exhaustive_search:
-        return run_exhaustive_cap_optimization(cfg, force=force, job_id=job_id)
+    """Returns the opt_run_dir path. Exhaustive cap search is now the only
+    optimization path (see run_exhaustive_cap_optimization) — the DE-based
+    TesFlexOptimization path below is unused in practice and commented out,
+    not deleted (see _run_optimization_tesflex_LEGACY)."""
+    return run_exhaustive_cap_optimization(cfg, force=force, job_id=job_id)
 
-    header("Section 2 — TesFlexOptimization")
 
-    # Check pointer file for existing run with matching ROI
-    pointer_path = f"{cfg.sim_sub_dir}/latest_flex_run.json"
-    if not force and os.path.isfile(pointer_path):
-        with open(pointer_path) as f:
-            ptr = json.load(f)
-        existing = ptr.get("flex_run_dir", "")
-        mesh = f"{existing}/{cfg.subject_id}_tes_flex_opt_head_mesh.msh"
-        if os.path.isfile(mesh) and ptr.get("roi") == cfg.roi.name:
-            print(f"  [SKIP] optimization — found existing run:\n         {existing}")
-            return existing
-        elif os.path.isfile(mesh) and ptr.get("roi") != cfg.roi.name:
-            print(f"  Previous run was for ROI '{ptr.get('roi')}', "
-                  f"current ROI is '{cfg.roi.name}' — running new optimization.")
-
-    import copy
-    import shutil
-    from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import TesFlexOptimization
-    from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import ElectrodeArrayPair
-    from simnibs.utils.region_of_interest import RegionOfInterest
-
-    # ── Build a RegionOfInterest object from an ROIConfig ────────────────────
-    def _build_roi(roi_cfg: ROIConfig):
-        roi = RegionOfInterest()
-        roi.subpath = cfg.m2m_path
-        if roi_cfg.method == "NIfTI":
-            mask_path = cfg.mask_path(roi_cfg.name)
-            if not os.path.isfile(mask_path):
-                abort(f"ROI mask not found: {mask_path}. Run Section 1 first.")
-            roi.method     = "volume"
-            roi.mask_path  = mask_path
-            roi.mask_space = "subject"
-            roi.tissues    = [2]
-        elif roi_cfg.method == "atlas":
-            roi.atlas_regions = roi_cfg.atlas_regions
-        elif roi_cfg.method == "sphere":
-            roi.method = "sphere"
-            roi.center = roi_cfg.sphere_center
-            roi.radius = roi_cfg.sphere_radius
-        return roi
-
-    # ── Build electrode pair ──────────────────────────────────────────────────
-    el  = cfg.electrode
-    ep  = ElectrodeArrayPair()
-    ep.center  = [[0, 0]]
-    ep.current = [el.current_mA * 1e-3, -el.current_mA * 1e-3]
-    if el.shape in ("ellipse", "circle"):
-        ep.radius   = [el.dimensions[0] / 2]
-    else:
-        ep.length_x = [el.dimensions[0]]
-        ep.length_y = [el.dimensions[1]]
-        ep.radius   = None
-
-    # ── Paths ─────────────────────────────────────────────────────────────────
-    timestamp      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    flex_dir       = cfg.ti_opt_dir
-    postproc_bids  = cfg.optimizer.postproc.replace("_", "")
-    op_tmp         = cfg.optimizer
-    scalp_tag      = ("boundary" if op_tmp.use_eeg_cap_boundary else "full")
-    job_tag        = f"_job-{job_id}" if job_id else ""
-    opt_output_dir = (f"{flex_dir}/sub-{cfg.subject_id}_roi-{cfg.roi.name}"
-                      f"_goal-{cfg.optimizer.goal}_postproc-{postproc_bids}"
-                      f"_scalp-{scalp_tag}{job_tag}_run-{timestamp}")
-    os.makedirs(opt_output_dir, exist_ok=True)
-
-    # ── Build ROI and optimizer ───────────────────────────────────────────────
-    target_roi = _build_roi(cfg.roi)
-    avoid_roi  = _build_roi(cfg.non_roi) if cfg.non_roi else None
-    op         = cfg.optimizer
-
-    # detailed_results crashes in SimNIBS for non-focality goals
-    if op.detailed_results and op.goal not in ("focality", "focality_inv"):
-        print(f"  WARNING: detailed_results=True is only supported with goal='focality'. "
-              f"Disabling for goal='{op.goal}'.")
-        object.__setattr__(op, "detailed_results", False)
-
-    def _build_opt(output_folder: str) -> TesFlexOptimization:
-        opt = TesFlexOptimization()
-        opt.subpath        = cfg.m2m_path
-        opt.output_folder  = output_folder
-        opt.goal           = [op.goal]
-        opt.e_postproc     = op.postproc
-        if op.goal == "focality" and avoid_roi is not None:
-            opt.roi       = [target_roi, avoid_roi]
-            opt.threshold = op.focality_threshold
-        else:
-            opt.roi = [target_roi]
-            if op.goal == "focality":
-                print("  WARNING: focality goal set but no non_roi defined — "
-                      "running without avoidance region.")
-        opt.electrode                        = [ep, copy.deepcopy(ep)]
-        opt.anisotropy_type                  = op.anisotropy_type
-        opt.min_electrode_distance           = op.min_electrode_distance
-        opt.detailed_results                 = op.detailed_results
-        opt.optimizer_options                = {
-            "maxiter":       op.max_iterations,
-            "popsize":       op.population_size,
-            "tol":           op.tolerance,
-            "mutation":      op.mutation,
-            "recombination": op.recombination,
-        }
-        opt.map_to_net_electrodes            = op.enable_mapping
-        opt.run_mapped_electrodes_simulation = op.enable_mapping
-        if op.enable_mapping:
-            opt.net_electrode_file = cfg.eeg_csv_path
-        opt.open_in_gmsh = False
-        return opt
-
-    # ── Multistart loop (following TIT flex.py pattern) ───────────────────────
-    n       = op.n_multistart
-    folders = ([f"{opt_output_dir}/{i:02d}" for i in range(n)]
-               if n > 1 else [opt_output_dir])
-    fvals   = np.full(n, float("inf"))
-
-    if n > 1:
-        print(f"  Multistart: {n} independent runs — keeping best (argmin funvalue)")
-
-    for run_i in range(n):
-        if n > 1:
-            print(f"\n  ── Start {run_i + 1}/{n} → {folders[run_i]}")
-        os.makedirs(folders[run_i], exist_ok=True)
-        opt = _build_opt(folders[run_i])
-        opt._prepare()
-        if op.use_eeg_cap_boundary:
-            apply_eeg_cap_boundary(opt, cfg.eeg_csv_path,
-                                   margin_mm=op.eeg_cap_margin_mm)
-        opt.run(cpus=op.cpus)
-        fvals[run_i] = getattr(opt, "optim_funvalue", float("inf"))
-        if n > 1:
-            print(f"  Start {run_i + 1} funvalue: {fvals[run_i]:.6f}")
-
-        # Delete any previous subfolders that are no longer the best.
-        # This frees disk space immediately — each subfolder contains large
-        # final_sim_0/ and final_sim_1/ meshes that accumulate across runs.
-        if n > 1 and run_i > 0:
-            current_best = int(np.argmin(fvals[:run_i + 1]))
-            for j in range(run_i):
-                if j != current_best and os.path.isdir(folders[j]):
-                    shutil.rmtree(folders[j])
-                    print(f"  Freed subfolder {j:02d}/ (not best)")
-
-    # Select best, promote to base folder, clean up subfolders
-    if n > 1:
-        best_idx = int(np.argmin(fvals))
-        print(f"\n  Best start: #{best_idx + 1} (funvalue={fvals[best_idx]:.6f})")
-        best_folder = folders[best_idx]
-        for item in os.listdir(best_folder):
-            src = os.path.join(best_folder, item)
-            dst = os.path.join(opt_output_dir, item)
-            if os.path.isdir(src):
-                if os.path.exists(dst):
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
-            else:
-                shutil.copy2(src, dst)
-        for folder in folders:
-            if os.path.isdir(folder):
-                shutil.rmtree(folder)
-
-    # ── dataset_description.json ──────────────────────────────────────────────
-    desc = {
-        "Name":        "SimNIBS TI Optimization",
-        "BIDSVersion": "1.9.0",
-        "DatasetType": "derivative",
-        "GeneratedBy": [
-            {
-                "Name":       "SimNIBS TesFlexOptimization",
-                "Container":  {"Type": "apptainer", "Image": "simnibs_v2.3.0.sif"},
-                "ROI":        cfg.roi.name,
-                "Goal":       op.goal,
-                "Postproc":   op.postproc,
-                "Multistart": n,
-                "BestFunvalue": float(np.min(fvals)),
-            },
-            {
-                "Name":       "run_pipeline.py",
-                "SlurmJobID": job_id or "local",
-                "Timestamp":  timestamp,
-            },
-        ],
-    }
-    with open(f"{opt_output_dir}/dataset_description.json", "w") as f:
-        json.dump(desc, f, indent=2)
-    print(f"  dataset_description.json written → {opt_output_dir}/dataset_description.json")
-
-    # ── Pointer file ──────────────────────────────────────────────────────────
-    pointer = {
-        "flex_run_dir": opt_output_dir,
-        "roi":          cfg.roi.name,
-        "goal":         op.goal,
-        "postproc":     op.postproc,
-        "timestamp":    timestamp,
-        "slurm_job_id": job_id or "local",
-    }
-    with open(pointer_path, "w") as f:
-        json.dump(pointer, f, indent=2)
-    print(f"  Pointer saved → {pointer_path}")
-    return opt_output_dir
+# LEGACY — TesFlexOptimization (differential-evolution, continuous electrode
+# search). Superseded by run_exhaustive_cap_optimization(): exhaustive search
+# computes one leadfield and algebraically evaluates every discrete cap
+# electrode pair, which is faster and gives a guaranteed global optimum over
+# cap positions, so this path hasn't been used since. Kept commented out
+# (not deleted) in case continuous (non-cap-constrained) electrode
+# placement is ever needed again — note it also reads several
+# OptimizerConfig fields (max_iterations, population_size, tolerance,
+# mutation, recombination, n_multistart, anisotropy_type,
+# min_electrode_distance, use_eeg_cap_boundary, eeg_cap_margin_mm,
+# detailed_results, enable_mapping, use_exhaustive_search) that were removed
+# from the dataclass alongside this — restore both together if reviving it.
+#
+# def _run_optimization_tesflex_LEGACY(cfg: PipelineConfig, force: bool = False,
+#                      job_id: str = "") -> str:
+#     """Returns the opt_run_dir path."""
+#     header("Section 2 — TesFlexOptimization")
+#
+#     # Check pointer file for existing run with matching ROI
+#     pointer_path = f"{cfg.sim_sub_dir}/latest_flex_run.json"
+#     if not force and os.path.isfile(pointer_path):
+#         with open(pointer_path) as f:
+#             ptr = json.load(f)
+#         existing = ptr.get("flex_run_dir", "")
+#         mesh = f"{existing}/{cfg.subject_id}_tes_flex_opt_head_mesh.msh"
+#         if os.path.isfile(mesh) and ptr.get("roi") == cfg.roi.name:
+#             print(f"  [SKIP] optimization — found existing run:\n         {existing}")
+#             return existing
+#         elif os.path.isfile(mesh) and ptr.get("roi") != cfg.roi.name:
+#             print(f"  Previous run was for ROI '{ptr.get('roi')}', "
+#                   f"current ROI is '{cfg.roi.name}' — running new optimization.")
+#
+#     import copy
+#     import shutil
+#     from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import TesFlexOptimization
+#     from simnibs.optimization.tes_flex_optimization.tes_flex_optimization import ElectrodeArrayPair
+#     from simnibs.utils.region_of_interest import RegionOfInterest
+#
+#     # ── Build a RegionOfInterest object from an ROIConfig ────────────────────
+#     def _build_roi(roi_cfg: ROIConfig):
+#         roi = RegionOfInterest()
+#         roi.subpath = cfg.m2m_path
+#         if roi_cfg.method == "NIfTI":
+#             mask_path = cfg.mask_path(roi_cfg.name)
+#             if not os.path.isfile(mask_path):
+#                 abort(f"ROI mask not found: {mask_path}. Run Section 1 first.")
+#             roi.method     = "volume"
+#             roi.mask_path  = mask_path
+#             roi.mask_space = "subject"
+#             roi.tissues    = [2]
+#         elif roi_cfg.method == "atlas":
+#             roi.atlas_regions = roi_cfg.atlas_regions
+#         elif roi_cfg.method == "sphere":
+#             roi.method = "sphere"
+#             roi.center = roi_cfg.sphere_center
+#             roi.radius = roi_cfg.sphere_radius
+#         return roi
+#
+#     # ── Build electrode pair ──────────────────────────────────────────────────
+#     el  = cfg.electrode
+#     ep  = ElectrodeArrayPair()
+#     ep.center  = [[0, 0]]
+#     ep.current = [el.current_mA * 1e-3, -el.current_mA * 1e-3]
+#     if el.shape in ("ellipse", "circle"):
+#         ep.radius   = [el.dimensions[0] / 2]
+#     else:
+#         ep.length_x = [el.dimensions[0]]
+#         ep.length_y = [el.dimensions[1]]
+#         ep.radius   = None
+#
+#     # ── Paths ─────────────────────────────────────────────────────────────────
+#     timestamp      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+#     flex_dir       = cfg.ti_opt_dir
+#     postproc_bids  = cfg.optimizer.postproc.replace("_", "")
+#     op_tmp         = cfg.optimizer
+#     scalp_tag      = ("boundary" if op_tmp.use_eeg_cap_boundary else "full")
+#     job_tag        = f"_job-{job_id}" if job_id else ""
+#     opt_output_dir = (f"{flex_dir}/sub-{cfg.subject_id}_roi-{cfg.roi.name}"
+#                       f"_goal-{cfg.optimizer.goal}_postproc-{postproc_bids}"
+#                       f"_scalp-{scalp_tag}{job_tag}_run-{timestamp}")
+#     os.makedirs(opt_output_dir, exist_ok=True)
+#
+#     # ── Build ROI and optimizer ───────────────────────────────────────────────
+#     target_roi = _build_roi(cfg.roi)
+#     avoid_roi  = _build_roi(cfg.non_roi) if cfg.non_roi else None
+#     op         = cfg.optimizer
+#
+#     # detailed_results crashes in SimNIBS for non-focality goals
+#     if op.detailed_results and op.goal not in ("focality", "focality_inv"):
+#         print(f"  WARNING: detailed_results=True is only supported with goal='focality'. "
+#               f"Disabling for goal='{op.goal}'.")
+#         object.__setattr__(op, "detailed_results", False)
+#
+#     def _build_opt(output_folder: str) -> TesFlexOptimization:
+#         opt = TesFlexOptimization()
+#         opt.subpath        = cfg.m2m_path
+#         opt.output_folder  = output_folder
+#         opt.goal           = [op.goal]
+#         opt.e_postproc     = op.postproc
+#         if op.goal == "focality" and avoid_roi is not None:
+#             opt.roi       = [target_roi, avoid_roi]
+#             opt.threshold = op.focality_threshold
+#         else:
+#             opt.roi = [target_roi]
+#             if op.goal == "focality":
+#                 print("  WARNING: focality goal set but no non_roi defined — "
+#                       "running without avoidance region.")
+#         opt.electrode                        = [ep, copy.deepcopy(ep)]
+#         opt.anisotropy_type                  = op.anisotropy_type
+#         opt.min_electrode_distance           = op.min_electrode_distance
+#         opt.detailed_results                 = op.detailed_results
+#         opt.optimizer_options                = {
+#             "maxiter":       op.max_iterations,
+#             "popsize":       op.population_size,
+#             "tol":           op.tolerance,
+#             "mutation":      op.mutation,
+#             "recombination": op.recombination,
+#         }
+#         opt.map_to_net_electrodes            = op.enable_mapping
+#         opt.run_mapped_electrodes_simulation = op.enable_mapping
+#         if op.enable_mapping:
+#             opt.net_electrode_file = cfg.eeg_csv_path
+#         opt.open_in_gmsh = False
+#         return opt
+#
+#     # ── Multistart loop (following TIT flex.py pattern) ───────────────────────
+#     n       = op.n_multistart
+#     folders = ([f"{opt_output_dir}/{i:02d}" for i in range(n)]
+#                if n > 1 else [opt_output_dir])
+#     fvals   = np.full(n, float("inf"))
+#
+#     if n > 1:
+#         print(f"  Multistart: {n} independent runs — keeping best (argmin funvalue)")
+#
+#     for run_i in range(n):
+#         if n > 1:
+#             print(f"\n  ── Start {run_i + 1}/{n} → {folders[run_i]}")
+#         os.makedirs(folders[run_i], exist_ok=True)
+#         opt = _build_opt(folders[run_i])
+#         opt._prepare()
+#         if op.use_eeg_cap_boundary:
+#             apply_eeg_cap_boundary(opt, cfg.eeg_csv_path,
+#                                    margin_mm=op.eeg_cap_margin_mm)
+#         opt.run(cpus=op.cpus)
+#         fvals[run_i] = getattr(opt, "optim_funvalue", float("inf"))
+#         if n > 1:
+#             print(f"  Start {run_i + 1} funvalue: {fvals[run_i]:.6f}")
+#
+#         # Delete any previous subfolders that are no longer the best.
+#         # This frees disk space immediately — each subfolder contains large
+#         # final_sim_0/ and final_sim_1/ meshes that accumulate across runs.
+#         if n > 1 and run_i > 0:
+#             current_best = int(np.argmin(fvals[:run_i + 1]))
+#             for j in range(run_i):
+#                 if j != current_best and os.path.isdir(folders[j]):
+#                     shutil.rmtree(folders[j])
+#                     print(f"  Freed subfolder {j:02d}/ (not best)")
+#
+#     # Select best, promote to base folder, clean up subfolders
+#     if n > 1:
+#         best_idx = int(np.argmin(fvals))
+#         print(f"\n  Best start: #{best_idx + 1} (funvalue={fvals[best_idx]:.6f})")
+#         best_folder = folders[best_idx]
+#         for item in os.listdir(best_folder):
+#             src = os.path.join(best_folder, item)
+#             dst = os.path.join(opt_output_dir, item)
+#             if os.path.isdir(src):
+#                 if os.path.exists(dst):
+#                     shutil.rmtree(dst)
+#                 shutil.copytree(src, dst)
+#             else:
+#                 shutil.copy2(src, dst)
+#         for folder in folders:
+#             if os.path.isdir(folder):
+#                 shutil.rmtree(folder)
+#
+#     # ── dataset_description.json ──────────────────────────────────────────────
+#     desc = {
+#         "Name":        "SimNIBS TI Optimization",
+#         "BIDSVersion": "1.9.0",
+#         "DatasetType": "derivative",
+#         "GeneratedBy": [
+#             {
+#                 "Name":       "SimNIBS TesFlexOptimization",
+#                 "Container":  {"Type": "apptainer", "Image": "simnibs_v2.3.0.sif"},
+#                 "ROI":        cfg.roi.name,
+#                 "Goal":       op.goal,
+#                 "Postproc":   op.postproc,
+#                 "Multistart": n,
+#                 "BestFunvalue": float(np.min(fvals)),
+#             },
+#             {
+#                 "Name":       "run_pipeline.py",
+#                 "SlurmJobID": job_id or "local",
+#                 "Timestamp":  timestamp,
+#             },
+#         ],
+#     }
+#     with open(f"{opt_output_dir}/dataset_description.json", "w") as f:
+#         json.dump(desc, f, indent=2)
+#     print(f"  dataset_description.json written → {opt_output_dir}/dataset_description.json")
+#
+#     # ── Pointer file ──────────────────────────────────────────────────────────
+#     pointer = {
+#         "flex_run_dir": opt_output_dir,
+#         "roi":          cfg.roi.name,
+#         "goal":         op.goal,
+#         "postproc":     op.postproc,
+#         "timestamp":    timestamp,
+#         "slurm_job_id": job_id or "local",
+#     }
+#     with open(pointer_path, "w") as f:
+#         json.dump(pointer, f, indent=2)
+#     print(f"  Pointer saved → {pointer_path}")
+#     return opt_output_dir
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

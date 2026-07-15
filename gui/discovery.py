@@ -169,16 +169,18 @@ def expected_mask_path(subject_id: str, mask_type: str, name: str, project_dir: 
     create_roi/create_non_roi/create_general_mask — keep in sync if those change.
     `name` here is whatever the caller passes to create_roi/etc (the GUI page
     is responsible for baking the atlas name into it to avoid collisions,
-    e.g. BNA vs Allen both producing a "hippocampus" mask)."""
-    roi_dir = os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi")
-    if mask_type == "ROI":
-        fname = f"sub-{subject_id}_label-{name}_mask.nii.gz"
-    elif mask_type == "non-ROI":
-        fname = f"sub-{subject_id}_nonroi-{name}_mask.nii.gz"
-    elif mask_type == "general":
-        fname = f"sub-{subject_id}_mask-{name}.nii.gz"
-    else:
+    e.g. BNA vs Allen both producing a "hippocampus" mask).
+
+    All three mask types share one "_label-{name}_mask.nii.gz" naming — this
+    matches PipelineConfig.mask_path() in code/pipeline/config.py, which
+    run_pipeline.py's Section 1 uses for its own skip-if-exists check for
+    both roi and non_roi. A mask made here (any atlas) is directly usable by
+    the pipeline as long as the name given to Config Generation matches.
+    """
+    if mask_type not in ("ROI", "non-ROI", "general"):
         raise ValueError(f"Unknown mask type: {mask_type}")
+    roi_dir = os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi")
+    fname = f"sub-{subject_id}_label-{name}_mask.nii.gz"
     return os.path.join(roi_dir, fname)
 
 
