@@ -1,0 +1,13 @@
+﻿__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Result/archive dumps - not source, multi-GB, never belongs in git
+_archive/
+_results/
+_results.zip
+_results_okamoto_19.zip
+# Judgment calls from our discussion - comment out any line below you'd rather commit instead
+pipeline/configs/*.json
+pipeline/configs/_archive/
+pipeline/configs/_archive_pre_cleanup/
