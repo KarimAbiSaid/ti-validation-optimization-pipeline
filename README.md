@@ -25,7 +25,7 @@ code/resources/
     └── BioSemi32_MNE.csv               (this project's own cap layout, MNI space)
 ```
 
-**Before publishing/redistributing**: the Brainnetome atlas and the Allen Brain Atlas (Ding 2020) each have their own citation/redistribution terms — verify these permit inclusion in your repo before pushing (not verified as part of this reorganization).
+**If ever we want to make this public**: the Brainnetome atlas and the Allen Brain Atlas (Ding 2020) each have their own citation/redistribution terms — Must add that permit and citation to the code.
 
 Only the *derived/compressed* Allen files are here — the original 138 MB raw `.nii` isn't tracked or read by any code (keep it in your external data directory below if you want it for reference).
 
@@ -48,9 +48,9 @@ Beyond the repo-provided resources above, this repo expects a BIDS-like project 
                                            source, not yet usable per create_masks.py)
 ```
 
-None of the above should ever be committed to this repo — it's either private subject data or large generated derivatives.
+None of the above should ever be committed to this repo — it's either private subject data or large generated derivatives that would make the repository too large or unsafe.
 
-**Setting it up**: run `python scripts/init_project_layout.py --project-dir <PROJECT_DIR>` (or just set `$BIDS_TI_PROJECT_DIR` first and omit the flag) to create the top-level `rawdata/`/`derivatives/SimNIBS/`/`derivatives/freesurfer/` folders if they don't already exist — each gets a small `_LAYOUT_INFO.json` sidecar describing what belongs there. Safe to re-run any time; it only creates what's missing. Doesn't create per-subject folders — those come from your own MRI data or from running the pipeline.
+**Setting it up**: In the case that you need to set up the folder structure in whichever directory you like, run `python scripts/init_project_layout.py --project-dir <PROJECT_DIR>` (or just set `$BIDS_TI_PROJECT_DIR` first and omit the flag) to create the top-level `rawdata/`/`derivatives/SimNIBS/`/`derivatives/freesurfer/` folders if they don't already exist — each gets a small `_LAYOUT_INFO.json` sidecar describing what belongs there. Safe to re-run any time; it only creates what's missing. Doesn't create per-subject folders — those come from your own MRI data or from running the pipeline.
 
 ---
 
