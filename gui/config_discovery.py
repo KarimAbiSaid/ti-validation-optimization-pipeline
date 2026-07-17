@@ -44,6 +44,10 @@ OPTIMIZER_DEFAULTS = {
     "hard_roi_constraint":    True,
     "no_adjacent_electrodes": True,
     "non_roi_hard_constraint_groups": [],
+    "use_hierarchical_search":   False,
+    "num_fine_iterations":       0,
+    "neighbours_per_iteration":  [],
+    "early_stop_threshold":      0.03,
 }
 ELECTRODE_DEFAULTS = {
     "shape":             "ellipse",

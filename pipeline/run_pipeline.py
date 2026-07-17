@@ -34,7 +34,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 # ── Config import ─────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
-from config import PipelineConfig, ROIConfig, load_config, save_config, leadfield_tag
+from config import PipelineConfig, ROIConfig, load_config, save_config, leadfield_tag, is_stimulation_electrode
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,6 +568,73 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
 # GUARANTEE: finds the true global optimum over all discrete cap positions.
 # This is the CURRENT STATE OF THE optimization algorithm that we are using
 
+def _load_cap_positions(csv_path: str) -> dict:
+    """Parse an EEG cap CSV into {electrode_name: np.array([x, y, z])},
+    excluding ground/reference/fiducial-landmark rows (is_stimulation_electrode).
+    Handles both "Name,X,Y,Z" and "Type,x,y,z,label" (BioSemi-style) layouts."""
+    import csv as _csv
+
+    cap_pos: dict = {}
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        rows = [r for r in _csv.reader(f) if r and not r[0].strip().startswith('#')]
+    if not rows:
+        return cap_pos
+
+    hdr = [c.strip().lower() for c in rows[0]]
+    xi = next((i for i, h in enumerate(hdr) if h == 'x'), None)
+    yi = next((i for i, h in enumerate(hdr) if h == 'y'), None)
+    zi = next((i for i, h in enumerate(hdr) if h == 'z'), None)
+    ni = next((i for i, h in enumerate(hdr)
+                if h in ('label', 'name', 'ch_name', 'channel')), None)
+    has_header = xi is not None and yi is not None and zi is not None
+
+    for row in (rows[1:] if has_header else rows):
+        row = [c.strip() for c in row]
+        if len(row) < 4:
+            continue
+        try:
+            if has_header:
+                x, y, z = float(row[xi]), float(row[yi]), float(row[zi])
+                name = row[ni] if ni is not None else row[0]
+            else:
+                name = row[0]
+                x, y, z = float(row[1]), float(row[2]), float(row[3])
+            if is_stimulation_electrode(name):
+                cap_pos[name] = np.array([x, y, z])
+        except (ValueError, IndexError):
+            continue
+    return cap_pos
+
+
+def _farthest_point_sample(names: list, positions: dict, k: int) -> list:
+    """Greedy farthest-point sampling for spatial-coverage subset selection.
+    Deterministic — starts from the electrode nearest the centroid, then
+    repeatedly picks whichever remaining electrode is farthest from the
+    already-picked set."""
+    n = len(names)
+    if k >= n:
+        return list(names)
+    pts = np.array([positions[nm] for nm in names])
+    centroid = pts.mean(axis=0)
+    first = int(np.argmin(np.linalg.norm(pts - centroid, axis=1)))
+    selected = [first]
+    min_dist = np.linalg.norm(pts - pts[first], axis=1)
+    min_dist[first] = -1
+    while len(selected) < k:
+        nxt = int(np.argmax(min_dist))
+        selected.append(nxt)
+        min_dist = np.minimum(min_dist, np.linalg.norm(pts - pts[nxt], axis=1))
+        min_dist[selected] = -1
+    return [names[i] for i in selected]
+
+
+def _nearest_neighbours(name: str, candidates: list, positions: dict, n_neighbours: int) -> list:
+    """The n_neighbours electrodes in `candidates` closest to `name` (excluding itself)."""
+    others = [c for c in candidates if c != name]
+    others.sort(key=lambda c: np.linalg.norm(positions[name] - positions[c]))
+    return others[:n_neighbours]
+
+
 def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                                     job_id: str = "") -> str:
     """
@@ -838,43 +905,15 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     # adj_elec_pairs: set of frozenset({nameA, nameB}) for all cap-adjacent pairs.
     # A montage is rejected if ANY two of its four active electrodes are adjacent.
     adj_elec_pairs: set = set()
+
+    # Electrode positions are needed both for adjacency filtering (below) and
+    # for the hierarchical search (STEP 3) — parsed once, reused by whichever
+    # (or both) is enabled.
+    _cap_pos: dict = {}
+    if cfg.optimizer.no_adjacent_electrodes or cfg.optimizer.use_hierarchical_search:
+        _cap_pos = _load_cap_positions(cfg.eeg_csv_path)
+
     if cfg.optimizer.no_adjacent_electrodes:
-        _cap_pos: dict = {}
-        with open(cfg.eeg_csv_path, encoding="utf-8") as _f:
-            _raw_lines = [l.strip() for l in _f
-                          if l.strip() and not l.strip().startswith('#')]
-
-        if _raw_lines:
-            # If we added the electrodes as a csv such as in biosemi32, 
-            # We also add the adjacency list
-            # Parse header to locate x/y/z and name columns by column title.
-            # Handles both "Name,X,Y,Z" and "Type,x,y,z,label" (BioSemi) layouts.
-            _hdr = [c.strip().lower()
-                    for c in _raw_lines[0].replace(',', ' ').split()]
-            _xi = next((i for i, h in enumerate(_hdr) if h == 'x'), None)
-            _yi = next((i for i, h in enumerate(_hdr) if h == 'y'), None)
-            _zi = next((i for i, h in enumerate(_hdr) if h == 'z'), None)
-            _ni = next((i for i, h in enumerate(_hdr)
-                        if h in ('label', 'name', 'ch_name', 'channel')), None)
-            _has_header = _xi is not None and _yi is not None and _zi is not None
-
-            for _line in (_raw_lines[1:] if _has_header else _raw_lines):
-                _parts = _line.replace(',', ' ').split()
-                if len(_parts) < 4:
-                    continue
-                try:
-                    if _has_header:
-                        _x = float(_parts[_xi])
-                        _y = float(_parts[_yi])
-                        _z = float(_parts[_zi])
-                        _name = _parts[_ni] if _ni is not None else _parts[0]
-                    else:
-                        _name = _parts[0]
-                        _x, _y, _z = float(_parts[1]), float(_parts[2]), float(_parts[3])
-                    _cap_pos[_name] = np.array([_x, _y, _z])
-                except (ValueError, IndexError):
-                    continue
-
         # Use hardcoded adjacency for known caps; fall back to geometry otherwise.
         _cap_name = os.path.splitext(os.path.basename(cfg.eeg_csv_path))[0].lower()
         _lf_set   = set(all_elec_names)
@@ -914,116 +953,194 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         """E-field at a subset of elements for one electrode pair."""
         return TI.get_field([e_plus, e_minus, current_A], lf_subset, idx_lf)
 
-    all_pairs   = list(combinations(all_elec_names, 2))
-    n_pairs     = len(all_pairs)
-
-    # Pre-filter: build neighbour lookup and remove within-channel adjacent pairs
+    # Pre-filter: build neighbour lookup from the (subset-independent) global
+    # adjacency set once — reused unchanged by every round of search below,
+    # since it only depends on cap topology, not on which electrodes are
+    # currently being searched.
     nb_dict: dict = {}
     if adj_elec_pairs:
         for _p in adj_elec_pairs:
             _a, _b = list(_p)
             nb_dict.setdefault(_a, set()).add(_b)
             nb_dict.setdefault(_b, set()).add(_a)
-        valid_pairs = [p for p in all_pairs if frozenset(p) not in adj_elec_pairs]
-    else:
-        valid_pairs = all_pairs
-    n_valid = len(valid_pairs)
-
-    # Count valid montages (pairs of pairs with no shared/adjacent electrodes)
-    n_combos = 0
-    for _i in range(n_valid):
-        _ep1, _em1 = valid_pairs[_i]
-        _fbd = nb_dict.get(_ep1, set()) | nb_dict.get(_em1, set()) | {_ep1, _em1}
-        for _j in range(_i + 1, n_valid):
-            _ep2, _em2 = valid_pairs[_j]
-            if _ep2 not in _fbd and _em2 not in _fbd:
-                n_combos += 1
-
-    print(f"\n  Searching {n_combos} montages "
-          f"({n_valid} valid single-channel pairs after adjacency pre-filter) ...")
-
-    best_score  = -np.inf
-    best_ch1    = None
-    best_ch2    = None
-    # Fallback: best mean-ROI montage, used when hard_roi_constraint=True but no
-    # montage meets the threshold — we still return something rather than crashing.
-    fallback_score = -np.inf
-    fallback_ch1   = None
-    fallback_ch2   = None
-    n_feasible  = 0
-    t_start     = time.time()
-    n_eval      = 0
 
     roi_min_threshold = cfg.optimizer.focality_threshold[1] if hard_constraint else None
 
-    for i, (ep1, em1) in enumerate(valid_pairs):
-        # Perform the search
-        ef1_roi    = get_ef(lf_roi, ep1, em1)
-        ef1_cgrps  = [get_ef(cg['lf'], ep1, em1) for cg in nr_constraint_groups]
-        # Forbidden inner-pair electrodes: shared electrode or cross-channel adjacent
-        forbidden = nb_dict.get(ep1, set()) | nb_dict.get(em1, set()) | {ep1, em1}
+    def _count_combos(valid_pairs: list) -> int:
+        """Number of valid montages (pairs-of-pairs with no shared/adjacent electrode)."""
+        n = 0
+        for _i in range(len(valid_pairs)):
+            _ep1, _em1 = valid_pairs[_i]
+            _fbd = nb_dict.get(_ep1, set()) | nb_dict.get(_em1, set()) | {_ep1, _em1}
+            for _ep2, _em2 in valid_pairs[_i + 1:]:
+                if _ep2 not in _fbd and _em2 not in _fbd:
+                    n += 1
+        return n
 
-        for ep2, em2 in valid_pairs[i + 1:]:
-            if ep2 in forbidden or em2 in forbidden:
-                continue   # skip: shared electrode or cross-channel adjacency
+    def _search(candidate_names: list) -> dict:
+        """Exhaustive montage search restricted to candidate_names. Same core
+        logic as the original flat search — called once with all electrodes
+        for the default (non-hierarchical) path, or iteratively with growing/
+        shrinking subsets for the hierarchical path."""
+        pairs = list(combinations(candidate_names, 2))
+        valid_pairs = ([p for p in pairs if frozenset(p) not in adj_elec_pairs]
+                       if adj_elec_pairs else pairs)
+        n_valid  = len(valid_pairs)
+        n_combos = _count_combos(valid_pairs)
+        print(f"\n  Searching {n_combos} montages ({n_valid} valid single-channel "
+              f"pairs, {len(candidate_names)} electrodes) ...")
 
-            ef2_roi = get_ef(lf_roi, ep2, em2)
-            ti_roi  = TI.get_maxTI(ef1_roi, ef2_roi)
-            n_eval += 1
+        best_score  = -np.inf
+        best_ch1 = best_ch2 = None
+        # Fallback: best mean-ROI montage, used when hard_roi_constraint=True but no
+        # montage meets the threshold — we still return something rather than crashing.
+        fallback_score = -np.inf
+        fallback_ch1 = fallback_ch2 = None
+        n_feasible = 0
+        n_eval     = 0
+        t_start    = time.time()
 
-            if use_focality:
-                ef1_nr  = get_ef(lf_non_roi, ep1, em1)
-                ef2_nr  = get_ef(lf_non_roi, ep2, em2)
-                ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
+        for i, (ep1, em1) in enumerate(valid_pairs):
+            ef1_roi    = get_ef(lf_roi, ep1, em1)
+            ef1_cgrps  = [get_ef(cg['lf'], ep1, em1) for cg in nr_constraint_groups]
+            # Forbidden inner-pair electrodes: shared electrode or cross-channel adjacent
+            forbidden = nb_dict.get(ep1, set()) | nb_dict.get(em1, set()) | {ep1, em1}
 
-                if hard_constraint:
-                    roi_mean = float(np.mean(ti_roi))
-                    if roi_mean > fallback_score:
-                        fallback_score = roi_mean
-                        fallback_ch1   = (ep1, em1)
-                        fallback_ch2   = (ep2, em2)
-                    if roi_mean < roi_min_threshold:
-                        continue   # hard constraint: below minimum dose, skip
+            for ep2, em2 in valid_pairs[i + 1:]:
+                if ep2 in forbidden or em2 in forbidden:
+                    continue   # skip: shared electrode or cross-channel adjacency
 
-                # Per-subgroup non-ROI hard constraints
-                if nr_constraint_groups:
-                    _violated = False
-                    for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
-                        _ef2_cg = get_ef(_cg['lf'], ep2, em2)
-                        if float(np.mean(TI.get_maxTI(_ef1_cg, _ef2_cg))) > _cg['max_mean']:
-                            _violated = True
-                            break
-                    if _violated:
-                        continue
+                ef2_roi = get_ef(lf_roi, ep2, em2)
+                ti_roi  = TI.get_maxTI(ef1_roi, ef2_roi)
+                n_eval += 1
 
-                if hard_constraint:
-                    n_feasible += 1
+                if use_focality:
+                    ef1_nr  = get_ef(lf_non_roi, ep1, em1)
+                    ef2_nr  = get_ef(lf_non_roi, ep2, em2)
+                    ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
 
-                # ROC returns a distance to the ideal point — lower is better.
-                # Negate so higher score = better (consistent with mean case).
-                score = -ROC(ti_roi, ti_nr,
-                             cfg.optimizer.focality_threshold, focal=True)
-            else:
-                score = float(np.mean(ti_roi))
+                    if hard_constraint:
+                        roi_mean = float(np.mean(ti_roi))
+                        if roi_mean > fallback_score:
+                            fallback_score = roi_mean
+                            fallback_ch1   = (ep1, em1)
+                            fallback_ch2   = (ep2, em2)
+                        if roi_mean < roi_min_threshold:
+                            continue   # hard constraint: below minimum dose, skip
 
-            if score > best_score:
-                best_score = score
-                best_ch1   = (ep1, em1)
-                best_ch2   = (ep2, em2)
+                    # Per-subgroup non-ROI hard constraints
+                    if nr_constraint_groups:
+                        _violated = False
+                        for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
+                            _ef2_cg = get_ef(_cg['lf'], ep2, em2)
+                            if float(np.mean(TI.get_maxTI(_ef1_cg, _ef2_cg))) > _cg['max_mean']:
+                                _violated = True
+                                break
+                        if _violated:
+                            continue
 
-    elapsed = time.time() - t_start
+                    if hard_constraint:
+                        n_feasible += 1
 
-    if hard_constraint and best_ch1 is None:
-        print(f"\n  WARNING: No montage meets hard ROI constraint "
-              f"(mean TI >= {roi_min_threshold} V/m). "
-              f"Falling back to best mean-ROI montage.")
-        best_ch1   = fallback_ch1
-        best_ch2   = fallback_ch2
-        best_score = fallback_score
+                    # ROC returns a distance to the ideal point — lower is better.
+                    # Negate so higher score = better (consistent with mean case).
+                    score = -ROC(ti_roi, ti_nr,
+                                 cfg.optimizer.focality_threshold, focal=True)
+                else:
+                    score = float(np.mean(ti_roi))
 
-    feasible_str = f"  Feasible montages (ROI >= {roi_min_threshold} V/m): {n_feasible}\n" if hard_constraint else ""
-    print(f"  Evaluated {n_eval} montages in {elapsed:.1f}s ({n_eval/elapsed:.0f}/s)")
-    print(feasible_str, end="")
+                if score > best_score:
+                    best_score = score
+                    best_ch1   = (ep1, em1)
+                    best_ch2   = (ep2, em2)
+
+        elapsed = time.time() - t_start
+
+        used_fallback = hard_constraint and best_ch1 is None
+        if used_fallback:
+            print(f"\n  WARNING: No montage meets hard ROI constraint "
+                  f"(mean TI >= {roi_min_threshold} V/m). "
+                  f"Falling back to best mean-ROI montage.")
+            best_ch1   = fallback_ch1
+            best_ch2   = fallback_ch2
+            best_score = fallback_score
+
+        rate = f"{n_eval/elapsed:.0f}/s" if elapsed > 1e-9 else "n/a"
+        print(f"  Evaluated {n_eval} montages in {elapsed:.1f}s ({rate})")
+        if hard_constraint:
+            print(f"  Feasible montages (ROI >= {roi_min_threshold} V/m): {n_feasible}")
+
+        return {
+            "best_ch1": best_ch1, "best_ch2": best_ch2, "best_score": best_score,
+            "n_feasible": n_feasible, "n_eval": n_eval, "elapsed": elapsed,
+            "n_valid_pairs": n_valid, "n_combos": n_combos, "used_fallback": used_fallback,
+        }
+
+    # ── Coarse-to-fine (hierarchical) vs flat exhaustive search ────────────
+    history = None
+    if cfg.optimizer.use_hierarchical_search:
+        n_total  = len(all_elec_names)
+        coarse_k = max(round(0.5 * n_total), min(n_total, 32))
+        missing  = [nm for nm in all_elec_names if nm not in _cap_pos]
+        if missing:
+            abort(f"Hierarchical search needs electrode positions for every cap "
+                  f"electrode — missing from {cfg.eeg_csv_path}: {missing}")
+
+        n_fine = cfg.optimizer.num_fine_iterations
+        neighbours_per_iter = cfg.optimizer.neighbours_per_iteration
+        if n_fine and len(neighbours_per_iter) != n_fine:
+            abort(f"optimizer.neighbours_per_iteration must have exactly {n_fine} "
+                  f"entries (num_fine_iterations), got {len(neighbours_per_iter)}")
+
+        print(f"\n  Hierarchical (coarse-to-fine) search — {n_fine} fine iteration(s) configured")
+        print(f"  Coarse round: {coarse_k}/{n_total} electrodes (farthest-point spatial sampling)")
+        coarse_names = _farthest_point_sample(all_elec_names, _cap_pos, coarse_k)
+        round_result = _search(coarse_names)
+        history = [{"round": "coarse", "n_electrodes": len(coarse_names),
+                    **{k: v for k, v in round_result.items() if k not in ("best_ch1", "best_ch2")}}]
+
+        candidate_set = set(coarse_names)
+        for it in range(n_fine):
+            n_nb    = neighbours_per_iter[it]
+            winners = [round_result["best_ch1"][0], round_result["best_ch1"][1],
+                       round_result["best_ch2"][0], round_result["best_ch2"][1]]
+            new_candidates = set(candidate_set)
+            for w in winners:
+                new_candidates.add(w)
+                new_candidates.update(_nearest_neighbours(w, all_elec_names, _cap_pos, n_nb))
+
+            if new_candidates == candidate_set:
+                print(f"\n  Fine iteration {it + 1}/{n_fine}: neighbour expansion added no "
+                      f"new electrodes to the candidate set — stopping early.")
+                break
+
+            candidate_set = new_candidates
+            print(f"\n  Fine iteration {it + 1}/{n_fine}: {len(candidate_set)} electrodes "
+                  f"(4 winners x {n_nb} nearest neighbours, deduplicated with prior candidates)")
+            new_result = _search(sorted(candidate_set, key=all_elec_names.index))
+            history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
+                             **{k: v for k, v in new_result.items() if k not in ("best_ch1", "best_ch2")}})
+
+            prev_score  = round_result["best_score"]
+            improvement = ((new_result["best_score"] - prev_score) / abs(prev_score)
+                            if prev_score != 0 else float("inf"))
+            round_result = new_result
+            print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
+
+            if improvement < cfg.optimizer.early_stop_threshold:
+                print(f"  Improvement below the {cfg.optimizer.early_stop_threshold * 100:.0f}% "
+                      f"threshold — stopping early.")
+                break
+
+        final = round_result
+    else:
+        final = _search(all_elec_names)
+
+    best_ch1, best_ch2, best_score = final["best_ch1"], final["best_ch2"], final["best_score"]
+    n_eval     = sum(h["n_eval"] for h in history) if history else final["n_eval"]
+    elapsed    = sum(h["elapsed"] for h in history) if history else final["elapsed"]
+    n_feasible = sum(h["n_feasible"] for h in history) if history else final["n_feasible"]
+
     print(f"\n  ══ Best montage ══")
     print(f"  Ch1: {best_ch1[0]}+ / {best_ch1[1]}-  @ {cfg.electrode.current_mA} mA")
     print(f"  Ch2: {best_ch2[0]}+ / {best_ch2[1]}-  @ {cfg.electrode.current_mA} mA")
@@ -1067,6 +1184,14 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         },
         "roi_TI_mean_V_m": round(roi_mean_V_m, 6),
     }
+    if history is not None:
+        results["hierarchical_search"] = {
+            "coarse_electrodes": history[0]["n_electrodes"],
+            "num_fine_iterations_configured": cfg.optimizer.num_fine_iterations,
+            "num_fine_iterations_run": len(history) - 1,
+            "early_stop_threshold": cfg.optimizer.early_stop_threshold,
+            "rounds": [{k: v for k, v in h.items() if k != "used_fallback"} for h in history],
+        }
     if use_focality:
         results["focality_roc_score"]       = round(best_score, 6)
         results["focality_threshold"]       = cfg.optimizer.focality_threshold

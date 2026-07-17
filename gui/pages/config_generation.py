@@ -258,6 +258,33 @@ layout = html.Div([
         inline=True,
     ),
 
+    html.Div([
+        dcc.Checklist(
+            id="cg-opt-hier-enable",
+            options=[{"label": " use_hierarchical_search (coarse-to-fine electrode search)",
+                      "value": "use_hierarchical_search"}],
+            value=[k for k in ("use_hierarchical_search",) if cd.OPTIMIZER_DEFAULTS[k]],
+        ),
+        html.Div([
+            html.Div([
+                html.Label("num_fine_iterations"),
+                dcc.Input(id="cg-opt-hier-num-iter", type="number", min=0, step=1,
+                          value=cd.OPTIMIZER_DEFAULTS["num_fine_iterations"], style={"width": "100%"}),
+            ], style={"minWidth": "160px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("neighbours per iteration (comma-separated, one value per fine iteration)"),
+                dcc.Input(id="cg-opt-hier-neighbours", type="text", placeholder="e.g. 8,6,4",
+                          value="", style={"width": "100%"}),
+            ], style={"minWidth": "280px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("early_stop_threshold (%)"),
+                dcc.Input(id="cg-opt-hier-early-stop", type="number", min=0, step=0.5,
+                          value=cd.OPTIMIZER_DEFAULTS["early_stop_threshold"] * 100, style={"width": "100%"}),
+            ], style={"minWidth": "160px", "marginRight": "1rem"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
+              "border": "1px solid #ccc", "borderRadius": "4px"}),
+
     html.H3("Electrode", style={"marginTop": "1.5rem"}),
     html.Div([
         html.Div([
@@ -522,6 +549,10 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
     State("cg-opt-focality-nonroi", "value"),
     State("cg-opt-focality-roi", "value"),
     State("cg-opt-checkboxes", "value"),
+    State("cg-opt-hier-enable", "value"),
+    State("cg-opt-hier-num-iter", "value"),
+    State("cg-opt-hier-neighbours", "value"),
+    State("cg-opt-hier-early-stop", "value"),
     State("cg-elec-diameter", "value"),
     State("cg-elec-gel-thickness", "value"),
     State("cg-elec-max-current", "value"),
@@ -531,6 +562,7 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
 def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_label_ids,
                        non_roi_name, non_roi_atlas, non_roi_label_ids, goals, cap_path,
                        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+                       hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
                        elec_diameter, elec_gel, elec_max_current, flags_checklist):
     rows = rows or []
     selected_rows = selected_rows or []
@@ -540,12 +572,31 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         return html.Div("Nothing to generate — check subject/ROI/non-ROI/goal selection.",
                          style={"color": "#a00"})
 
+    use_hierarchical = "use_hierarchical_search" in (hier_enable or [])
+    num_fine_iter = int(hier_num_iter) if hier_num_iter else 0
+    neighbours_per_iter = []
+    if hier_neighbours_str and hier_neighbours_str.strip():
+        try:
+            neighbours_per_iter = [int(x.strip()) for x in hier_neighbours_str.split(",") if x.strip()]
+        except ValueError:
+            return html.Div(f"neighbours per iteration must be comma-separated integers "
+                             f"(e.g. 8,6,4) — got: {hier_neighbours_str!r}",
+                             style={"color": "#a00"})
+    if use_hierarchical and num_fine_iter and len(neighbours_per_iter) != num_fine_iter:
+        return html.Div(f"neighbours per iteration must have exactly {num_fine_iter} value(s) "
+                         f"(one per fine iteration) — got {len(neighbours_per_iter)}.",
+                         style={"color": "#a00"})
+
     optimizer_overrides = {
         "postproc": postproc,
         "cpus": cpus,
         "focality_threshold": [focality_nonroi, focality_roi],
         "hard_roi_constraint": "hard_roi_constraint" in (opt_checkboxes or []),
         "no_adjacent_electrodes": "no_adjacent_electrodes" in (opt_checkboxes or []),
+        "use_hierarchical_search": use_hierarchical,
+        "num_fine_iterations": num_fine_iter,
+        "neighbours_per_iteration": neighbours_per_iter,
+        "early_stop_threshold": (hier_early_stop_pct or 0) / 100.0,
     }
     electrode_overrides = {
         "dimensions": [elec_diameter, elec_diameter],

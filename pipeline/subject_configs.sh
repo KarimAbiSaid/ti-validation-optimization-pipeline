@@ -4,7 +4,8 @@
 declare -A SUBJECT_CONFIGS
 declare -A SUBJECT_TIMELIMITS
 
-SUBJECT_CONFIGS["52Y03"]="${BASE_CONFIG_DIR}/sub-52Y03_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_CONFIGS["52Y03"]="${BASE_CONFIG_DIR}/sub-52Y03_roi-STN_L_roi_Allen_ex_focality.json \
+  ${BASE_CONFIG_DIR}/sub-52Y03_roi-STN_L_roi_Allen_ex_mean.json"
 SUBJECT_TIMELIMITS["52Y03"]="02:00:00"
 
 SUBJECT_CONFIGS["52Y04"]="${BASE_CONFIG_DIR}/sub-52Y04_roi-STN_L_roi_Allen_ex_focality.json"

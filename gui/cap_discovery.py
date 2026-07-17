@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 
 from common import PROJECT_DIR, RESOURCES_DIR, get_m2m_path, discover_subjects  # noqa: F401 (re-exported)
+from config import is_stimulation_electrode  # noqa: F401 (re-exported) — shared with run_pipeline.py
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -123,6 +124,23 @@ def read_cap_csv(path: str) -> dict:
     return {"types": types, "names": names, "coords": np.array(coords)}
 
 
+def _filter_non_electrodes(cap: dict) -> dict:
+    """Drops ground/reference/fiducial-landmark rows (see
+    config.NON_ELECTRODE_NAMES) from a read_cap_csv() result — not real
+    stimulation contacts, even though some cap files tag them with the same
+    Type as real electrodes (no Type-based way to distinguish them there).
+    Applied once, at registration/adoption time, so neither the leadfield
+    nor the montage search ever sees them."""
+    keep = [i for i, n in enumerate(cap["names"]) if is_stimulation_electrode(n)]
+    if len(keep) == len(cap["names"]):
+        return cap
+    return {
+        "types": [cap["types"][i] for i in keep],
+        "names": [cap["names"][i] for i in keep],
+        "coords": cap["coords"][keep],
+    }
+
+
 def validate_cap_path(path: str) -> dict:
     """For the custom-path input: {"exists", "readable", "n_electrodes", "error"}."""
     if not path or not os.path.isfile(path):
@@ -195,7 +213,7 @@ def register_cap(subject_id: str, cap_path: str, project_dir: str = PROJECT_DIR)
         from simnibs import mesh_io
         from simnibs.utils.transformations import mni2subject_coords
 
-        cap = read_cap_csv(cap_path)
+        cap = _filter_non_electrodes(read_cap_csv(cap_path))
         coords_subj = mni2subject_coords(cap["coords"], m2m_path)
 
         mesh = mesh_io.read_msh(msh_path)
@@ -235,7 +253,7 @@ def adopt_subject_space_cap(subject_id: str, cap_path: str, project_dir: str = P
         return {"subject_id": subject_id, "success": False, "error": f"m2m not found: {m2m_path}",
                 "out_path": None, "n_electrodes": None}
     try:
-        cap = read_cap_csv(cap_path)
+        cap = _filter_non_electrodes(read_cap_csv(cap_path))
         out_path = registered_cap_path(subject_id, cap_path, project_dir)
         _write_registered_csv(out_path, cap["types"], cap["names"], cap["coords"])
         return {"subject_id": subject_id, "success": True, "error": None,

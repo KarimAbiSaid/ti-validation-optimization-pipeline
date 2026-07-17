@@ -181,17 +181,23 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
         if not up["success"]:
             return {"success": False, "job_id": None, "error": f"m2m_ upload failed: {up['stderr']}"}
 
-    # Registered cap CSV — upload if the config references one SCITAS doesn't have
+    # Registered cap CSV — always re-uploaded (overwriting any remote copy).
+    # Unlike m2m_/BNA below, this file is tiny (a few KB), so there's no cost
+    # to always refreshing it — a skip-if-exists check here previously let a
+    # stale remote cap silently survive a local re-registration (e.g. after
+    # fixing which rows count as real electrodes), since the check only
+    # looked at existence, not content.
     cap_csv = cfg.get("cap_csv")
     if cap_csv:
         remote_cap_csv = _to_scratch(cap_csv)
-        if not sd.remote_path_exists(remote_cap_csv):
-            cap_name = os.path.splitext(os.path.basename(cap_csv))[0]
-            local_cap_csv = os.path.join(get_m2m_path(subject_id), "eeg_positions", f"{cap_name}.csv")
-            if not os.path.isfile(local_cap_csv):
+        cap_name = os.path.splitext(os.path.basename(cap_csv))[0]
+        local_cap_csv = os.path.join(get_m2m_path(subject_id), "eeg_positions", f"{cap_name}.csv")
+        if not os.path.isfile(local_cap_csv):
+            if not sd.remote_path_exists(remote_cap_csv):
                 return {"success": False, "job_id": None,
                         "error": f"registered cap not found locally or on SCITAS: {cap_name} "
                                  f"— run Cap Registration first."}
+        else:
             sd.remote_mkdir(os.path.dirname(remote_cap_csv))
             up = sd.scp_upload(local_cap_csv, remote_cap_csv, recursive=False)
             if not up["success"]:

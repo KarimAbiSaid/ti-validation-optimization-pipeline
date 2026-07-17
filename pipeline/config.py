@@ -12,6 +12,27 @@ import json
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
+# Ground/reference/fiducial-landmark names some digitized or custom cap CSVs
+# include alongside real electrodes — never valid stimulation contacts, even
+# when the file's own "Type" column tags them the same as real electrodes
+# (seen in practice: a cap CSV where every row, including GND, is tagged
+# "Electrode" — no Type-based way to distinguish them there). Matched
+# case-insensitively against the cap's "label"/name column. NOTE: "Iz" is a
+# real posterior-midline 10-10 electrode, distinct from the "inion" landmark
+# below — do not add "Iz" here.
+NON_ELECTRODE_NAMES = {
+    "gnd", "ground",
+    "ref", "reference",
+    "nasion", "nz",
+    "inion",
+    "left pre auricular point", "right pre auricular point", "lpa", "rpa",
+    "left exocantion", "right exocantion", "left exocanthion", "right exocanthion", "loc", "roc",
+}
+
+
+def is_stimulation_electrode(name: str) -> bool:
+    return (name or "").strip().lower() not in NON_ELECTRODE_NAMES
+
 
 # ── Sub-configs ────────────────────────────────────────────────────────────────
 
@@ -122,6 +143,29 @@ class OptimizerConfig:
     # regardless of the overall non-ROI union mean.
     # Each entry: {"name": str, "bna_labels": {str: int}, "max_mean_V_m": float}
     non_roi_hard_constraint_groups: List[dict] = field(default_factory=list)
+
+    # Hierarchical / coarse-to-fine electrode search (opt-in). When False
+    # (default) run_exhaustive_cap_optimization searches all electrodes in one
+    # flat pass — identical to the original (pre-hierarchical) behaviour.
+    use_hierarchical_search: bool = False
+
+    # Number of refinement ("fine") rounds run after the initial coarse round.
+    # 0 means the coarse round's result IS the final result.
+    num_fine_iterations: int = 0
+
+    # Nearest-neighbour count per fine iteration — one entry per iteration
+    # (length must equal num_fine_iterations). Each round expands every
+    # current winning electrode to its N nearest neighbours from the full
+    # (dense) electrode set, unions those into the candidate set, and
+    # re-searches exhaustively over that (still much smaller than the full set).
+    neighbours_per_iteration: List[int] = field(default_factory=list)
+
+    # Stop refining once a fine iteration's score improvement over the
+    # previous round is below this fraction (e.g. 0.03 = 3%). Refinement also
+    # stops automatically, regardless of this threshold, if an iteration's
+    # neighbour-expansion doesn't add any new electrode to the candidate set
+    # (further rounds would just repeat the same search).
+    early_stop_threshold: float = 0.03
 
 
 @dataclass
