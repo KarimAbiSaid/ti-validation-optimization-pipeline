@@ -261,8 +261,8 @@ layout = html.Div([
     html.H3("Electrode", style={"marginTop": "1.5rem"}),
     html.Div([
         html.Div([
-            html.Label("radius (mm)"),
-            dcc.Input(id="cg-elec-radius", type="number", step=0.5,
+            html.Label("diameter (mm)"),
+            dcc.Input(id="cg-elec-diameter", type="number", step=0.5,
                       value=cd.ELECTRODE_DEFAULTS["dimensions"][0], style={"width": "100%"}),
         ], style={"minWidth": "140px", "marginRight": "1rem"}),
         html.Div([
@@ -354,10 +354,25 @@ def _load_subjects(_):
     return options
 
 
-@callback(Output("cg-cap-dropdown", "options"), Input("cg-cap-dropdown", "id"))
-def _load_caps(_):
-    return [{"label": f"{c['name']}  ({c['source']})", "value": c["path"]}
-            for c in cap_discovery.list_available_caps()]
+@callback(Output("cg-cap-dropdown", "options"), Input("cg-subject-dropdown", "value"))
+def _load_caps(subject_ids):
+    """Caps actually REGISTERED for the selected subject(s) — m2m_{id}/
+    eeg_positions/*.csv — not generic MNI-space templates (list_available_caps()
+    would show every cap that exists project-wide, regardless of whether any
+    selected subject has it registered; a custom-registered cap that isn't
+    one of those templates would never show up at all). Union across
+    subjects if more than one is selected; the Subject Readiness table below
+    flags whichever subjects are actually missing the chosen cap. Only the
+    filename stem matters downstream (build_config()/registered_cap_path()
+    both re-derive the per-subject path from it), so any one subject's path
+    for a given cap name is an equally valid dropdown value."""
+    if not subject_ids:
+        return []
+    seen = {}
+    for sid in subject_ids:
+        for c in cap_discovery.list_registered_caps(sid):
+            seen.setdefault(c["name"], c["path"])
+    return [{"label": name, "value": path} for name, path in sorted(seen.items())]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -507,7 +522,7 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
     State("cg-opt-focality-nonroi", "value"),
     State("cg-opt-focality-roi", "value"),
     State("cg-opt-checkboxes", "value"),
-    State("cg-elec-radius", "value"),
+    State("cg-elec-diameter", "value"),
     State("cg-elec-gel-thickness", "value"),
     State("cg-elec-max-current", "value"),
     State("cg-flags-checklist", "value"),
@@ -516,7 +531,7 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
 def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_label_ids,
                        non_roi_name, non_roi_atlas, non_roi_label_ids, goals, cap_path,
                        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
-                       elec_radius, elec_gel, elec_max_current, flags_checklist):
+                       elec_diameter, elec_gel, elec_max_current, flags_checklist):
     rows = rows or []
     selected_rows = selected_rows or []
     subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
@@ -533,7 +548,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         "no_adjacent_electrodes": "no_adjacent_electrodes" in (opt_checkboxes or []),
     }
     electrode_overrides = {
-        "dimensions": [elec_radius, elec_radius],
+        "dimensions": [elec_diameter, elec_diameter],
         "gel_thickness": elec_gel,
         "max_total_current": elec_max_current,
     }
