@@ -114,16 +114,41 @@ def load_subject_resources(
     cap_name:     str,
     roi_mask:     str,
     non_roi_mask: str | None = None,
+    electrode_shape:         str | None = None,
+    electrode_dimensions:    list | None = None,
+    electrode_gel_thickness: float | None = None,
 ) -> SubjectResources:
-    """Load leadfield + ROI/non-ROI masks for a subject. Call once, reuse."""
+    """Load leadfield + ROI/non-ROI masks for a subject. Call once, reuse.
+
+    electrode_shape/dimensions/gel_thickness are optional and opt-in: pass
+    them to look up a leadfield from the newer per-settings cache that
+    run_pipeline.py writes (leadfield_volume/{tag}/, see config.leadfield_tag)
+    — needed if you want a leadfield computed with specific electrode
+    geometry rather than whatever happens to be cached. Leave them unset
+    (the default) to keep using the older flat
+    leadfield_volume/{id}_leadfield_{cap}.hdf5 path, unchanged, for any
+    existing notebook/script call that doesn't pass them.
+    """
     from simnibs.simulation.sim_struct import TDCSLEADFIELD
     from simnibs.utils import TI_utils as TI
     from simnibs import mesh_io
 
-    lf_dir  = os.path.join(project_dir, "derivatives", "SimNIBS",
-                           f"sub-{subject_id}", "leadfield_volume")
-    lf_hdf  = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}.hdf5")
-    lf_par  = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}_params.json")
+    base_lf_dir = os.path.join(project_dir, "derivatives", "SimNIBS",
+                               f"sub-{subject_id}", "leadfield_volume")
+
+    if electrode_dimensions is not None:
+        from config import leadfield_tag
+        tag    = leadfield_tag(cap_name, electrode_shape or "ellipse", electrode_dimensions,
+                               electrode_gel_thickness if electrode_gel_thickness is not None else 1.0)
+        lf_dir = os.path.join(base_lf_dir, tag)
+        # TDCSLEADFIELD's own output filename convention (subpath + eeg_cap
+        # basename) — only the directory is new, not this filename pattern.
+        lf_hdf = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}.hdf5")
+        lf_par = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}_params.json")
+    else:
+        lf_dir = base_lf_dir
+        lf_hdf = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}.hdf5")
+        lf_par = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}_params.json")
 
     if not os.path.isfile(lf_hdf):
         sys.exit(f"ERROR: leadfield not found:\n  {lf_hdf}")

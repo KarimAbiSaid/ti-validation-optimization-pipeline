@@ -105,19 +105,33 @@ def run_leadfield_row(
     ch1_plus: str, ch1_minus: str, ch1_current_mA: float,
     ch2_plus: str, ch2_minus: str, ch2_current_mA: float,
     label: str, project_dir: str = PROJECT_DIR,
+    electrode_shape: str | None = None, electrode_dimensions: list | None = None,
+    electrode_gel_thickness: float | None = None,
 ) -> dict:
-    """Runs synchronously (fast/algebraic) — call directly, no background job needed."""
+    """Runs synchronously (fast/algebraic) — call directly, no background job needed.
+
+    electrode_shape/dimensions/gel_thickness: which cached leadfield variant
+    to use for this cap (see fem_discovery.leadfield_status) — leave unset to
+    get "any variant for this cap" (today's coarse behaviour, from before
+    per-settings variants existed)."""
     roi_mask = resolve_mask(subject_id, roi_label, project_dir)
     if not roi_mask:
         return {"success": False, "error": f"ROI mask not found for sub-{subject_id}, label '{roi_label}'"}
     non_roi_mask = resolve_mask(subject_id, non_roi_label, project_dir) if non_roi_label else None
 
+    status = fd.leadfield_status(subject_id, cap_name, project_dir,
+                                 shape=electrode_shape, dimensions=electrode_dimensions,
+                                 gel_thickness=electrode_gel_thickness)
+    if not status["exists"]:
+        return {"success": False,
+                "error": f"No leadfield for sub-{subject_id} / {cap_name}: {status['hdf5_path']}"}
+
     return fd.compute_ti(
-        subject_id=subject_id, cap_name=cap_name,
+        subject_id=subject_id, hdf5_path=status["hdf5_path"],
         roi_mask_path=roi_mask, non_roi_mask_path=non_roi_mask,
         ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=ch1_current_mA,
         ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=ch2_current_mA,
-        label=label, project_dir=project_dir,
+        electrode_dims=electrode_dimensions, label=label, project_dir=project_dir,
     )
 
 

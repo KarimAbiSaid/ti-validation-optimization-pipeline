@@ -243,6 +243,42 @@ def _same_grid(img_a, img_b) -> bool:
     return img_a.shape == img_b.shape and np.allclose(img_a.affine, img_b.affine, atol=1e-3)
 
 
+def combine_masks(subject_id: str, mask_paths: list[str], mask_type: str, name: str,
+                   project_dir: str = PROJECT_DIR) -> dict:
+    """Unions (logical OR) 2+ existing mask files for one subject into a new
+    mask — atlas-agnostic: works across masks built from different atlases
+    or with different hemisphere settings (e.g. left-STN from Allen +
+    bilateral-M1 from Allen), as long as they're all in this subject's
+    space. Every mask MaskGeneratorEngine produces already shares one common
+    grid (it resamples onto charm's Conform grid regardless of source), so
+    this is just a grid-match check + logical OR, not a resampling step.
+    Returns {"success", "voxel_count", "out_path", "error"}."""
+    import nibabel as nib
+    import numpy as np
+
+    if len(mask_paths) < 2:
+        return {"success": False, "voxel_count": None, "out_path": None,
+                "error": "select at least 2 masks to combine"}
+
+    ref_img = nib.load(mask_paths[0])
+    combined = np.zeros(ref_img.shape, dtype=bool)
+    for p in mask_paths:
+        img = nib.load(p)
+        if not _same_grid(img, ref_img):
+            return {"success": False, "voxel_count": None, "out_path": None,
+                    "error": f"grid mismatch — {os.path.basename(p)} isn't on the same grid as "
+                             f"{os.path.basename(mask_paths[0])}"}
+        combined |= (np.asarray(img.dataobj) > 0)
+
+    out_path = expected_mask_path(subject_id, mask_type, name, project_dir)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    img_out = nib.Nifti1Image(combined.astype(np.uint8), ref_img.affine, ref_img.header)
+    img_out.set_data_dtype(np.uint8)
+    nib.save(img_out, out_path)
+
+    return {"success": True, "voxel_count": int(combined.sum()), "out_path": out_path, "error": None}
+
+
 def mask_centroid_in_t1_voxels(subject_id: str, mask_path: str, project_dir: str = PROJECT_DIR) -> tuple[int, int, int]:
     """A mask voxel to default the slice preview to, expressed in T1.nii.gz's
     voxel grid. Uses the actual mask voxel closest to the centroid (a

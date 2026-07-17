@@ -20,9 +20,21 @@ import numpy as np
 import nibabel as nib
 from scipy.ndimage import map_coordinates
 
+# This script's own print()s use non-ASCII characters (→, ✓, ═ box drawing,
+# ...). When stdout/stderr aren't an interactive console (piped/redirected —
+# true for local runs via the GUI, or "python run_pipeline.py > log.txt"),
+# Python falls back to the OS locale's preferred encoding, which is cp1252
+# on Windows, not UTF-8 — crashing with UnicodeEncodeError on the first such
+# character. SCITAS's Linux container defaults to UTF-8, so this never
+# showed up there; reconfigure explicitly so local Windows runs don't depend
+# on the caller happening to set PYTHONIOENCODING.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Config import ─────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
-from config import PipelineConfig, ROIConfig, load_config, save_config
+from config import PipelineConfig, ROIConfig, load_config, save_config, leadfield_tag
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -599,13 +611,23 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     # If the leadfield already exists
     # just load the cached hdf5 file since it takes a lot of time to compute
     cap_basename = os.path.splitext(os.path.basename(cfg.eeg_csv_path))[0]
-    lf_dir      = f"{cfg.sim_sub_dir}/leadfield_volume"
+    el = cfg.electrode
+
+    # Each distinct (cap, electrode shape/dimensions/gel_thickness) combination
+    # gets its own subdirectory, keyed by leadfield_tag() — so switching
+    # electrode settings and switching back later reuses the matching cache
+    # instead of recomputing, and never collides with a different combination's
+    # leftover SimNIBS bookkeeping files (.mat, logs) the way a single shared
+    # directory did (the actual cause of the old "Found already existing
+    # simulation results" crash on a settings change).
+    tag         = leadfield_tag(cap_basename, el.shape, el.dimensions, el.gel_thickness)
+    lf_dir      = f"{cfg.sim_sub_dir}/leadfield_volume/{tag}"
+    # TDCSLEADFIELD names its own output file "{subject_id}_leadfield_{cap_basename}.hdf5"
+    # (SimNIBS's own convention, based on subpath + eeg_cap — not ours to choose) —
+    # only its DIRECTORY (lf_dir) is new; the filename inside it is unchanged.
     lf_hdf      = f"{lf_dir}/{cfg.subject_id}_leadfield_{cap_basename}.hdf5"
     lf_params   = f"{lf_dir}/{cfg.subject_id}_leadfield_{cap_basename}_params.json"
 
-    # Parameters that fully determine the leadfield. If any differ from what
-    # was used to compute the cached HDF5, we delete it and recompute.
-    el = cfg.electrode
     current_lf_params = {
         "shape":        el.shape,
         "dimensions":   el.dimensions,
@@ -615,8 +637,11 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     }
 
     # Leadfield is always cached — even --force optimization skips it.
-    # The params sidecar guards against stale cache after electrode changes,
-    # and also confirms the HDF5 was written cleanly (sidecar only saved on success).
+    # The params sidecar is written only on success, so its absence means a
+    # prior run into this exact directory was interrupted — clean the whole
+    # directory (not just the 2 files we know about) before recomputing, since
+    # SimNIBS refuses to write into a directory containing leftover result
+    # files from an incomplete run.
     lf_valid = False
     if os.path.isfile(lf_hdf) and os.path.isfile(lf_params):
         with open(lf_params) as _f:
@@ -625,15 +650,20 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             lf_valid = True
             print(f"  [SKIP] Leadfield — already exists:\n         {lf_hdf}")
         else:
-            print(f"  WARNING: Electrode settings changed — recomputing leadfield.")
+            # Shouldn't happen — the tag already encodes these settings — but
+            # guard against a tag collision (e.g. future tag-format change)
+            # by trusting the sidecar's actual content over the directory name.
+            print(f"  WARNING: cached leadfield params don't match the directory's own tag — recomputing.")
             print(f"    Saved : {saved_params}")
             print(f"    Current: {current_lf_params}")
-            os.remove(lf_hdf)
-            os.remove(lf_params)
-    elif os.path.isfile(lf_hdf):
-        # No params sidecar — electrode settings unverified, recompute to be safe.
-        print(f"  Leadfield HDF5 found but no params sidecar — recomputing.")
-        os.remove(lf_hdf)
+            import shutil
+            shutil.rmtree(lf_dir, ignore_errors=True)
+    elif os.path.isdir(lf_dir):
+        # Directory exists but no valid (hdf5 + sidecar) pair — a previous
+        # interrupted run. Clean it out entirely rather than just the hdf5.
+        print(f"  Incomplete leadfield directory found — recomputing:\n         {lf_dir}")
+        import shutil
+        shutil.rmtree(lf_dir, ignore_errors=True)
 
     if not lf_valid:
         print(f"  Computing TDCS leadfield for {cap_basename} ...")

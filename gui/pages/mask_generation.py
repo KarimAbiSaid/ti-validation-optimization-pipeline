@@ -174,6 +174,42 @@ layout = html.Div([
     ], style={"display": "flex", "flexWrap": "wrap"}),
 
     html.Div([
+        html.H3("Combine Existing Masks"),
+        html.P("Unions 2+ already-generated masks for one subject into a new mask — atlas-agnostic, "
+               "works across masks built from different atlases or different hemisphere settings "
+               "(e.g. left-only STN from Allen + bilateral M1 from Allen), as long as they're all in "
+               "that subject's space. Build the individual pieces above first, then combine them here.",
+               style={"fontSize": "13px", "color": "#666"}),
+        html.Div([
+            html.Div([
+                html.Label("Subject"),
+                dcc.Dropdown(id="mg-combine-subject-dropdown", placeholder="Select subject..."),
+            ], style={"maxWidth": "260px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("Masks to combine (2+)"),
+                dcc.Dropdown(id="mg-combine-masks-dropdown", multi=True, placeholder="Select masks..."),
+            ], style={"flex": "1 1 380px"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "0.75rem"}),
+        html.Div([
+            html.Div([
+                html.Label("Mask type"),
+                dcc.RadioItems(
+                    id="mg-combine-type",
+                    options=[{"label": t, "value": t} for t in MASK_TYPES],
+                    value="ROI", inline=True,
+                ),
+            ], style={"marginRight": "1.5rem"}),
+            html.Div([
+                html.Label("Name (atlas name is NOT auto-appended here — enter the full final name)"),
+                dcc.Input(id="mg-combine-name", type="text", placeholder="e.g. STN_L_M1_bilateral",
+                          style={"width": "100%"}),
+            ], style={"flex": "1 1 320px"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "0.75rem"}),
+        html.Button("Combine", id="mg-combine-button", n_clicks=0, style={"padding": "0.5rem 1.5rem"}),
+        dcc.Loading(html.Div(id="mg-combine-result", style={"marginTop": "1rem"})),
+    ], style={"marginTop": "2rem"}),
+
+    html.Div([
         html.H3("Mask Preview"),
         html.Div([
             html.Div([
@@ -263,6 +299,59 @@ def _update_existing_masks(subject_ids):
                 "description": (m["sidecar"] or {}).get("Description", ""),
             })
     return rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Combine existing masks: pick a subject + 2 or more of its already-generated
+# masks (any atlas/hemisphere combination), union them into one new mask.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(Output("mg-combine-subject-dropdown", "options"), Input("mg-combine-subject-dropdown", "id"))
+def _load_combine_subjects(_):
+    options = []
+    for s in discovery.discover_subjects():
+        options.append({
+            "label": s["subject_id"] + ("" if s["has_m2m"] else "  (no m2m)"),
+            "value": s["subject_id"],
+            "disabled": not s["has_m2m"],
+        })
+    return options
+
+
+@callback(
+    Output("mg-combine-masks-dropdown", "options"),
+    Output("mg-combine-masks-dropdown", "value"),
+    Input("mg-combine-subject-dropdown", "value"),
+)
+def _load_combine_mask_options(subject_id):
+    if not subject_id:
+        return [], None
+    options = [{"label": m["filename"], "value": m["path"]} for m in discovery.existing_masks(subject_id)]
+    return options, None
+
+
+@callback(
+    Output("mg-combine-result", "children"),
+    Input("mg-combine-button", "n_clicks"),
+    State("mg-combine-subject-dropdown", "value"),
+    State("mg-combine-masks-dropdown", "value"),
+    State("mg-combine-type", "value"),
+    State("mg-combine-name", "value"),
+    prevent_initial_call=True,
+)
+def _on_combine_click(_n_clicks, subject_id, mask_paths, mask_type, name):
+    if not subject_id:
+        return html.Div("Select a subject first.", style={"color": "#a00"})
+    if not mask_paths or len(mask_paths) < 2:
+        return html.Div("Select at least 2 masks to combine.", style={"color": "#a00"})
+    if not name or not name.strip():
+        return html.Div("Enter a name for the combined mask.", style={"color": "#a00"})
+
+    result = discovery.combine_masks(subject_id, mask_paths, mask_type, name.strip())
+    if not result["success"]:
+        return html.Div(f"✗ {result['error']}", style={"color": "#a00"})
+    return html.Div(f"✓ Combined into {result['out_path']} ({result['voxel_count']} voxels).",
+                    style={"color": "#060"})
 
 
 # ═════════════════════════════════════════════════════════════════════════════

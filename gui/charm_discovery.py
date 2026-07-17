@@ -12,8 +12,13 @@ m2m_{id} folder otherwise).
 
 A real run is ~30-90 minutes (per the sbatch script's own comment) — meant
 to run inside a background job (job_runner.py), not called directly from a
-Dash callback. SCITAS submission is a placeholder for now — see
-job_runner.submit_to_scitas().
+Dash callback. run_charm_on_scitas() is the remote equivalent: submits
+charm_scitas.sbatch, blocks until the SLURM job finishes, then scp's
+m2m_{id}/ back — same call signature/return shape as run_charm(), so both
+fit job_runner.start_local_job() identically. charm itself is a standalone
+CLI tool inside the container (no dependency on this project's Python
+pipeline files), so unlike Run Pipeline's SCITAS path, this one isn't
+affected by local/remote code drift in config.py/run_pipeline.py/etc.
 """
 from __future__ import annotations
 
@@ -90,7 +95,11 @@ def run_charm(subject_id: str, use_t2: bool = True, force: bool = False,
     cmd.append("--forceqform")
 
     try:
-        proc = subprocess.run(cmd, cwd=sub_dir, capture_output=True, text=True)
+        # encoding/errors explicit: charm's own output isn't guaranteed to be
+        # decodable as Windows' default cp1252 (see the same fix in
+        # run_pipeline.py / scitas_discovery.py this session).
+        proc = subprocess.run(cmd, cwd=sub_dir, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace")
     except Exception as e:
         return {"success": False, "error": str(e), "stdout": ""}
 
@@ -102,3 +111,76 @@ def run_charm(subject_id: str, use_t2: bool = True, force: bool = False,
                 "stdout": proc.stdout}
 
     return {"success": True, "cached": False, "m2m_path": m2m_path, "error": None, "stdout": proc.stdout}
+
+
+def run_charm_on_scitas(subject_id: str, use_t2: bool = True, force: bool = False,
+                        project_dir: str = PROJECT_DIR) -> dict:
+    """Submits charm to SCITAS (SLURM), blocks until the remote job leaves
+    the queue, then scp's the resulting m2m_{id}/ back to this machine.
+    Call inside a job_runner background job (blocking — same contract as
+    run_charm()). Returns the same shape: {"success", "cached"?, "m2m_path",
+    "error", "stdout"}."""
+    import scitas_discovery as sd
+
+    status = charm_status(subject_id, project_dir)
+    if not status["t1_exists"]:
+        return {"success": False, "error": f"T1w not found locally: {t1_path(subject_id, project_dir)}"}
+
+    m2m_path = get_m2m_path(subject_id, project_dir)
+    if status["m2m_complete"] and not force:
+        return {"success": True, "cached": True, "m2m_path": m2m_path, "error": None, "stdout": ""}
+
+    remote_sub_dir = f"{sd.scitas_scratch_dir()}/derivatives/SimNIBS/sub-{subject_id}"
+    remote_m2m = f"{remote_sub_dir}/m2m_{subject_id}"
+    remote_mesh = f"{remote_m2m}/{subject_id}.msh"
+    remote_t1 = f"{sd.scitas_scratch_dir()}/rawdata/sub-{subject_id}/anat/sub-{subject_id}_T1w.nii.gz"
+    remote_t2 = f"{sd.scitas_scratch_dir()}/rawdata/sub-{subject_id}/anat/sub-{subject_id}_T2w.nii.gz"
+
+    if not sd.remote_path_exists(remote_t1):
+        mk = sd.remote_mkdir(f"{sd.scitas_scratch_dir()}/rawdata/sub-{subject_id}/anat")
+        if not mk["success"]:
+            return {"success": False, "error": f"couldn't create remote rawdata dir: {mk['stderr']}"}
+        up = sd.scp_upload(t1_path(subject_id, project_dir), remote_t1, recursive=False)
+        if not up["success"]:
+            return {"success": False, "error": f"T1w upload to SCITAS failed: {up['stderr']}"}
+
+    if use_t2 and status["t2_exists"] and not sd.remote_path_exists(remote_t2):
+        up = sd.scp_upload(t2_path(subject_id, project_dir), remote_t2, recursive=False)
+        if not up["success"]:
+            return {"success": False, "error": f"T2w upload to SCITAS failed: {up['stderr']}"}
+
+    # force=True: charm_scitas.sbatch only auto-cleans a PARTIAL remote
+    # m2m_ folder (mirrors charm's own refusal-to-overwrite behaviour) — a
+    # COMPLETE one needs removing here first, same as run_charm() does locally.
+    if force and sd.remote_path_exists(remote_m2m):
+        rm = sd.remote_rmtree(remote_m2m)
+        if not rm["success"]:
+            return {"success": False, "error": f"couldn't clear existing remote m2m_ for force re-run: {rm['stderr']}"}
+
+    submit = sd.submit_sbatch(
+        script_path=f"{sd.scitas_pipeline_dir()}/charm_scitas.sbatch",
+        job_name=f"charm_{subject_id}",
+        export_vars={"CHARM_SUBJECT": subject_id},
+    )
+    if not submit["success"]:
+        return {"success": False, "error": f"sbatch submission failed: {submit['error']}"}
+
+    wait = sd.wait_for_job(submit["job_id"], max_wait_s=3 * 3600)
+    if not wait["success"]:
+        return {"success": False,
+                "error": f"SCITAS job {submit['job_id']} did not complete "
+                         f"(final state: {wait['final_state']}). {wait['error'] or ''}"}
+
+    if not sd.remote_path_exists(remote_mesh):
+        return {"success": False,
+                "error": f"SCITAS job {submit['job_id']} completed but mesh not found remotely: {remote_mesh}"}
+
+    os.makedirs(os.path.dirname(m2m_path), exist_ok=True)
+    down = sd.scp_download(remote_m2m, os.path.dirname(m2m_path), recursive=True)
+    if not down["success"]:
+        return {"success": False,
+                "error": f"charm succeeded on SCITAS (job {submit['job_id']}) but syncing m2m_{subject_id}/ "
+                         f"back failed: {down['stderr']}. Remote result is intact at {remote_m2m}."}
+
+    return {"success": True, "cached": False, "m2m_path": m2m_path, "error": None,
+            "stdout": f"SCITAS job {submit['job_id']} completed and results synced back."}

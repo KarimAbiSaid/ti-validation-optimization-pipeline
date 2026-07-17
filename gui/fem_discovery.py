@@ -24,23 +24,85 @@ def leadfield_dir(subject_id: str, project_dir: str = PROJECT_DIR) -> str:
     return os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "leadfield_volume")
 
 
+def _read_json(path: str) -> dict:
+    if not os.path.isfile(path):
+        return {}
+    import json
+    with open(path) as f:
+        return json.load(f)
+
+
 def list_leadfields(subject_id: str, project_dir: str = PROJECT_DIR) -> list[dict]:
-    """Precomputed leadfields already on disk for this subject —
-    {"cap_name", "hdf5_path"}, one per sub-{id}_leadfield_{cap_name}.hdf5."""
+    """Precomputed leadfields already on disk for this subject, across BOTH
+    schemes:
+      - new: leadfield_volume/{tag}/{id}_leadfield_{cap}.hdf5 (tag =
+        config.leadfield_tag(cap, shape, dimensions, gel_thickness)) — one
+        subdirectory per distinct (cap, electrode-settings) combination, the
+        same layout run_pipeline.py and generate_leadfield() write.
+      - legacy: leadfield_volume/{id}_leadfield_{cap}.hdf5 directly — from
+        before per-settings variants existed. Still discoverable so older
+        leadfields aren't silently hidden.
+    Returns [{"cap_name", "tag" (None for legacy), "hdf5_path", "params",
+    "label"}], one entry per variant found."""
     d = leadfield_dir(subject_id, project_dir)
     prefix = f"{subject_id}_leadfield_"
     out = []
-    if os.path.isdir(d):
-        for fname in sorted(os.listdir(d)):
-            if fname.startswith(prefix) and fname.endswith(".hdf5"):
-                cap_name = fname[len(prefix):-len(".hdf5")]
-                out.append({"cap_name": cap_name, "hdf5_path": os.path.join(d, fname)})
+    if not os.path.isdir(d):
+        return out
+
+    for name in sorted(os.listdir(d)):
+        sub = os.path.join(d, name)
+        if not os.path.isdir(sub) or name.startswith("_"):
+            continue
+        for fname in sorted(os.listdir(sub)):
+            if not (fname.startswith(prefix) and fname.endswith(".hdf5")):
+                continue
+            cap_name = fname[len(prefix):-len(".hdf5")]
+            hdf5_path = os.path.join(sub, fname)
+            params = _read_json(hdf5_path[:-len(".hdf5")] + "_params.json")
+            dims = params.get("dimensions") or []
+            dims_str = "x".join(f"{v:g}" for v in dims) if dims else "?"
+            label = (f"{cap_name}  ({params.get('shape', '?')} {dims_str}mm, "
+                    f"{params.get('gel_thickness', '?')}mm gel)")
+            out.append({"cap_name": cap_name, "tag": name, "hdf5_path": hdf5_path,
+                       "params": params, "label": label})
+
+    for fname in sorted(os.listdir(d)):
+        if fname.startswith(prefix) and fname.endswith(".hdf5"):
+            cap_name = fname[len(prefix):-len(".hdf5")]
+            hdf5_path = os.path.join(d, fname)
+            params = _read_json(hdf5_path[:-len(".hdf5")] + "_params.json")
+            out.append({"cap_name": cap_name, "tag": None, "hdf5_path": hdf5_path,
+                       "params": params, "label": f"{cap_name}  (legacy cache)"})
     return out
 
 
-def leadfield_status(subject_id: str, cap_name: str, project_dir: str = PROJECT_DIR) -> dict:
-    hdf5_path = os.path.join(leadfield_dir(subject_id, project_dir), f"{subject_id}_leadfield_{cap_name}.hdf5")
-    return {"exists": os.path.isfile(hdf5_path), "hdf5_path": hdf5_path}
+def leadfield_status(subject_id: str, cap_name: str, project_dir: str = PROJECT_DIR,
+                      shape: str | None = None, dimensions: list | None = None,
+                      gel_thickness: float | None = None) -> dict:
+    """{"exists", "hdf5_path"}.
+
+    If shape/dimensions/gel_thickness are given, checks for that EXACT
+    variant (via config.leadfield_tag) — used when a specific electrode
+    setting matters (Run Pipeline / FEM Validation's variant picker).
+
+    Otherwise ("exists" = true if ANY variant, tagged or legacy, exists for
+    this cap) — the coarse cap-level readiness check Comparison's
+    availability display uses, unchanged from before per-settings variants
+    existed; hdf5_path is the first match found."""
+    if dimensions is not None:
+        from config import leadfield_tag
+        tag = leadfield_tag(cap_name, shape or "ellipse", dimensions,
+                            gel_thickness if gel_thickness is not None else 1.0)
+        hdf5_path = os.path.join(leadfield_dir(subject_id, project_dir), tag,
+                                 f"{subject_id}_leadfield_{cap_name}.hdf5")
+        return {"exists": os.path.isfile(hdf5_path), "hdf5_path": hdf5_path}
+
+    matches = [lf for lf in list_leadfields(subject_id, project_dir) if lf["cap_name"] == cap_name]
+    if matches:
+        return {"exists": True, "hdf5_path": matches[0]["hdf5_path"]}
+    flat_hdf5 = os.path.join(leadfield_dir(subject_id, project_dir), f"{subject_id}_leadfield_{cap_name}.hdf5")
+    return {"exists": False, "hdf5_path": flat_hdf5}
 
 
 def leadfield_availability_matrix(subject_ids: list[str], cap_name: str, project_dir: str = PROJECT_DIR) -> dict:
@@ -91,52 +153,28 @@ def leadfield_electrode_dims(hdf5_path: str) -> list[float] | None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def compute_ti(
-    subject_id: str, cap_name: str, roi_mask_path: str, non_roi_mask_path: str | None,
+    subject_id: str, hdf5_path: str, roi_mask_path: str, non_roi_mask_path: str | None,
     ch1_plus: str, ch1_minus: str, ch1_current_mA: float,
     ch2_plus: str, ch2_minus: str, ch2_current_mA: float,
     electrode_dims: list[float] | None = None, label: str = "setup",
     output_dir: str | None = None, project_dir: str = PROJECT_DIR,
 ) -> dict:
     """Returns {"success", "error"} or, on success, {"success": True, "label",
-    "montage", "stats", "msh_path", "npz_path", "json_path"}."""
-    status = leadfield_status(subject_id, cap_name, project_dir)
-    if not status["exists"]:
-        return {"success": False,
-                "error": f"No leadfield for sub-{subject_id} / {cap_name}: {status['hdf5_path']}"}
+    "montage", "stats", "msh_path", "npz_path", "json_path"}.
 
-    names = set(leadfield_electrode_names(status["hdf5_path"]))
-    for field_label, val in [("Ch1+", ch1_plus), ("Ch1-", ch1_minus),
-                              ("Ch2+", ch2_plus), ("Ch2-", ch2_minus)]:
-        if val not in names:
-            return {"success": False,
-                     "error": f"{field_label} '{val}' not in this leadfield's electrodes: {sorted(names)}"}
-
-    if output_dir is None:
-        output_dir = os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "comparison")
-
-    from compare_ti_montages import load_subject_resources, compute_ti_setup
-
-    try:
-        resources = load_subject_resources(
-            subject_id=subject_id, project_dir=project_dir, cap_name=cap_name,
-            roi_mask=roi_mask_path, non_roi_mask=non_roi_mask_path,
-        )
-        result = compute_ti_setup(
-            resources,
-            ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=ch1_current_mA,
-            ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=ch2_current_mA,
-            electrode_dims=electrode_dims, label=label, output_dir=output_dir,
-        )
-    except SystemExit as e:
-        return {"success": False, "error": str(e)}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-    return {
-        "success": True, "label": result["label"], "montage": result["montage"],
-        "stats": result["stats"], "msh_path": result["msh_path"],
-        "npz_path": result["npz_path"], "json_path": result["json_path"],
-    }
+    hdf5_path: resolved leadfield path — use list_leadfields()/
+    leadfield_status() to find one for a (subject, cap[, electrode settings])
+    combination. Now identical to compute_ti_custom_leadfield() (both take an
+    explicit path); kept as a separate name since callers already spell it
+    this way, and "custom" no longer means anything different once every
+    leadfield lookup resolves to an explicit path first."""
+    return compute_ti_custom_leadfield(
+        subject_id=subject_id, hdf5_path=hdf5_path, roi_mask_path=roi_mask_path,
+        non_roi_mask_path=non_roi_mask_path,
+        ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=ch1_current_mA,
+        ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=ch2_current_mA,
+        electrode_dims=electrode_dims, label=label, output_dir=output_dir, project_dir=project_dir,
+    )
 
 
 def _load_subject_resources_from_path(subject_id: str, hdf5_path: str, roi_mask_path: str,
@@ -263,9 +301,14 @@ def generate_leadfield(
         return {"success": False, "hdf5_path": None,
                 "error": f"registered cap not found: {registered_cap_path}"}
 
+    from config import leadfield_tag
+
     cap_name = os.path.splitext(os.path.basename(registered_cap_path))[0]
-    lf_dir = leadfield_dir(subject_id, project_dir)
-    hdf5_path = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}.hdf5")
+    base_dir = leadfield_dir(subject_id, project_dir)
+    tag      = leadfield_tag(cap_name, shape, list(dimensions), gel_thickness)
+    lf_dir   = os.path.join(base_dir, tag)
+    fname    = f"{subject_id}_leadfield_{cap_name}.hdf5"  # TDCSLEADFIELD's own naming
+    hdf5_path = os.path.join(lf_dir, fname)
     params_path = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}_params.json")
 
     current_params = {
@@ -273,19 +316,15 @@ def generate_leadfield(
         "tissues": _LEADFIELD_TISSUES, "interpolation": None,
     }
 
+    # The tag already encodes shape/dimensions/gel_thickness, so a mismatch
+    # here would only mean a corrupted/foreign params.json — the params
+    # comparison is a belt-and-suspenders check, not the primary cache key.
     if os.path.isfile(hdf5_path) and os.path.isfile(params_path):
         with open(params_path) as f:
             saved = json.load(f)
         if saved == current_params:
             return {"success": True, "hdf5_path": hdf5_path, "error": None, "cached": True,
                     "params_used": current_params}
-        # Params differ — recompute needed. Do NOT touch the existing hdf5/json
-        # yet: compute into a fresh scratch subdirectory first (this also
-        # sidesteps SimNIBS's own "existing simulation results" refusal if
-        # leftover simnibs_simulation*.mat files sit in lf_dir from an
-        # unrelated earlier run) and only replace the old file once the new
-        # one is confirmed written — a failed recompute must never destroy a
-        # working cached leadfield.
 
     scratch_dir = None
     try:
@@ -294,8 +333,16 @@ def generate_leadfield(
 
         from simnibs.simulation.sim_struct import TDCSLEADFIELD
 
-        os.makedirs(lf_dir, exist_ok=True)
-        scratch_dir = os.path.join(lf_dir, f"_regen_{cap_name}_{int(_time.time())}")
+        os.makedirs(base_dir, exist_ok=True)
+        # Compute into a fresh scratch subdirectory first — this cache is now
+        # keyed by tag (see leadfield_tag()), so a genuine settings mismatch
+        # can't collide with this directory at all; the only case landing
+        # here is an incomplete previous run into this exact tag. Computing
+        # into scratch first (rather than directly into lf_dir) means a
+        # failed recompute never destroys a working cached leadfield, and
+        # never trips over that incomplete run's own leftover
+        # simnibs_simulation*.mat files either.
+        scratch_dir = os.path.join(base_dir, f"_regen_{tag}_{int(_time.time())}")
         os.makedirs(scratch_dir, exist_ok=True)
 
         lf_sess = TDCSLEADFIELD()
@@ -309,13 +356,14 @@ def generate_leadfield(
         lf_sess.tissues = _LEADFIELD_TISSUES
         lf_sess.run(cpus=cpus)
 
-        scratch_hdf5 = os.path.join(scratch_dir, f"{subject_id}_leadfield_{cap_name}.hdf5")
+        scratch_hdf5 = os.path.join(scratch_dir, fname)
         if not os.path.isfile(scratch_hdf5):
             return {"success": False, "hdf5_path": None,
                     "error": f"Leadfield HDF5 not found after run: {scratch_hdf5} "
                              f"(existing cached leadfield, if any, was left untouched)"}
 
         # New leadfield confirmed on disk — now safe to replace the old one.
+        os.makedirs(lf_dir, exist_ok=True)
         if os.path.isfile(hdf5_path):
             os.remove(hdf5_path)
         shutil.move(scratch_hdf5, hdf5_path)

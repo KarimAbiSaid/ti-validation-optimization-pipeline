@@ -29,9 +29,25 @@ import job_runner as jr
 
 dash.register_page(__name__, path="/comparison", name="Comparison", category="Simulation", order=2)
 
-_EMPTY_ROW = {"subject": "", "mode": "leadfield", "cap": "", "roi": "", "nonroi": "",
+_EMPTY_ROW = {"subject": "", "mode": "leadfield", "cap": "", "roi": "", "nonroi": "", "elec": "",
               "ch1_plus": "", "ch1_minus": "", "ch1_current": 2.0,
               "ch2_plus": "", "ch2_minus": "", "ch2_current": 2.0, "label": ""}
+
+_LEGACY_ELEC_VALUE = "legacy"  # sentinel: use "any variant for this cap" (fem_discovery's coarse behaviour)
+
+
+def _encode_elec(shape: str, dimensions: list, gel_thickness: float) -> str:
+    dims = dimensions or ["", ""]
+    return f"{shape}|{dims[0]}|{dims[1] if len(dims) > 1 else dims[0]}|{gel_thickness}"
+
+
+def _decode_elec(value: str):
+    """Returns (shape, dimensions, gel_thickness) or (None, None, None) for
+    the legacy sentinel / an unset value."""
+    if not value or value == _LEGACY_ELEC_VALUE:
+        return None, None, None
+    shape, d1, d2, gel = value.split("|")
+    return shape, [float(d1), float(d2)], float(gel)
 
 
 def _styled_table(id_, columns, data=None, **kwargs):
@@ -75,20 +91,24 @@ def _atlas_region_picker(prefix):
     ]
 
 
-def _base_columns(show_cap, show_roi, show_nonroi):
+def _base_columns(show_cap, show_roi, show_nonroi, show_elec=False):
     # Channels/ROI/non-ROI are plain text, not DataTable dropdown cells —
     # DataTable's built-in dropdown editor has known typing/backspace
     # issues. "Mode" stays a dropdown (two fixed choices, no typing
     # needed). Cap gets a dropdown too (filtered per-subject) plus
     # red/green conditional cell coloring for registration status, so
     # picking the wrong one is visually obvious despite the click-only
-    # editing UX.
+    # editing UX. "Elec" (electrode settings), when per-row, is a dropdown
+    # filtered by that row's own (subject, cap) — one option per cached
+    # leadfield variant for that pair (see fem_discovery.list_leadfields).
     cols = [
         {"name": "Subject", "id": "subject"},
         {"name": "Mode", "id": "mode", "presentation": "dropdown"},
     ]
     if show_cap:
         cols.append({"name": "Cap", "id": "cap", "presentation": "dropdown"})
+    if show_elec:
+        cols.append({"name": "Elec settings", "id": "elec", "presentation": "dropdown"})
     cols += [
         {"name": "Ch1+", "id": "ch1_plus"},
         {"name": "Ch1-", "id": "ch1_minus"},
@@ -120,6 +140,30 @@ layout = html.Div([
         dcc.Dropdown(id="cx-common-cap-dropdown", placeholder="Select cap...", style={"maxWidth": "420px"}),
         html.Div(id="cx-cap-readiness-container", style={"marginTop": "0.5rem"}),
     ], id="cx-common-cap-panel", style={"display": "none", "marginBottom": "1rem"}),
+
+    # ── Electrode settings ─────────────────────────────────────────────────────
+    html.H3("Electrode Settings (leadfield rows only)", style={"marginTop": "1.5rem"}),
+    html.P("Which cached leadfield variant to use for a given cap — a cap can have more than "
+           "one, computed with different electrode dimensions/gel thickness.",
+           style={"fontSize": "12px", "color": "#666"}),
+    dcc.Checklist(id="cx-common-elec-toggle",
+                  options=[{"label": " Use the same electrode settings for all setups", "value": "common"}],
+                  value=["common"]),
+    html.Div([
+        html.Div([
+            html.Label("Dimensions (mm)"),
+            html.Div([
+                dcc.Input(id="cx-common-elec-dim1", type="number", value=19.5, step=0.5,
+                          style={"width": "90px", "marginRight": "0.5rem"}),
+                dcc.Input(id="cx-common-elec-dim2", type="number", value=19.5, step=0.5,
+                          style={"width": "90px"}),
+            ], style={"display": "flex"}),
+        ], style={"marginRight": "1.5rem"}),
+        html.Div([
+            html.Label("Gel thickness (mm)"),
+            dcc.Input(id="cx-common-elec-gel", type="number", value=1.0, step=0.1, style={"width": "90px"}),
+        ]),
+    ], id="cx-common-elec-panel", style={"display": "flex", "flexWrap": "wrap", "marginBottom": "1rem"}),
 
     # ── ROI ──────────────────────────────────────────────────────────────────
     html.H3("ROI", style={"marginTop": "1.5rem"}),
@@ -193,6 +237,14 @@ layout = html.Div([
 @callback(Output("cx-common-cap-panel", "style"), Input("cx-common-cap-toggle", "value"))
 def _toggle_cap_panel(value):
     style = {"marginBottom": "1rem"}
+    if "common" not in (value or []):
+        style["display"] = "none"
+    return style
+
+
+@callback(Output("cx-common-elec-panel", "style"), Input("cx-common-elec-toggle", "value"))
+def _toggle_elec_panel(value):
+    style = {"display": "flex", "flexWrap": "wrap", "marginBottom": "1rem"}
     if "common" not in (value or []):
         style["display"] = "none"
     return style
@@ -350,12 +402,14 @@ def _unique_subjects(rows):
     Input("cx-common-cap-toggle", "value"),
     Input("cx-common-roi-toggle", "value"),
     Input("cx-common-nonroi-toggle", "value"),
+    Input("cx-common-elec-toggle", "value"),
 )
-def _update_table_schema(cap_toggle, roi_toggle, nonroi_toggle):
+def _update_table_schema(cap_toggle, roi_toggle, nonroi_toggle, elec_toggle):
     show_cap = "common" not in (cap_toggle or [])
     show_roi = "common" not in (roi_toggle or [])
     show_nonroi = "common" not in (nonroi_toggle or [])
-    columns = _base_columns(show_cap, show_roi, show_nonroi)
+    show_elec = "common" not in (elec_toggle or [])
+    columns = _base_columns(show_cap, show_roi, show_nonroi, show_elec)
     static_dropdown = {
         "mode": {"options": [{"label": "leadfield", "value": "leadfield"},
                              {"label": "oneoff", "value": "oneoff"}]},
@@ -370,10 +424,12 @@ def _update_table_schema(cap_toggle, roi_toggle, nonroi_toggle):
     Input("cx-common-cap-toggle", "value"),
     Input("cx-common-cap-dropdown", "value"),
     Input("cx-cap-registered-trigger", "data"),
+    Input("cx-common-elec-toggle", "value"),
 )
-def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger):
+def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger, elec_toggle):
     show_cap = "common" not in (cap_toggle or [])
     common_cap_name = cd.cap_stem(common_cap_path) if (not show_cap and common_cap_path) else None
+    show_elec = "common" not in (elec_toggle or [])
 
     rows = rows or []
     dropdown_conditional = []
@@ -381,6 +437,7 @@ def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger)
     seen_subjects = set()
     seen_cap_pairs = set()
     seen_leadfield_pairs = set()
+    seen_elec_pairs = set()
 
     for row in rows:
         sid = (row.get("subject") or "").strip()
@@ -421,6 +478,29 @@ def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger)
             style_conditional.append({
                 "if": {"column_id": "mode", "filter_query": filter_q},
                 "backgroundColor": "#d4f7d4" if has_leadfield else "#f7d4d4",
+            })
+
+        # Elec cell: one dropdown option per cached leadfield variant for
+        # this row's own (subject, cap) pair.
+        if show_elec and cap_val and (sid, cap_val) not in seen_elec_pairs:
+            seen_elec_pairs.add((sid, cap_val))
+            variants = [lf for lf in fd.list_leadfields(sid) if lf["cap_name"] == cap_val]
+            elec_opts = []
+            for lf in variants:
+                if lf["tag"] is None:
+                    elec_opts.append({"label": lf["label"], "value": _LEGACY_ELEC_VALUE})
+                else:
+                    p = lf["params"]
+                    dims = p.get("dimensions") or [None, None]
+                    elec_opts.append({
+                        "label": lf["label"],
+                        "value": _encode_elec(p.get("shape", "ellipse"), dims, p.get("gel_thickness", 1.0)),
+                    })
+            filter_q = (f'{{subject}} eq "{sid}" && {{cap}} eq "{cap_val}"' if show_cap
+                       else f'{{subject}} eq "{sid}"')
+            dropdown_conditional.append({
+                "if": {"column_id": "elec", "filter_query": filter_q},
+                "options": elec_opts,
             })
 
     return dropdown_conditional, style_conditional
@@ -556,10 +636,14 @@ def _update_nonroi_readiness(rows, nonroi_label):
     State("cx-roi-label", "value"),
     State("cx-common-nonroi-toggle", "value"),
     State("cx-nonroi-label", "value"),
+    State("cx-common-elec-toggle", "value"),
+    State("cx-common-elec-dim1", "value"),
+    State("cx-common-elec-dim2", "value"),
+    State("cx-common-elec-gel", "value"),
     prevent_initial_call=True,
 )
 def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_label,
-                   nonroi_toggle, nonroi_label):
+                   nonroi_toggle, nonroi_label, elec_toggle, common_dim1, common_dim2, common_gel):
     rows = [r for r in (rows or []) if (r.get("subject") or "").strip()]
     if not rows:
         return None, True, html.Div("No setups — fill in at least one row.", style={"color": "#a00"})
@@ -574,6 +658,8 @@ def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_
         return None, True, html.Div("ROI label is required.", style={"color": "#a00"})
 
     use_common_nonroi = "common" in (nonroi_toggle or [])
+    use_common_elec = "common" in (elec_toggle or [])
+    common_elec = ("ellipse", [common_dim1, common_dim2], common_gel) if use_common_elec else (None, None, None)
 
     jobs = {}
     any_pending = False
@@ -610,7 +696,12 @@ def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_
                 jobs[row_key] = {"mode": "oneoff", "row": display_row, "job_dir": None,
                                  "status": "error", "result": {"success": False, "error": str(e)}}
         else:
-            result = cx.run_leadfield_row(**kwargs)
+            elec_shape, elec_dims, elec_gel = (common_elec if use_common_elec
+                                               else _decode_elec((row.get("elec") or "").strip()))
+            result = cx.run_leadfield_row(
+                **kwargs, electrode_shape=elec_shape, electrode_dimensions=elec_dims,
+                electrode_gel_thickness=elec_gel,
+            )
             jobs[row_key] = {"mode": "leadfield", "row": display_row, "job_dir": None,
                              "status": "done", "result": result}
 

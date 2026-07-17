@@ -3,10 +3,11 @@ pages/head_modeling.py — Phase 0: generate a subject's head model (m2m_{id})
 via SimNIBS charm, the prerequisite for every later phase.
 
 charm is a real external command-line tool (~30-90 min per subject), run
-locally via job_runner.py's background-job mechanism, same pattern as
-Phase 3's leadfield generation / one-off FEM. A "Run on SCITAS" option is
-present as a placeholder (job_runner.submit_to_scitas() — not implemented
-yet) so the UI shape is ready once that's built.
+either locally (job_runner.py's background-job mechanism, same pattern as
+Phase 3's leadfield generation / one-off FEM) or on SCITAS
+(charm_discovery.run_charm_on_scitas — submits charm_scitas.sbatch over SSH,
+blocks on the SLURM queue, scp's m2m_{id}/ back). Both fit the exact same
+job_runner contract, so this page's polling UI doesn't care which one ran.
 
 Single subject at a time by design: charm runs this long are typically
 either a one-off/local test (this page) or dispatched as one SCITAS job per
@@ -49,7 +50,7 @@ layout = html.Div([
             id="hm-run-location",
             options=[
                 {"label": " Local (this machine)", "value": "local"},
-                {"label": " SCITAS (not implemented yet)", "value": "scitas"},
+                {"label": " SCITAS (jed.hpc.epfl.ch)", "value": "scitas"},
             ],
             value="local",
         ),
@@ -116,17 +117,17 @@ def _on_start_click(_n_clicks, subject_id, use_t2_value, force_value, run_locati
     use_t2 = "use_t2" in (use_t2_value or [])
     force = "force" in (force_value or [])
 
-    if run_location == "scitas":
-        try:
-            jr.submit_to_scitas()
-        except NotImplementedError as e:
-            return None, True, html.Div(f"✗ {e}", style={"color": "#a00"})
-
     base_dir = os.path.join(chd.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}", "_charm_jobs")
     _job_id, job_dir = jr.new_job_dir(base_dir)
-    jr.start_local_job(job_dir, chd.run_charm, subject_id, use_t2, force)
-    return job_dir, False, html.Div("Started — polling every 3s (charm typically takes 30-90 min)...",
-                                     style={"color": "#666"})
+
+    if run_location == "scitas":
+        jr.start_local_job(job_dir, chd.run_charm_on_scitas, subject_id, use_t2, force)
+        note = ("Started on SCITAS — polling every 3s (submits the job, then waits on the SLURM "
+                "queue; charm itself typically takes 30-90 min once running, plus queue time).")
+    else:
+        jr.start_local_job(job_dir, chd.run_charm, subject_id, use_t2, force)
+        note = "Started — polling every 3s (charm typically takes 30-90 min)..."
+    return job_dir, False, html.Div(note, style={"color": "#666"})
 
 
 @callback(

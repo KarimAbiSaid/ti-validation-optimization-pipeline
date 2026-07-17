@@ -53,6 +53,17 @@ class ElectrodeConfig:
     n_electrodes: int = 4           # electrodes per channel pair (2 pairs = 4 total)
 
 
+def leadfield_tag(cap_basename: str, shape: str, dimensions: list, gel_thickness: float) -> str:
+    """Filesystem-safe identifier for one (cap, electrode-geometry)
+    combination — keys leadfield_volume/ subdirectories in run_pipeline.py
+    (and, opt-in, compare_ti_montages.py) so switching electrode settings
+    gets its own cache instead of colliding with / invalidating a
+    previously-computed leadfield for different settings. ':g' formatting
+    keeps e.g. 19.5 and 19.50 identical rather than producing two tags."""
+    dims = "x".join(f"{d:g}" for d in dimensions)
+    return f"{cap_basename}__{shape}_{dims}_{gel_thickness:g}mm"
+
+
 @dataclass
 class OptimizerConfig:
     # Goal / postprocessing

@@ -116,9 +116,9 @@ layout = html.Div([
             dcc.Dropdown(id="fv-subject-dropdown", placeholder="Select subject..."),
         ], style={"maxWidth": "260px", "marginRight": "1.5rem"}),
         html.Div([
-            html.Label("Cap (only caps with a precomputed leadfield are listed)"),
-            dcc.Dropdown(id="fv-cap-dropdown", placeholder="Select cap..."),
-        ], style={"maxWidth": "420px"}),
+            html.Label("Cap + electrode settings (only variants with a precomputed leadfield are listed)"),
+            dcc.Dropdown(id="fv-cap-dropdown", placeholder="Select cap...", style={"maxWidth": "480px"}),
+        ], style={"maxWidth": "480px"}),
     ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "0.5rem"}),
     html.Div(id="fv-leadfield-note", style={"fontSize": "13px", "marginBottom": "1.5rem"}),
 
@@ -299,7 +299,10 @@ def _load_caps(subject_id):
             "✗ No precomputed leadfield for this subject — leadfield mode isn't available yet. "
             "(Custom leadfield path / one-off FEM / generate leadfield are planned follow-ups.)",
             style={"color": "#a00"})
-    options = [{"label": lf["cap_name"], "value": lf["cap_name"]} for lf in leadfields]
+    # One option per (cap, electrode-settings) variant — value is the
+    # resolved hdf5_path directly, since a cap can now have more than one
+    # cached variant (see fem_discovery.list_leadfields).
+    options = [{"label": lf["label"], "value": lf["hdf5_path"]} for lf in leadfields]
     return options, ""
 
 
@@ -322,15 +325,12 @@ def _load_masks(subject_id):
     Input("fv-subject-dropdown", "value"),
     Input("fv-cap-dropdown", "value"),
 )
-def _load_electrodes(subject_id, cap_name):
-    if not subject_id or not cap_name:
+def _load_electrodes(subject_id, hdf5_path):
+    if not subject_id or not hdf5_path or not os.path.isfile(hdf5_path):
         return [], [], [], [], ""
-    status = fd.leadfield_status(subject_id, cap_name)
-    if not status["exists"]:
-        return [], [], [], [], ""
-    names = fd.leadfield_electrode_names(status["hdf5_path"])
+    names = fd.leadfield_electrode_names(hdf5_path)
     options = [{"label": n, "value": n} for n in names]
-    dims = fd.leadfield_electrode_dims(status["hdf5_path"])
+    dims = fd.leadfield_electrode_dims(hdf5_path)
     dims_str = ", ".join(str(d) for d in dims) if dims else ""
     return options, options, options, options, dims_str
 
@@ -362,13 +362,13 @@ def _parse_dims(text):
     State("fv-label", "value"),
     prevent_initial_call=True,
 )
-def _on_compute_click(_n_clicks, subject_id, cap_name, roi_mask, non_roi_mask,
+def _on_compute_click(_n_clicks, subject_id, hdf5_path, roi_mask, non_roi_mask,
                        ch1_plus, ch1_minus, ch1_current, ch2_plus, ch2_minus, ch2_current,
                        dims_text, label):
     missing = []
     if not subject_id:
         missing.append("subject")
-    if not cap_name:
+    if not hdf5_path:
         missing.append("cap")
     if not roi_mask:
         missing.append("ROI mask")
@@ -378,7 +378,7 @@ def _on_compute_click(_n_clicks, subject_id, cap_name, roi_mask, non_roi_mask,
         return html.Div("Missing: " + ", ".join(missing), style={"color": "#a00"})
 
     result = fd.compute_ti(
-        subject_id=subject_id, cap_name=cap_name,
+        subject_id=subject_id, hdf5_path=hdf5_path,
         roi_mask_path=roi_mask, non_roi_mask_path=non_roi_mask,
         ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=float(ch1_current),
         ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=float(ch2_current),
