@@ -218,41 +218,74 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
                 return {"success": False, "job_id": None, "error": f"BNA atlas upload failed: {up['stderr']}"}
 
     # ROI / non-ROI masks — just the .nii.gz, nothing else needed (Section 1's
-    # skip-if-exists check only looks at the file itself). Upload if SCITAS
-    # is missing one. Two cases:
-    #   - roi_cfg has labels or bna_labels: Section 1 CAN build it itself from
-    #     the aseg/BNA atlas — uploading is a nice-to-have (saves Section 1
-    #     rebuild time) but not required, so a locally-missing mask here is
-    #     fine, silently skipped.
-    #   - roi_cfg has neither (Allen-sourced, or a Combine Existing Masks
-    #     output): Section 1 has no way to build it — the file MUST already
-    #     exist somewhere (local, to upload, or already on SCITAS), or this
-    #     run can only fail later inside the SLURM job. Caught here instead,
-    #     with a clear error, before wasting a queue slot.
+    # skip-if-exists check only looks at the file itself). Two cases:
+    #   - local copy exists: ALWAYS re-upload, overwriting any remote copy.
+    #     A skip-if-remote-exists check here would let a stale/broken remote
+    #     mask (e.g. saved by an earlier run that hit the since-fixed "Allen
+    #     mask silently rebuilt as empty" bug in create_roi_masks()) survive
+    #     forever even after the local mask is regenerated correctly — masks
+    #     are small (a few hundred KB), so there's no real cost to always
+    #     refreshing, same reasoning as the registered-cap-CSV re-upload above.
+    #   - local copy missing: fall back to checking remote. If neither exists
+    #     and Section 1 can't build it either (Allen-sourced, or a Combine
+    #     Existing Masks output — no labels/bna_labels), error out now with a
+    #     clear message before wasting a queue slot instead of failing later
+    #     inside the SLURM job.
     for roi_cfg in (cfg.get("roi"), cfg.get("non_roi")):
         if not roi_cfg or not roi_cfg.get("name"):
             continue
         name = roi_cfg["name"]
         remote_mask = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/roi/sub-{subject_id}_label-{name}_mask.nii.gz"
-        if sd.remote_path_exists(remote_mask):
-            continue
-
         local_mask = os.path.join(PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi",
                                   f"sub-{subject_id}_label-{name}_mask.nii.gz")
+
+        if os.path.isfile(local_mask):
+            sd.remote_mkdir(os.path.dirname(remote_mask))
+            up = sd.scp_upload(local_mask, remote_mask, recursive=False)
+            if not up["success"]:
+                return {"success": False, "job_id": None, "error": f"mask '{name}' upload failed: {up['stderr']}"}
+            continue
+
+        if sd.remote_path_exists(remote_mask):
+            continue   # local missing but remote already has a copy — trust it
+
         can_rebuild_remotely = bool(roi_cfg.get("labels")) or bool(roi_cfg.get("bna_labels"))
+        if can_rebuild_remotely:
+            continue  # Section 1 will build it remotely from labels/bna_labels
+        return {"success": False, "job_id": None,
+                "error": f"mask '{name}' not found locally or on SCITAS, and this ROI/non-ROI has "
+                         f"no labels/bna_labels for Section 1 to build it from (Allen-sourced, or a "
+                         f"combined mask) — generate it via Mask Generation first."}
 
-        if not os.path.isfile(local_mask):
-            if can_rebuild_remotely:
-                continue  # Section 1 will build it remotely from labels/bna_labels
-            return {"success": False, "job_id": None,
-                    "error": f"mask '{name}' not found locally or on SCITAS, and this ROI/non-ROI has "
-                             f"no labels/bna_labels for Section 1 to build it from (Allen-sourced, or a "
-                             f"combined mask) — generate it via Mask Generation first."}
+    # Non-ROI subgroup hard-constraint masks (optimizer.non_roi_hard_constraint_groups).
+    # Only mask_name-based groups need this — bna_labels-based groups need no
+    # upload since Section 1 rebuilds the warped BNA atlas itself. Unlike
+    # ROI/non-ROI above, a mask_name group can NEVER be rebuilt remotely (no
+    # labels/bna_labels fallback exists for it in run_pipeline.py). Same
+    # always-reupload-if-local-exists reasoning as ROI/non-ROI above — a
+    # locally-missing mask (with no remote copy either) is a hard error.
+    for grp in cfg.get("optimizer", {}).get("non_roi_hard_constraint_groups", []):
+        mask_name = grp.get("mask_name")
+        if not mask_name:
+            continue
+        remote_mask = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/roi/sub-{subject_id}_label-{mask_name}_mask.nii.gz"
+        local_mask = os.path.join(PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi",
+                                  f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
 
-        sd.remote_mkdir(os.path.dirname(remote_mask))
-        up = sd.scp_upload(local_mask, remote_mask, recursive=False)
-        if not up["success"]:
-            return {"success": False, "job_id": None, "error": f"mask '{name}' upload failed: {up['stderr']}"}
+        if os.path.isfile(local_mask):
+            sd.remote_mkdir(os.path.dirname(remote_mask))
+            up = sd.scp_upload(local_mask, remote_mask, recursive=False)
+            if not up["success"]:
+                return {"success": False, "job_id": None,
+                        "error": f"non-ROI constraint mask '{mask_name}' upload failed: {up['stderr']}"}
+            continue
+
+        if sd.remote_path_exists(remote_mask):
+            continue   # local missing but remote already has a copy — trust it
+
+        return {"success": False, "job_id": None,
+                "error": f"non-ROI constraint mask '{mask_name}' (group '{grp.get('name', '?')}') "
+                         f"not found locally or on SCITAS — generate it via Mask Generation first."}
 
     export_vars = {"PIPELINE_CONFIGS": remote_config_path}
     if force_sections:

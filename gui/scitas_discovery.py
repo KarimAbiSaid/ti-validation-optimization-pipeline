@@ -438,14 +438,43 @@ def list_remote_subjects() -> list[str]:
 def remote_data_status(subject_ids: list[str]) -> dict:
     """Read-only: {subject_id: {folder_tag: exists_bool}} for each of
     DATA_FOLDERS, across the given subjects — lets the picker show what's
-    actually there before the user selects what to sync."""
+    actually there before the user selects what to sync.
+
+    One SSH round trip total, not one per (subject, folder) pair — the
+    latter (34 subjects x 3 folders = 102 separate SSH connections, each
+    with its own handshake) was the actual cause of "Load Subjects from
+    SCITAS" taking 100+ seconds and looking hung.
+
+    Runs as a remote `for` loop rather than one flat chain of 102 `test &&
+    echo || echo` clauses joined by ";" — that first attempt built a command
+    whose length scaled with subject count (~14KB at 34 subjects) and
+    silently lost output partway through (likely a Windows ssh.exe
+    argv-requoting/buffering limit), which remote_data_status had no way to
+    detect since ssh_run still reported success. A loop keeps the command
+    body constant-size regardless of how many subjects are checked."""
     scratch = scitas_scratch_dir()
-    out = {}
-    for sid in subject_ids:
-        out[sid] = {}
-        for tag, template in DATA_FOLDERS.items():
-            remote_path = f"{scratch}/{template.format(sid=sid)}"
-            out[sid][tag] = remote_path_exists(remote_path)
+    out = {sid: {tag: False for tag in DATA_FOLDERS} for sid in subject_ids}
+    if not subject_ids:
+        return out
+
+    for tag, template in DATA_FOLDERS.items():
+        assert template == f"{tag}/sub-{{sid}}", (
+            f"remote_data_status's remote loop assumes every DATA_FOLDERS "
+            f"template is '{{tag}}/sub-{{{{sid}}}}' — got {tag}={template!r}")
+
+    sid_list = " ".join(shlex.quote(s) for s in subject_ids)
+    tag_list = " ".join(shlex.quote(t) for t in DATA_FOLDERS)
+    script = (
+        f'for sid in {sid_list}; do for tag in {tag_list}; do '
+        f'if [ -e "{scratch}/$tag/sub-$sid" ]; then echo "$sid $tag Y"; else echo "$sid $tag N"; fi; '
+        f'done; done'
+    )
+    result = ssh_run(script, timeout=60)
+    if result["success"]:
+        for line in (result["stdout"] or "").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] in out and parts[1] in out[parts[0]]:
+                out[parts[0]][parts[1]] = (parts[2] == "Y")
     return out
 
 

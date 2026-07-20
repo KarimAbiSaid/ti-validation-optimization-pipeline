@@ -116,12 +116,16 @@ def roi_mask_exists(subject_id: str, name: str, mask_type: str,
 
 def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
                        non_roi_atlas: str | None, non_roi_name: str | None,
-                       cap_path: str | None, project_dir: str = PROJECT_DIR) -> dict:
+                       cap_path: str | None, project_dir: str = PROJECT_DIR,
+                       constraint_group_masks: list[str] | None = None) -> dict:
     """{"ready": bool, "missing": [str, ...]} for one subject, across every
     prerequisite Config Generation needs for THIS roi/non-roi/cap
     combination: m2m + atlas-specific paths (BNA/SimNIBS/FreeSurfer), or the
     pre-built mask file (Allen); registered cap CSV if cap_path is set (None
-    = default Okamoto cap, always available once m2m exists)."""
+    = default Okamoto cap, always available once m2m exists); mask_name-based
+    non-ROI subgroup hard constraints (optimizer.non_roi_hard_constraint_groups)
+    — these can never be built by Section 1 (no labels/bna_labels fallback),
+    so missing here means the run will silently skip that constraint."""
     missing: list[str] = []
 
     if uses_allen(roi_atlas):
@@ -146,6 +150,10 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
         if not os.path.isfile(reg_path):
             missing.append(f"cap not registered — run Cap Registration first: {cap_discovery.cap_stem(cap_path)}")
 
+    for mask_name in (constraint_group_masks or []):
+        if not roi_mask_exists(subject_id, mask_name, "general", project_dir):
+            missing.append(f"non-ROI constraint mask not on disk — run Mask Generation first: {mask_name}")
+
     seen = set()
     missing_unique = [m for m in missing if not (m in seen or seen.add(m))]
     return {"ready": not missing_unique, "missing": missing_unique}
@@ -153,9 +161,11 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
 
 def readiness_matrix(subject_ids: list[str], roi_atlas: str, roi_name: str,
                       non_roi_atlas: str | None, non_roi_name: str | None,
-                      cap_path: str | None, project_dir: str = PROJECT_DIR) -> dict:
+                      cap_path: str | None, project_dir: str = PROJECT_DIR,
+                      constraint_group_masks: list[str] | None = None) -> dict:
     return {
-        sid: subject_readiness(sid, roi_atlas, roi_name, non_roi_atlas, non_roi_name, cap_path, project_dir)
+        sid: subject_readiness(sid, roi_atlas, roi_name, non_roi_atlas, non_roi_name, cap_path,
+                               project_dir, constraint_group_masks)
         for sid in subject_ids
     }
 

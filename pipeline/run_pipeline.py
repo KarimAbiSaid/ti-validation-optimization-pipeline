@@ -245,11 +245,21 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
     absolutely need for the focality and mean constratints in the optimization."""
     header("Section 1 — ROI / non-ROI masks")
 
+    # force only means "rebuild from source" when a source (labels/bna_labels)
+    # actually exists — for an Allen-sourced (or otherwise pre-built-only)
+    # mask there is nothing to rebuild FROM, so force is a no-op whenever a
+    # file's already there; it stays "needed" (and aborts below) only when
+    # genuinely missing. Without this, --force on an Allen ROI would always
+    # hit the "no labels/bna_labels" abort even when a valid mask exists.
+    def _can_build(roi_cfg) -> bool:
+        return bool(roi_cfg.bna_labels) or bool(roi_cfg.labels)
+
     roi_path     = cfg.mask_path(cfg.roi.name)
     non_roi_path = cfg.mask_path(cfg.non_roi.name) if cfg.non_roi else None
 
-    roi_needed     = force or not os.path.exists(roi_path)
-    non_roi_needed = (non_roi_path is not None) and (force or not os.path.exists(non_roi_path))
+    roi_needed     = not os.path.exists(roi_path) or (force and _can_build(cfg.roi))
+    non_roi_needed = (non_roi_path is not None) and (
+        not os.path.exists(non_roi_path) or (force and _can_build(cfg.non_roi)))
 
     if not roi_needed:
         print(f"  [SKIP] ROI mask — already exists:\n         {roi_path}")
@@ -259,7 +269,7 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
     extra_needed = []
     for extra in cfg.extra_rois:
         extra_path = cfg.mask_path(extra.name)
-        if force or not os.path.isfile(extra_path):
+        if not os.path.isfile(extra_path) or (force and _can_build(extra)):
             extra_needed.append(extra)
         else:
             print(f"  [SKIP] extra ROI mask — already exists: {extra_path}")
@@ -310,11 +320,28 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
     for roi_cfg, out_path in all_roi_cfgs:
         label = "ROI" if out_path == roi_path else "non-ROI" if out_path == non_roi_path else "extra ROI"
         print(f"\n  {label}: {roi_cfg.name}")
+
+        if not roi_cfg.bna_labels and not roi_cfg.labels:
+            # Nothing to build from (Allen-sourced, or any other pre-built-
+            # mask-only source) and the mask doesn't already exist (checked
+            # above via roi_needed/non_roi_needed/extra_needed) — building
+            # anyway would silently call _create_mask() with an empty label
+            # dict, producing and saving a 0-voxel mask with no error.
+            abort(f"{label} '{roi_cfg.name}' has no bna_labels or labels to build a mask "
+                  f"from, and no mask file exists yet at {out_path}. This is expected for "
+                  f"an Allen-sourced (or otherwise pre-built) mask — generate it via Mask "
+                  f"Generation first, then re-run.")
+
         if roi_cfg.bna_labels:
-            _create_bna_mask(warped_bna, roi_cfg.bna_labels, out_path)
+            n_vox = _create_bna_mask(warped_bna, roi_cfg.bna_labels, out_path)
         else:
-            _create_mask(aseg, roi_cfg.labels, cfg.m2m_path, out_path,
-                         fallback_labels=roi_cfg.fallback_labels, engine=fs_engine)
+            n_vox = _create_mask(aseg, roi_cfg.labels, cfg.m2m_path, out_path,
+                                 fallback_labels=roi_cfg.fallback_labels, engine=fs_engine)
+
+        if n_vox == 0:
+            abort(f"{label} '{roi_cfg.name}' mask has 0 voxels after building from its "
+                  f"configured labels — check that the label ids match this subject's "
+                  f"segmentation (see the per-label breakdown above).")
 
     print("  Section 1 complete.")
 
@@ -864,40 +891,74 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
               f" (soft penalty otherwise)")
 
     # ── Per-subgroup non-ROI hard constraints ────────────────────────────────
+    # Each group is either mask-file-based (mask_name — an already-generated
+    # sub-{id}_label-{mask_name}_mask.nii.gz, any atlas) or BNA-label-based
+    # (bna_labels, mapped via the subject's warped BNA atlas) — see
+    # OptimizerConfig.non_roi_hard_constraint_groups in config.py.
     nr_constraint_groups = []
-    if cfg.optimizer.non_roi_hard_constraint_groups:
-        bna_warped = os.path.join(cfg.sim_sub_dir, 'roi',
-                                  f'sub-{cfg.subject_id}_BNA_atlas_subjectspace.nii.gz')
-        if not os.path.isfile(bna_warped):
-            print(f"  WARNING: BNA atlas not found — skipping subgroup constraints: {bna_warped}")
-        else:
-            _bna_img  = nib.load(bna_warped)
-            _bna_data = np.asarray(_bna_img.dataobj, dtype=np.int32)
-            _bna_inv  = np.linalg.inv(_bna_img.affine)
-            _bna_vox  = (_bna_inv @ np.hstack([centroids, ones]).T).T[:, :3]
-            _bna_idx  = np.round(_bna_vox).astype(int)
-            _bna_sh   = _bna_data.shape
-            _bna_ok   = ((_bna_idx[:,0]>=0)&(_bna_idx[:,0]<_bna_sh[0])&
-                         (_bna_idx[:,1]>=0)&(_bna_idx[:,1]<_bna_sh[1])&
-                         (_bna_idx[:,2]>=0)&(_bna_idx[:,2]<_bna_sh[2]))
-            _elm_lbl  = np.zeros(len(centroids), dtype=np.int32)
-            _elm_lbl[_bna_ok] = _bna_data[_bna_idx[_bna_ok,0],
-                                           _bna_idx[_bna_ok,1],
-                                           _bna_idx[_bna_ok,2]]
-            for _grp in cfg.optimizer.non_roi_hard_constraint_groups:
-                _labels  = list(_grp['bna_labels'].values())
-                _gmask   = np.isin(_elm_lbl, _labels) & gm_wm_mask   # GM+WM only
-                _gidx    = np.flatnonzero(_gmask)
-                if len(_gidx) == 0:
-                    print(f"  WARNING: constraint group '{_grp['name']}' maps to 0 elements — skipped")
+    _bna_elm_lbl = None  # lazily loaded only if a bna_labels group is actually present
+
+    def _map_mask_file_to_elements(mask_path: str) -> np.ndarray:
+        _img  = nib.load(mask_path)
+        _data = np.asarray(_img.dataobj) > 0
+        _inv  = np.linalg.inv(_img.affine)
+        _vox  = (_inv @ np.hstack([centroids, ones]).T).T[:, :3]
+        _idx  = np.round(_vox).astype(int)
+        _sh   = _data.shape
+        _ok   = ((_idx[:, 0] >= 0) & (_idx[:, 0] < _sh[0]) &
+                 (_idx[:, 1] >= 0) & (_idx[:, 1] < _sh[1]) &
+                 (_idx[:, 2] >= 0) & (_idx[:, 2] < _sh[2]))
+        _m = np.zeros(len(centroids), dtype=bool)
+        _m[_ok] = _data[_idx[_ok, 0], _idx[_ok, 1], _idx[_ok, 2]]
+        return _m
+
+    for _grp in cfg.optimizer.non_roi_hard_constraint_groups:
+        if 'mask_name' in _grp:
+            _mask_path = cfg.mask_path(_grp['mask_name'])
+            if not os.path.isfile(_mask_path):
+                print(f"  WARNING: constraint group '{_grp['name']}' mask not found "
+                      f"({_mask_path}) — skipped")
+                continue
+            _gmask = _map_mask_file_to_elements(_mask_path) & gm_wm_mask   # GM+WM only
+        elif 'bna_labels' in _grp:
+            if _bna_elm_lbl is None:
+                bna_warped = os.path.join(cfg.sim_sub_dir, 'roi',
+                                          f'sub-{cfg.subject_id}_BNA_atlas_subjectspace.nii.gz')
+                if not os.path.isfile(bna_warped):
+                    print(f"  WARNING: BNA atlas not found — skipping bna_labels "
+                          f"constraint group '{_grp['name']}': {bna_warped}")
                     continue
-                nr_constraint_groups.append({
-                    'name':     _grp['name'],
-                    'lf':       leadfield[:, _gidx, :],
-                    'max_mean': float(_grp['max_mean_V_m']),
-                })
-                print(f"  Subgroup constraint '{_grp['name']}': {len(_gidx)} elements, "
-                      f"max mean TI <= {_grp['max_mean_V_m']} V/m")
+                _bna_img  = nib.load(bna_warped)
+                _bna_data = np.asarray(_bna_img.dataobj, dtype=np.int32)
+                _bna_inv  = np.linalg.inv(_bna_img.affine)
+                _bna_vox  = (_bna_inv @ np.hstack([centroids, ones]).T).T[:, :3]
+                _bna_idx  = np.round(_bna_vox).astype(int)
+                _bna_sh   = _bna_data.shape
+                _bna_ok   = ((_bna_idx[:,0]>=0)&(_bna_idx[:,0]<_bna_sh[0])&
+                             (_bna_idx[:,1]>=0)&(_bna_idx[:,1]<_bna_sh[1])&
+                             (_bna_idx[:,2]>=0)&(_bna_idx[:,2]<_bna_sh[2]))
+                _bna_elm_lbl = np.zeros(len(centroids), dtype=np.int32)
+                _bna_elm_lbl[_bna_ok] = _bna_data[_bna_idx[_bna_ok,0],
+                                                   _bna_idx[_bna_ok,1],
+                                                   _bna_idx[_bna_ok,2]]
+            _labels = list(_grp['bna_labels'].values())
+            _gmask  = np.isin(_bna_elm_lbl, _labels) & gm_wm_mask   # GM+WM only
+        else:
+            print(f"  WARNING: constraint group '{_grp.get('name', '?')}' has neither "
+                  f"'mask_name' nor 'bna_labels' — skipped")
+            continue
+
+        _gidx = np.flatnonzero(_gmask)
+        if len(_gidx) == 0:
+            print(f"  WARNING: constraint group '{_grp['name']}' maps to 0 elements — skipped")
+            continue
+        nr_constraint_groups.append({
+            'name':     _grp['name'],
+            'lf':       leadfield[:, _gidx, :],
+            'max_mean': float(_grp['max_mean_V_m']),
+        })
+        print(f"  Subgroup constraint '{_grp['name']}': {len(_gidx)} elements, "
+              f"max mean TI <= {_grp['max_mean_V_m']} V/m")
 
     # ════════════════════════════════════════════════════════════════════════
     # STEP 2b — Build electrode adjacency set (shunting prevention and source isolation)
@@ -1104,7 +1165,12 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             n_nb    = neighbours_per_iter[it]
             winners = [round_result["best_ch1"][0], round_result["best_ch1"][1],
                        round_result["best_ch2"][0], round_result["best_ch2"][1]]
-            new_candidates = set(candidate_set)
+            # Freshly rebuilt from just this round's 4 winners each time — NOT
+            # unioned with the previous round's candidate set, so the search
+            # space actually narrows around the current best montage each
+            # iteration (e.g. 4 winners x 8 neighbours = up to 32+4=36
+            # electrodes), rather than growing without bound.
+            new_candidates = set()
             for w in winners:
                 new_candidates.add(w)
                 new_candidates.update(_nearest_neighbours(w, all_elec_names, _cap_pos, n_nb))
@@ -1116,7 +1182,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
             candidate_set = new_candidates
             print(f"\n  Fine iteration {it + 1}/{n_fine}: {len(candidate_set)} electrodes "
-                  f"(4 winners x {n_nb} nearest neighbours, deduplicated with prior candidates)")
+                  f"(4 winners x {n_nb} nearest neighbours, deduplicated)")
             new_result = _search(sorted(candidate_set, key=all_elec_names.index))
             history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
                              **{k: v for k, v in new_result.items() if k not in ("best_ch1", "best_ch2")}})

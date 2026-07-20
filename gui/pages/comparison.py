@@ -92,15 +92,15 @@ def _atlas_region_picker(prefix):
 
 
 def _base_columns(show_cap, show_roi, show_nonroi, show_elec=False):
-    # Channels/ROI/non-ROI are plain text, not DataTable dropdown cells —
-    # DataTable's built-in dropdown editor has known typing/backspace
-    # issues. "Mode" stays a dropdown (two fixed choices, no typing
-    # needed). Cap gets a dropdown too (filtered per-subject) plus
-    # red/green conditional cell coloring for registration status, so
-    # picking the wrong one is visually obvious despite the click-only
-    # editing UX. "Elec" (electrode settings), when per-row, is a dropdown
-    # filtered by that row's own (subject, cap) — one option per cached
-    # leadfield variant for that pair (see fem_discovery.list_leadfields).
+    # Channels are plain text (raw electrode names / "x, y, z" for oneoff —
+    # not a fixed option set). Everything else that has a discoverable,
+    # per-subject option set is a DataTable dropdown cell, filtered by that
+    # row's own subject (see _update_cap_dropdown_and_colors): "Mode" (fixed
+    # choices), "Cap" (registered caps, + red/green registration-status
+    # coloring), "Elec" (cached leadfield variants for that row's (subject,
+    # cap) pair), and — when NOT using a common ROI/non-ROI — "ROI mask" /
+    # "Non-ROI mask" (existing mask files found for that row's subject, +
+    # red/green found-on-disk coloring), same technique as Cap.
     cols = [
         {"name": "Subject", "id": "subject"},
         {"name": "Mode", "id": "mode", "presentation": "dropdown"},
@@ -118,9 +118,9 @@ def _base_columns(show_cap, show_roi, show_nonroi, show_elec=False):
         {"name": "Ch2 mA", "id": "ch2_current", "type": "numeric"},
     ]
     if show_roi:
-        cols.append({"name": "ROI mask", "id": "roi"})
+        cols.append({"name": "ROI mask", "id": "roi", "presentation": "dropdown"})
     if show_nonroi:
-        cols.append({"name": "Non-ROI mask", "id": "nonroi"})
+        cols.append({"name": "Non-ROI mask", "id": "nonroi", "presentation": "dropdown"})
     cols.append({"name": "Label", "id": "label"})
     return cols
 
@@ -425,11 +425,16 @@ def _update_table_schema(cap_toggle, roi_toggle, nonroi_toggle, elec_toggle):
     Input("cx-common-cap-dropdown", "value"),
     Input("cx-cap-registered-trigger", "data"),
     Input("cx-common-elec-toggle", "value"),
+    Input("cx-common-roi-toggle", "value"),
+    Input("cx-common-nonroi-toggle", "value"),
 )
-def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger, elec_toggle):
+def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger, elec_toggle,
+                                    roi_toggle, nonroi_toggle):
     show_cap = "common" not in (cap_toggle or [])
     common_cap_name = cd.cap_stem(common_cap_path) if (not show_cap and common_cap_path) else None
     show_elec = "common" not in (elec_toggle or [])
+    show_roi = "common" not in (roi_toggle or [])
+    show_nonroi = "common" not in (nonroi_toggle or [])
 
     rows = rows or []
     dropdown_conditional = []
@@ -438,6 +443,9 @@ def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger,
     seen_cap_pairs = set()
     seen_leadfield_pairs = set()
     seen_elec_pairs = set()
+    seen_mask_subjects = set()
+    seen_roi_pairs = set()
+    seen_nonroi_pairs = set()
 
     for row in rows:
         sid = (row.get("subject") or "").strip()
@@ -501,6 +509,45 @@ def _update_cap_dropdown_and_colors(rows, cap_toggle, common_cap_path, _trigger,
             dropdown_conditional.append({
                 "if": {"column_id": "elec", "filter_query": filter_q},
                 "options": elec_opts,
+            })
+
+        # ROI / non-ROI mask dropdowns: existing mask files found for this
+        # row's own subject (no ROI/non-ROI type distinction on disk — both
+        # columns draw from the same name list, same as the common-mode
+        # "existing mask names" picker above). Red/green by found-on-disk,
+        # same technique as Cap; non-ROI is optional so an empty cell stays
+        # uncolored.
+        if (show_roi or show_nonroi) and sid not in seen_mask_subjects:
+            seen_mask_subjects.add(sid)
+            mask_opts = [{"label": n, "value": n} for n in sorted(cx.list_existing_names([sid]))]
+            if show_roi:
+                dropdown_conditional.append({
+                    "if": {"column_id": "roi", "filter_query": f'{{subject}} eq "{sid}"'},
+                    "options": mask_opts,
+                })
+            if show_nonroi:
+                dropdown_conditional.append({
+                    "if": {"column_id": "nonroi", "filter_query": f'{{subject}} eq "{sid}"'},
+                    "options": mask_opts,
+                })
+
+        roi_val = (row.get("roi") or "").strip()
+        if show_roi and roi_val and (sid, roi_val) not in seen_roi_pairs:
+            seen_roi_pairs.add((sid, roi_val))
+            found = cx.resolve_mask(sid, roi_val) is not None
+            style_conditional.append({
+                "if": {"column_id": "roi", "filter_query": f'{{subject}} eq "{sid}" && {{roi}} eq "{roi_val}"'},
+                "backgroundColor": "#d4f7d4" if found else "#f7d4d4",
+            })
+
+        nonroi_val = (row.get("nonroi") or "").strip()
+        if show_nonroi and nonroi_val and (sid, nonroi_val) not in seen_nonroi_pairs:
+            seen_nonroi_pairs.add((sid, nonroi_val))
+            found = cx.resolve_mask(sid, nonroi_val) is not None
+            style_conditional.append({
+                "if": {"column_id": "nonroi",
+                       "filter_query": f'{{subject}} eq "{sid}" && {{nonroi}} eq "{nonroi_val}"'},
+                "backgroundColor": "#d4f7d4" if found else "#f7d4d4",
             })
 
     return dropdown_conditional, style_conditional

@@ -140,8 +140,16 @@ class OptimizerConfig:
 
     # Per-subgroup non-ROI hard constraints.
     # A montage is rejected if mean TI in ANY listed group exceeds max_mean_V_m,
-    # regardless of the overall non-ROI union mean.
-    # Each entry: {"name": str, "bna_labels": {str: int}, "max_mean_V_m": float}
+    # regardless of the overall non-ROI union mean (which stays a single
+    # unioned mask — cfg.non_roi — regardless of how many groups are listed here).
+    # Each entry is EITHER:
+    #   {"name": str, "mask_name": str, "max_mean_V_m": float}
+    #     — references an already-generated sub-{id}_label-{mask_name}_mask.nii.gz
+    #       (any atlas: Allen, SimNIBS, FreeSurfer, or a combined mask from Mask
+    #       Generation — same file convention Allen-sourced ROI/non-ROI already use)
+    #   {"name": str, "bna_labels": {str: int}, "max_mean_V_m": float}
+    #     — BNA-atlas labels, mapped via the subject's warped
+    #       BNA_atlas_subjectspace.nii.gz (the original, still-supported path)
     non_roi_hard_constraint_groups: List[dict] = field(default_factory=list)
 
     # Hierarchical / coarse-to-fine electrode search (opt-in). When False

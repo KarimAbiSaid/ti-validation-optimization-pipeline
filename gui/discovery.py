@@ -510,3 +510,35 @@ def existing_masks(subject_id: str, project_dir: str = PROJECT_DIR) -> list[dict
             "sidecar": sidecar,
         })
     return out
+
+
+# One pattern per _MASK_FILENAME_RE alternative, each capturing just the
+# {name} component — the value expected by ROI/non-ROI "Name" fields and by
+# non_roi_hard_constraint_groups' mask_name (see PipelineConfig.mask_path()).
+_MASK_NAME_PATTERNS = [
+    re.compile(r"^sub-[^_]+_label-(.+)_mask\.nii\.gz$"),
+    re.compile(r"^sub-[^_]+_nonroi-(.+)_mask\.nii\.gz$"),
+    re.compile(r"^sub-[^_]+_mask-(.+)\.nii\.gz$"),
+]
+
+
+def _extract_mask_name(fname: str) -> str | None:
+    for pat in _MASK_NAME_PATTERNS:
+        m = pat.match(fname)
+        if m:
+            return m.group(1)
+    return None
+
+
+def list_mask_names(subject_ids: list[str], project_dir: str = PROJECT_DIR) -> list[str]:
+    """Union of existing mask names across subject_ids, for 'pick an existing
+    mask' dropdowns (Allen ROI/non-ROI, non-ROI subgroup hard constraints) —
+    same union-across-selected-subjects pattern cap_discovery uses for the
+    Config Generation cap dropdown."""
+    names = set()
+    for sid in subject_ids or []:
+        for m in existing_masks(sid, project_dir):
+            name = _extract_mask_name(m["filename"])
+            if name:
+                names.add(name)
+    return sorted(names)

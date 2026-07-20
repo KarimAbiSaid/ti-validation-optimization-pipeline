@@ -4,6 +4,9 @@
 declare -A SUBJECT_CONFIGS
 declare -A SUBJECT_TIMELIMITS
 
+SUBJECT_CONFIGS["52Y02"]="${BASE_CONFIG_DIR}/sub-52Y02_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_TIMELIMITS["52Y02"]="02:00:00"
+
 SUBJECT_CONFIGS["52Y03"]="${BASE_CONFIG_DIR}/sub-52Y03_roi-STN_L_roi_Allen_ex_focality.json \
   ${BASE_CONFIG_DIR}/sub-52Y03_roi-STN_L_roi_Allen_ex_mean.json"
 SUBJECT_TIMELIMITS["52Y03"]="02:00:00"
@@ -13,6 +16,22 @@ SUBJECT_TIMELIMITS["52Y04"]="02:00:00"
 
 SUBJECT_CONFIGS["52Y05"]="${BASE_CONFIG_DIR}/sub-52Y05_roi-STN_L_roi_Allen_ex_focality.json"
 SUBJECT_TIMELIMITS["52Y05"]="02:00:00"
+
+SUBJECT_CONFIGS["52Y07"]="${BASE_CONFIG_DIR}/sub-52Y07_roi-STN_L_roi_Allen_ex_focality.json \
+  ${BASE_CONFIG_DIR}/sub-52Y07_roi-STN_L_roi_Allen_ex_mean.json"
+SUBJECT_TIMELIMITS["52Y07"]="02:00:00"
+
+SUBJECT_CONFIGS["52Y08"]="${BASE_CONFIG_DIR}/sub-52Y08_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_TIMELIMITS["52Y08"]="02:00:00"
+
+SUBJECT_CONFIGS["52Y09"]="${BASE_CONFIG_DIR}/sub-52Y09_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_TIMELIMITS["52Y09"]="02:00:00"
+
+SUBJECT_CONFIGS["52Y10"]="${BASE_CONFIG_DIR}/sub-52Y10_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_TIMELIMITS["52Y10"]="02:00:00"
+
+SUBJECT_CONFIGS["52Y13"]="${BASE_CONFIG_DIR}/sub-52Y13_roi-STN_L_roi_Allen_ex_focality.json"
+SUBJECT_TIMELIMITS["52Y13"]="02:00:00"
 
 SUBJECT_CONFIGS["73T01"]="${BASE_CONFIG_DIR}/sub-73T01_roi-hippo_r_phg_ex_focality.json \
   ${BASE_CONFIG_DIR}/sub-73T01_roi-hippo_r_phg_ex_mean.json"
