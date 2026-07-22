@@ -41,7 +41,7 @@ echo "============================================================"
 echo " Submitting charm jobs — $(date)"
 echo " Subjects : ${NEW_SUBJECTS[*]}"
 echo " Account  : uphummel"
-echo " CPUs     : 4 per job  |  Mem: 16G  |  Time: 03:30:00"
+echo " CPUs     : 4 per job  |  Mem: 16G  |  Time: 05:30:00"
 echo "============================================================"
 
 submitted=0

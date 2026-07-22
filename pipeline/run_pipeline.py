@@ -697,6 +697,19 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             print(f"  [SKIP] exhaustive search — found existing run:\n         {prev}")
             return prev
 
+    # Fail fast on a bad cap CSV — cap_discovery.py's registration/adoption
+    # now rejects non-finite coordinates up front, but this catches an
+    # already-registered cap from before that fix (or any cap CSV supplied
+    # outside the GUI's registration flow entirely) before spending 30-90 min
+    # on the leadfield computation below, only to have SimNIBS's own
+    # electrode placement crash on it with a much less actionable error.
+    _cap_check = _load_cap_positions(cfg.eeg_csv_path)
+    _bad_electrodes = [n for n, p in _cap_check.items() if not np.all(np.isfinite(p))]
+    if _bad_electrodes:
+        abort(f"Cap CSV has non-finite (NaN/inf) coordinates for: {', '.join(_bad_electrodes)}\n"
+              f"  {cfg.eeg_csv_path}\n"
+              f"  Fix or remove these rows (e.g. re-register the cap, or edit the CSV directly) before running.")
+
     os.makedirs(out_dir, exist_ok=True)
 
     # ════════════════════════════════════════════════════════════════════════

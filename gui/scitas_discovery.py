@@ -56,6 +56,27 @@ TRACKED_PIPELINE_FILES = [
 _SSH_TIMEOUT = 30       # a single ssh command (submit, squeue, sacct, test -e) should be fast
 POLL_INTERVAL_S = 30    # how often wait_for_job() checks squeue/sacct while blocking
 
+# SSH connection multiplexing (ControlMaster/ControlPersist) — without this,
+# every single ssh_run()/scp call opens a brand-new TCP+SSH handshake. A
+# burst of calls close together (several mask uploads in one
+# run_pipeline_on_scitas(), several GUI actions at once, wait_for_job()
+# polling several concurrent jobs) can trip SCITAS's own new-connection rate
+# limiting on its login node — seen live as scp failing with
+# "kex_exchange_identification: Connection closed by remote host". With
+# multiplexing, the first call opens one real authenticated connection and
+# keeps it open in the background (ControlPersist); every later call to the
+# same (host, user, port) reuses it instantly instead of re-handshaking.
+# %C (a hash of local user/host/port) keeps the control-socket path short
+# regardless of how long this machine's home directory path is — Unix-domain
+# socket paths have a low length limit on both Linux and Windows/Cygwin ssh.
+_MUX_DIR = Path.home() / ".ssh" / "cm"
+
+
+def _mux_args() -> list[str]:
+    _MUX_DIR.mkdir(parents=True, exist_ok=True)
+    return ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
+            "-o", f"ControlPath={_MUX_DIR}/%C"]
+
 _TERMINAL_STATES = {
     "COMPLETED", "FAILED", "CANCELLED", "TIMEOUT",
     "OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE",
@@ -157,7 +178,7 @@ def ssh_run(remote_command: str, timeout: int = _SSH_TIMEOUT) -> dict:
     "returncode", "stdout", "stderr"}."""
     extra_args, host = _ssh_target()
     cmd = (["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={min(timeout, 15)}"]
-          + extra_args + [host, remote_command])
+          + _mux_args() + extra_args + [host, remote_command])
     try:
         # encoding/errors explicit: remote output isn't guaranteed to be
         # decodable as Windows' default cp1252 (subprocess's own internal
@@ -183,7 +204,7 @@ def _scp_host_spec() -> str:
 def _scp(args: list[str], timeout: int) -> dict:
     identity_file = load_settings()["identity_file"]
     identity_args = ["-i", identity_file] if identity_file else []
-    cmd = ["scp", "-o", "BatchMode=yes"] + identity_args + args
+    cmd = ["scp", "-o", "BatchMode=yes"] + _mux_args() + identity_args + args
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               encoding="utf-8", errors="replace")
@@ -288,7 +309,7 @@ def test_connection(timeout: int = 10) -> dict:
     """Read-only. {"success", "host", "username", "error"}."""
     extra_args, host = _ssh_target()
     cmd = (["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}"]
-          + extra_args + [host, "echo CONNECTION_OK && echo USER=$USER"])
+          + _mux_args() + extra_args + [host, "echo CONNECTION_OK && echo USER=$USER"])
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5,
                               encoding="utf-8", errors="replace")

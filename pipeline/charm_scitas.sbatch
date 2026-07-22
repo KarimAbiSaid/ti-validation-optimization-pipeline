@@ -22,7 +22,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=03:30:00
+#SBATCH --time=05:30:00
 #SBATCH --account=uphummel
 #SBATCH --output=/scratch/%u/logs/simnibs/charm_%x_%j.out
 #SBATCH --error=/scratch/%u/logs/simnibs/charm_%x_%j.err

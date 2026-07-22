@@ -124,6 +124,21 @@ def read_cap_csv(path: str) -> dict:
     return {"types": types, "names": names, "coords": np.array(coords)}
 
 
+def _check_finite_coords(names: list[str], coords) -> None:
+    """Raises ValueError listing any electrode with a non-finite (NaN/inf)
+    coordinate — e.g. a digitized cap with an undigitized/failed point, or
+    (for register_cap) an MNI position that falls outside the subject's
+    valid warp-field domain. Written this early (registration time) instead
+    of letting it reach SimNIBS's own electrode placement, which only
+    surfaces it deep inside the leadfield computation with a much less
+    actionable error, after real compute time has already been spent."""
+    import numpy as np
+    bad = [n for n, c in zip(names, coords) if not np.all(np.isfinite(c))]
+    if bad:
+        raise ValueError(f"non-finite (NaN/inf) coordinates for: {', '.join(bad)} — "
+                         f"fix or remove these rows in the source cap file before registering.")
+
+
 def _filter_non_electrodes(cap: dict) -> dict:
     """Drops ground/reference/fiducial-landmark rows (see
     config.NON_ELECTRODE_NAMES) from a read_cap_csv() result — not real
@@ -215,6 +230,7 @@ def register_cap(subject_id: str, cap_path: str, project_dir: str = PROJECT_DIR)
 
         cap = _filter_non_electrodes(read_cap_csv(cap_path))
         coords_subj = mni2subject_coords(cap["coords"], m2m_path)
+        _check_finite_coords(cap["names"], coords_subj)
 
         mesh = mesh_io.read_msh(msh_path)
         scalp = mesh.crop_mesh(tags=[1005])
@@ -254,6 +270,7 @@ def adopt_subject_space_cap(subject_id: str, cap_path: str, project_dir: str = P
                 "out_path": None, "n_electrodes": None}
     try:
         cap = _filter_non_electrodes(read_cap_csv(cap_path))
+        _check_finite_coords(cap["names"], cap["coords"])
         out_path = registered_cap_path(subject_id, cap_path, project_dir)
         _write_registered_csv(out_path, cap["types"], cap["names"], cap["coords"])
         return {"subject_id": subject_id, "success": True, "error": None,
