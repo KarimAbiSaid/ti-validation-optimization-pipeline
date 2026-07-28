@@ -40,49 +40,61 @@ SUBJECT_CONFIGS["52Y13"]="${BASE_CONFIG_DIR}/sub-52Y13_roi-STN_L_roi_Allen_ex_fo
 SUBJECT_TIMELIMITS["52Y13"]="02:00:00"
 
 SUBJECT_CONFIGS["73T01"]="${BASE_CONFIG_DIR}/sub-73T01_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T01_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T01_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T01_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T01"]="02:00:00"
 
 SUBJECT_CONFIGS["73T02"]="${BASE_CONFIG_DIR}/sub-73T02_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T02_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T02_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T02_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T02"]="02:00:00"
 
 SUBJECT_CONFIGS["73T03"]="${BASE_CONFIG_DIR}/sub-73T03_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T03_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T03_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T03_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T03"]="02:00:00"
 
 SUBJECT_CONFIGS["73T04"]="${BASE_CONFIG_DIR}/sub-73T04_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T04_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T04_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T04_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T04"]="02:00:00"
 
 SUBJECT_CONFIGS["73T05"]="${BASE_CONFIG_DIR}/sub-73T05_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T05_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T05_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T05_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T05"]="02:00:00"
 
 SUBJECT_CONFIGS["73T06"]="${BASE_CONFIG_DIR}/sub-73T06_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T06_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T06_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T06_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T06"]="02:00:00"
 
 SUBJECT_CONFIGS["73T07"]="${BASE_CONFIG_DIR}/sub-73T07_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T07_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T07_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T07_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T07"]="02:00:00"
 
 SUBJECT_CONFIGS["73T09"]="${BASE_CONFIG_DIR}/sub-73T09_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T09_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T09_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T09_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T09"]="02:00:00"
 
 SUBJECT_CONFIGS["73T10"]="${BASE_CONFIG_DIR}/sub-73T10_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T10_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T10_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T10_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T10"]="02:00:00"
 
 SUBJECT_CONFIGS["73T11"]="${BASE_CONFIG_DIR}/sub-73T11_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T11_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T11_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T11_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T11"]="02:00:00"
 
 SUBJECT_CONFIGS["73T12"]="${BASE_CONFIG_DIR}/sub-73T12_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T12_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T12_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T12_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T12"]="02:00:00"
 
 SUBJECT_CONFIGS["73T14"]="${BASE_CONFIG_DIR}/sub-73T14_roi-hippo_r_phg_ex_focality.json \
-  ${BASE_CONFIG_DIR}/sub-73T14_roi-hippo_r_phg_ex_mean.json"
+  ${BASE_CONFIG_DIR}/sub-73T14_roi-hippo_r_phg_ex_mean.json \
+  ${BASE_CONFIG_DIR}/sub-73T14_roi-right_hc_phg_hierarchical_BNA_ex_focality.json"
 SUBJECT_TIMELIMITS["73T14"]="02:00:00"

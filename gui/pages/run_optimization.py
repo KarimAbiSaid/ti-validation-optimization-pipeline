@@ -125,24 +125,45 @@ def _on_start_click(_n_clicks, rows, selected_rows, force_value, run_location):
         return None, True, html.Div("Select at least one config first.", style={"color": "#a00"})
 
     force_sections = list(rd.FORCE_SECTIONS) if "force" in (force_value or []) else None
-    fn = rd.run_pipeline_on_scitas if run_location == "scitas" else rd.run_local
-
     jobs = {}
-    for i, row in enumerate(selected):
-        config_path = row["path"]
-        subject_id = row["subject_id"]
-        _job_id, job_dir = jr.new_job_dir(rd.job_base_dir(subject_id))
-        jr.start_local_job(job_dir, fn, config_path, force_sections)
-        jobs[str(i)] = {
-            "job_dir": job_dir, "status": "running", "result": None,
-            "row": {"subject_id": subject_id, "roi_name": row.get("roi_name"),
-                    "goal": row.get("goal"), "filename": row.get("filename")},
-        }
 
-    loc_note = ("SCITAS — each config uploads its own prerequisites and submits its own SLURM job; "
-               "they run concurrently on the cluster." if run_location == "scitas"
-               else "locally, each in its own background thread, concurrently.")
-    note = f"Started {len(jobs)} run(s) — {loc_note} Polling every 3s..."
+    if run_location == "scitas":
+        # Gets every selected config's prereqs uploaded and its SLURM job
+        # queued using as few ssh connections as possible for the WHOLE
+        # batch (not per config) — doing that per config, all at once for
+        # N configs, was still enough separate connections in a short
+        # window to trip SCITAS's own new-connection rate limiting. Each
+        # config that got queued successfully then gets its own background
+        # thread that just polls that job to completion — no more upload/
+        # submit work left for it to do (and therefore no more per-job
+        # connections at startup).
+        submissions = rd.batch_submit([row["path"] for row in selected], force_sections)
+        n_ok = sum(1 for s in submissions.values() if s["success"])
+        for i, row in enumerate(selected):
+            sub = submissions[row["path"]]
+            row_info = {"subject_id": row["subject_id"], "roi_name": row.get("roi_name"),
+                       "goal": row.get("goal"), "filename": row.get("filename")}
+            if sub["success"]:
+                _job_id, job_dir = jr.new_job_dir(rd.job_base_dir(row["subject_id"]))
+                jr.start_local_job(job_dir, rd.wait_for_submitted_job, sub["job_id"], row["subject_id"])
+                jobs[str(i)] = {"job_dir": job_dir, "status": "running", "result": None, "row": row_info}
+            else:
+                jobs[str(i)] = {"job_dir": None, "status": "error",
+                                "result": {"success": False, "error": sub["error"]}, "row": row_info}
+        note = (f"Submitted {n_ok}/{len(selected)} job(s) to SCITAS in one batch "
+               f"(shared prereq upload + submission) — polling every 3s...")
+    else:
+        for i, row in enumerate(selected):
+            subject_id = row["subject_id"]
+            _job_id, job_dir = jr.new_job_dir(rd.job_base_dir(subject_id))
+            jr.start_local_job(job_dir, rd.run_local, row["path"], force_sections)
+            jobs[str(i)] = {
+                "job_dir": job_dir, "status": "running", "result": None,
+                "row": {"subject_id": subject_id, "roi_name": row.get("roi_name"),
+                        "goal": row.get("goal"), "filename": row.get("filename")},
+            }
+        note = f"Started {len(jobs)} run(s) locally, each in its own background thread. Polling every 3s..."
+
     return jobs, False, html.Div(note, style={"color": "#666"})
 
 

@@ -17,14 +17,50 @@ demand (scp -r) — deliberately not an automatic/whole-tree sync, since
 derivatives (leadfields especially) can be very large.
 """
 import os
+import time
 
 import dash
 from dash import html, dcc, dash_table, callback, Input, Output, State, ctx
 
 import common
+import job_runner as jr
 import scitas_discovery as sd
 
 dash.register_page(__name__, path="/data-directory", name="Data Directory", category="Settings", order=2)
+
+SYNC_JOB_BASE_DIR = os.path.join(common.PROJECT_DIR, "_data_sync_jobs")
+
+
+def _run_sync_job(job_dir: str, subject_ids: list[str], folder_tags: list[str], project_dir: str) -> dict:
+    """Runs inside a job_runner background thread. Wraps
+    sd.sync_subject_data with a progress_cb that live-updates the job's own
+    status.json (job_runner.report_progress) as lines arrive, instead of
+    only reporting a result at the very end — the actual point of
+    backgrounding this at all, since a sync can be a multi-minute
+    operation (large derivatives, especially TIoptimization results) that
+    used to just block the page behind a bare spinner.
+
+    Returns {"sid|tag": {"success","error"}, ...} — sync_subject_data's own
+    (subject_id, folder_tag) tuple keys aren't valid JSON object keys, so
+    they're flattened to a single "sid|tag" string here before job_runner
+    writes this as the job's result."""
+    log_lines = []
+    last_write = [0.0]
+
+    def cb(line):
+        log_lines.append(line)
+        now = time.time()
+        # Throttled to ~4 writes/sec — sync_subject_data can call this once
+        # PER EXTRACTED FILE (hundreds+ for a big subject), and rewriting
+        # the whole status.json that often is wasted I/O for no
+        # perceptible difference in a UI that polls every second anyway.
+        if now - last_write[0] > 0.25:
+            jr.report_progress(job_dir, log=log_lines[-300:])
+            last_write[0] = now
+
+    results = sd.sync_subject_data(subject_ids, folder_tags, project_dir, progress_cb=cb)
+    jr.report_progress(job_dir, log=log_lines[-300:])  # final flush — catches anything since the last throttled write
+    return {f"{sid}|{tag}": {"success": r["success"], "error": r["error"]} for (sid, tag), r in results.items()}
 
 
 def _styled_table(id_, columns, data=None, **kwargs):
@@ -95,6 +131,7 @@ layout = html.Div([
             {"name": "Subject", "id": "subject"},
             {"name": "rawdata", "id": "rawdata_display"},
             {"name": "derivatives/SimNIBS", "id": "simnibs_display"},
+            {"name": "leadfield_volume", "id": "leadfield_display"},
             {"name": "derivatives/freesurfer", "id": "freesurfer_display"},
         ],
         row_selectable="multi",
@@ -112,7 +149,14 @@ layout = html.Div([
     ], style={"margin": "1rem 0"}),
 
     html.Button("Sync Selected", id="dd-sync-button", n_clicks=0, style={"padding": "0.5rem 1.5rem"}),
-    dcc.Loading(html.Div(id="dd-sync-result", style={"marginTop": "1rem"})),
+    dcc.Store(id="dd-sync-job-store"),
+    dcc.Interval(id="dd-sync-poll-interval", interval=1000, disabled=True),
+    html.Div(id="dd-sync-note", style={"fontSize": "13px", "margin": "0.5rem 0"}),
+    html.Pre(id="dd-sync-log", style={
+        "maxHeight": "300px", "overflowY": "auto", "backgroundColor": "#111", "color": "#0f0",
+        "padding": "0.5rem", "fontSize": "12px", "whiteSpace": "pre-wrap", "marginTop": "0.5rem",
+    }),
+    html.Div(id="dd-sync-result", style={"marginTop": "1rem"}),
 ])
 
 
@@ -201,12 +245,17 @@ def _on_load_remote_click(_n_clicks):
             "subject": sid,
             "rawdata_display": "✓" if s["rawdata"] else "—",
             "simnibs_display": "✓" if s["derivatives/SimNIBS"] else "—",
+            "leadfield_display": "✓" if s["derivatives/SimNIBS/leadfield_volume"] else "—",
             "freesurfer_display": "✓" if s["derivatives/freesurfer"] else "—",
         })
     return rows, f"{len(subjects)} subject(s) found on SCITAS."
 
 
 @callback(
+    Output("dd-sync-job-store", "data"),
+    Output("dd-sync-poll-interval", "disabled"),
+    Output("dd-sync-note", "children"),
+    Output("dd-sync-log", "children"),
     Output("dd-sync-result", "children"),
     Input("dd-sync-button", "n_clicks"),
     State("dd-remote-table", "data"),
@@ -220,17 +269,50 @@ def _on_sync_click(_n_clicks, rows, selected_rows, folder_tags):
     subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
 
     if not subject_ids:
-        return html.Div("Select at least one subject above.", style={"color": "#a00"})
+        return None, True, html.Div("Select at least one subject above.", style={"color": "#a00"}), "", ""
     if not folder_tags:
-        return html.Div("Select at least one folder to sync.", style={"color": "#a00"})
+        return None, True, html.Div("Select at least one folder to sync.", style={"color": "#a00"}), "", ""
 
-    results = sd.sync_subject_data(subject_ids, folder_tags, common.PROJECT_DIR)
-    rows_out = [
-        {"subject": sid, "folder": tag, "status": "✓ ok" if r["success"] else f"✗ {r['error']}"}
-        for (sid, tag), r in results.items()
-    ]
-    return _styled_table("dd-sync-results-table", [
+    os.makedirs(SYNC_JOB_BASE_DIR, exist_ok=True)
+    _job_id, job_dir = jr.new_job_dir(SYNC_JOB_BASE_DIR)
+    jr.start_local_job(job_dir, _run_sync_job, job_dir, subject_ids, folder_tags, common.PROJECT_DIR)
+    note = html.Div(f"Syncing {len(subject_ids)} subject(s) x {len(folder_tags)} folder(s) — "
+                    f"polling every 1s...", style={"color": "#666"})
+    return job_dir, False, note, "", ""
+
+
+@callback(
+    Output("dd-sync-job-store", "data", allow_duplicate=True),
+    Output("dd-sync-poll-interval", "disabled", allow_duplicate=True),
+    Output("dd-sync-log", "children", allow_duplicate=True),
+    Output("dd-sync-result", "children", allow_duplicate=True),
+    Input("dd-sync-poll-interval", "n_intervals"),
+    State("dd-sync-job-store", "data"),
+    prevent_initial_call=True,
+)
+def _poll_sync(_n_intervals, job_dir):
+    if not job_dir:
+        return job_dir, True, "", ""
+    status = jr.read_status(job_dir)
+    if not status:
+        return job_dir, False, "", ""
+
+    log_text = "\n".join(status.get("log") or [])
+    if status["state"] == "running":
+        return job_dir, False, log_text, ""
+    if status["state"] == "error":
+        err = html.Pre(f"✗ {status.get('error')}\n\n{status.get('traceback', '')}",
+                       style={"color": "#a00", "whiteSpace": "pre-wrap", "fontSize": "12px"})
+        return job_dir, True, log_text, err
+
+    result = status["result"] or {}
+    rows_out = []
+    for key, r in result.items():
+        sid, tag = key.split("|", 1)
+        rows_out.append({"subject": sid, "folder": tag, "status": "✓ ok" if r["success"] else f"✗ {r['error']}"})
+    table = _styled_table("dd-sync-results-table", [
         {"name": "Subject", "id": "subject"},
         {"name": "Folder", "id": "folder"},
         {"name": "Status", "id": "status"},
     ], data=rows_out)
+    return job_dir, True, log_text, table

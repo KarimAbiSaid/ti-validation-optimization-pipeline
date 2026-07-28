@@ -120,7 +120,68 @@ def run_local(config_path: str, force_sections: list[str] | None = None) -> dict
     }
 
 
-def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = None) -> dict:
+def _config_prereq_relpaths(cfg: dict) -> list[str]:
+    """Relative-to-PROJECT_DIR paths (forward-slash, matching the remote
+    scratch layout — see scitas_discovery.batch_upload) for every small
+    file this config needs uploaded: registered cap CSV, ROI/non-ROI
+    masks, non-ROI constraint-group masks. Shared by
+    run_pipeline_on_scitas()'s own per-config upload step and
+    batch_upload_prereqs()'s combined multi-config upload, so both stay in
+    sync about what "this config's prerequisites" actually means."""
+    subject_id = cfg["subject_id"]
+    paths = []
+    cap_csv = cfg.get("cap_csv")
+    if cap_csv:
+        cap_name = os.path.splitext(os.path.basename(cap_csv))[0]
+        paths.append(f"derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}/eeg_positions/{cap_name}.csv")
+    for roi_cfg in (cfg.get("roi"), cfg.get("non_roi")):
+        if roi_cfg and roi_cfg.get("name"):
+            paths.append(f"derivatives/SimNIBS/sub-{subject_id}/roi/"
+                         f"sub-{subject_id}_label-{roi_cfg['name']}_mask.nii.gz")
+    for grp in cfg.get("optimizer", {}).get("non_roi_hard_constraint_groups", []):
+        mask_name = grp.get("mask_name")
+        if mask_name:
+            paths.append(f"derivatives/SimNIBS/sub-{subject_id}/roi/"
+                         f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
+    return paths
+
+
+def batch_upload_prereqs(config_paths: list[str]) -> dict:
+    """Uploads every listed config's own config JSON + registered cap +
+    ROI/non-ROI/constraint masks in ONE ssh connection
+    (scitas_discovery.batch_upload) instead of one scp call per file per
+    config. Built for submitting several configs at once on the Run
+    Pipeline page: doing this one config at a time, as
+    run_pipeline_on_scitas() does on its own, opens a burst of separate
+    connections large enough to trip SCITAS's own new-connection rate
+    limiting on its login node (seen live as scp failing with
+    "kex_exchange_identification: Connection closed by remote host").
+
+    Call this ONCE before launching the per-config run_pipeline_on_scitas()
+    jobs, then pass skip_prereq_upload=True to each so they don't
+    redundantly re-upload what's already here. m2m_ and the BNA atlas are
+    deliberately NOT included: m2m_ can be large enough that folding it
+    into one combined transfer risks turning several small independent
+    retriable uploads into one large fragile one, and the BNA atlas is a
+    single shared file almost always already present after the first run
+    ever — both keep their existing per-config if-missing check.
+
+    Returns {"success", "uploaded", "error"} (scitas_discovery.batch_upload's
+    own shape)."""
+    import scitas_discovery as sd
+
+    relpaths = []
+    for config_path in config_paths:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        relpaths.append(f"code/pipeline/configs/{os.path.basename(config_path)}")
+        relpaths += _config_prereq_relpaths(cfg)
+
+    return sd.batch_upload(PROJECT_DIR, relpaths)
+
+
+def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = None,
+                           skip_prereq_upload: bool = False) -> dict:
     """Submits config_path to SCITAS via simnibs_ti_pipeline.sbatch, blocks
     until the SLURM job leaves the queue. Call inside a job_runner
     background job (blocking — same contract as run_local()). Returns
@@ -140,6 +201,15 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
     output — no labels/bna_labels to build from), opportunistic otherwise.
     Results stay on SCITAS scratch — sync them back via the Data
     Directory page if you want local copies, same as any other SCITAS data.
+
+    skip_prereq_upload: set True when the caller already uploaded the
+    config/cap/masks itself (batch_upload_prereqs(), called once across
+    several configs at once — see the Run Pipeline page's multi-select
+    submit). The existence/rebuildability validation (does a mask exist
+    anywhere, can Section 1 rebuild it, else error) still always runs —
+    only the redundant individual re-upload of a file that's already there
+    is skipped. m2m_ and the BNA atlas are unaffected either way, since
+    batch_upload_prereqs() never includes them.
     """
     import scitas_discovery as sd
 
@@ -162,12 +232,14 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
     fname = os.path.basename(config_path)
     remote_configs_dir = f"{sd.scitas_pipeline_dir()}/configs"
     remote_config_path = f"{remote_configs_dir}/{fname}"
-    mk = sd.remote_mkdir(remote_configs_dir)
-    if not mk["success"]:
-        return {"success": False, "job_id": None, "error": f"couldn't create remote configs dir: {mk['stderr']}"}
-    up = sd.scp_upload(config_path, remote_config_path, recursive=False)
-    if not up["success"]:
-        return {"success": False, "job_id": None, "error": f"config upload failed: {up['stderr']}"}
+    if not skip_prereq_upload:
+        mk = sd.remote_mkdir(remote_configs_dir)
+        if not mk["success"]:
+            return {"success": False, "job_id": None,
+                    "error": f"couldn't create remote configs dir: {mk['stderr']}"}
+        up = sd.scp_upload(config_path, remote_config_path, recursive=False)
+        if not up["success"]:
+            return {"success": False, "job_id": None, "error": f"config upload failed: {up['stderr']}"}
 
     # m2m_ — required; upload from local if SCITAS doesn't have it yet
     remote_m2m = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
@@ -197,7 +269,7 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
                 return {"success": False, "job_id": None,
                         "error": f"registered cap not found locally or on SCITAS: {cap_name} "
                                  f"— run Cap Registration first."}
-        else:
+        elif not skip_prereq_upload:
             sd.remote_mkdir(os.path.dirname(remote_cap_csv))
             up = sd.scp_upload(local_cap_csv, remote_cap_csv, recursive=False)
             if not up["success"]:
@@ -240,10 +312,12 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
                                   f"sub-{subject_id}_label-{name}_mask.nii.gz")
 
         if os.path.isfile(local_mask):
-            sd.remote_mkdir(os.path.dirname(remote_mask))
-            up = sd.scp_upload(local_mask, remote_mask, recursive=False)
-            if not up["success"]:
-                return {"success": False, "job_id": None, "error": f"mask '{name}' upload failed: {up['stderr']}"}
+            if not skip_prereq_upload:
+                sd.remote_mkdir(os.path.dirname(remote_mask))
+                up = sd.scp_upload(local_mask, remote_mask, recursive=False)
+                if not up["success"]:
+                    return {"success": False, "job_id": None,
+                            "error": f"mask '{name}' upload failed: {up['stderr']}"}
             continue
 
         if sd.remote_path_exists(remote_mask):
@@ -273,11 +347,12 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
                                   f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
 
         if os.path.isfile(local_mask):
-            sd.remote_mkdir(os.path.dirname(remote_mask))
-            up = sd.scp_upload(local_mask, remote_mask, recursive=False)
-            if not up["success"]:
-                return {"success": False, "job_id": None,
-                        "error": f"non-ROI constraint mask '{mask_name}' upload failed: {up['stderr']}"}
+            if not skip_prereq_upload:
+                sd.remote_mkdir(os.path.dirname(remote_mask))
+                up = sd.scp_upload(local_mask, remote_mask, recursive=False)
+                if not up["success"]:
+                    return {"success": False, "job_id": None,
+                            "error": f"non-ROI constraint mask '{mask_name}' upload failed: {up['stderr']}"}
             continue
 
         if sd.remote_path_exists(remote_mask):
@@ -307,5 +382,131 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
 
     return {"success": True, "job_id": submit["job_id"], "error": None,
             "stdout": f"SCITAS job {submit['job_id']} completed. Results are on SCITAS scratch under "
+                      f"derivatives/SimNIBS/sub-{subject_id}/TIoptimization/ — use the Data Directory "
+                      f"page to sync them back for local viewing."}
+
+
+def batch_submit(config_paths: list[str], force_sections: list[str] | None = None) -> dict:
+    """{config_path: {"success", "job_id", "error", "subject_id"}} — gets
+    several configs' SLURM jobs INTO the queue using as few ssh connections
+    as possible across the whole batch, instead of each config running its
+    own full run_pipeline_on_scitas() sequence (prereq upload, m2m_/BNA
+    checks, sbatch submission — several ssh calls each). Firing that
+    sequence once per config, all at once for N configs, was still enough
+    separate connections in a short window to trip SCITAS's own
+    new-connection rate limiting even after batch_upload_prereqs() already
+    batched the small-file upload step — this batches the rest of it too
+    (existence checks, submission).
+
+    Only gets each config's job queued — does NOT block waiting for
+    completion. Callers run wait_for_submitted_job(job_id, subject_id) in
+    their own background job per successfully-submitted config afterward
+    (see pages/run_optimization.py)."""
+    import scitas_discovery as sd
+
+    configs = {}
+    for path in config_paths:
+        with open(path) as f:
+            configs[path] = json.load(f)
+
+    out = {path: {"success": False, "job_id": None, "error": None, "subject_id": cfg["subject_id"]}
+           for path, cfg in configs.items()}
+
+    # 1) Config JSON + registered cap + ROI/non-ROI/constraint masks — one
+    #    shared connection for every config's small files.
+    up = batch_upload_prereqs(config_paths)
+    if not up["success"]:
+        for path in out:
+            out[path]["error"] = f"prerequisite upload failed: {up['error']}"
+        return out
+
+    scratch = sd.scitas_scratch_dir()
+
+    # 2) m2m_/BNA existence — one shared connection across every unique
+    #    subject/atlas path involved. m2m_ upload itself, if actually
+    #    missing, still falls back to an individual scp per subject (rare,
+    #    and large enough that folding it into the small-file tar batch
+    #    above isn't worth the risk of one huge fragile transfer).
+    check_paths = set()
+    for cfg in configs.values():
+        subject_id = cfg["subject_id"]
+        check_paths.add(f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}")
+        if cfg.get("bna_atlas_path"):
+            container_root = cfg["project_dir"]
+            check_paths.add(scratch + cfg["bna_atlas_path"][len(container_root):])
+    existence = sd.remote_paths_exist(sorted(check_paths))
+
+    for path, cfg in configs.items():
+        if out[path]["error"]:
+            continue
+        subject_id = cfg["subject_id"]
+        remote_m2m = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
+        if not existence.get(remote_m2m, False):
+            local_m2m = get_m2m_path(subject_id)
+            if not os.path.isdir(local_m2m):
+                out[path]["error"] = f"m2m_{subject_id}/ not found locally or on SCITAS — run Head Modeling first."
+                continue
+            sd.remote_mkdir(os.path.dirname(remote_m2m))
+            m2m_up = sd.scp_upload(local_m2m, os.path.dirname(remote_m2m), recursive=True)
+            if not m2m_up["success"]:
+                out[path]["error"] = f"m2m_ upload failed: {m2m_up['stderr']}"
+                continue
+
+        bna_atlas_path = cfg.get("bna_atlas_path")
+        if bna_atlas_path:
+            container_root = cfg["project_dir"]
+            remote_bna = scratch + bna_atlas_path[len(container_root):]
+            if not existence.get(remote_bna, False):
+                local_bna = os.path.join(RESOURCES_DIR, "atlases", "BN_Atlas_246_1mm.nii.gz")
+                if not os.path.isfile(local_bna):
+                    out[path]["error"] = f"BNA atlas not found locally or on SCITAS: {bna_atlas_path}"
+                    continue
+                sd.remote_mkdir(os.path.dirname(remote_bna))
+                bna_up = sd.scp_upload(local_bna, remote_bna, recursive=False)
+                if not bna_up["success"]:
+                    out[path]["error"] = f"BNA atlas upload failed: {bna_up['stderr']}"
+                    continue
+
+    # 3) sbatch submission — one shared connection for every config that's
+    #    still error-free.
+    ready_paths = [p for p in config_paths if out[p]["error"] is None]
+    if ready_paths:
+        submit_jobs = []
+        for path in ready_paths:
+            fname = os.path.basename(path)
+            remote_config_path = f"{sd.scitas_pipeline_dir()}/configs/{fname}"
+            export_vars = {"PIPELINE_CONFIGS": remote_config_path}
+            if force_sections:
+                export_vars["PIPELINE_EXTRA_ARGS"] = "--force " + " ".join(force_sections)
+            submit_jobs.append({
+                "script_path": f"{sd.scitas_pipeline_dir()}/simnibs_ti_pipeline.sbatch",
+                "job_name": f"ti_{configs[path]['subject_id']}",
+                "export_vars": export_vars,
+            })
+        submissions = sd.submit_sbatch_batch(submit_jobs)
+        for path, sub in zip(ready_paths, submissions):
+            if sub["success"]:
+                out[path]["success"] = True
+                out[path]["job_id"] = sub["job_id"]
+            else:
+                out[path]["error"] = f"sbatch submission failed: {sub['error']}"
+
+    return out
+
+
+def wait_for_submitted_job(job_id: str, subject_id: str) -> dict:
+    """Blocks on an ALREADY-submitted SLURM job (see batch_submit()) until
+    it leaves the queue. Same return shape as run_pipeline_on_scitas()'s
+    successful-submission case, so the Run Pipeline page's result
+    rendering doesn't need to know which path a job took to get started."""
+    import scitas_discovery as sd
+
+    wait = sd.wait_for_job(job_id, max_wait_s=48 * 3600)
+    if not wait["success"]:
+        return {"success": False, "job_id": job_id,
+                "error": f"SCITAS job {job_id} did not complete "
+                         f"(final state: {wait['final_state']}). {wait['error'] or ''}"}
+    return {"success": True, "job_id": job_id, "error": None,
+            "stdout": f"SCITAS job {job_id} completed. Results are on SCITAS scratch under "
                       f"derivatives/SimNIBS/sub-{subject_id}/TIoptimization/ — use the Data Directory "
                       f"page to sync them back for local viewing."}

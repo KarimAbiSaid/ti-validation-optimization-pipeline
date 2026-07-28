@@ -598,7 +598,17 @@ def create_roi_masks(cfg: PipelineConfig, force: bool = False) -> None:
 def _load_cap_positions(csv_path: str) -> dict:
     """Parse an EEG cap CSV into {electrode_name: np.array([x, y, z])},
     excluding ground/reference/fiducial-landmark rows (is_stimulation_electrode).
-    Handles both "Name,X,Y,Z" and "Type,x,y,z,label" (BioSemi-style) layouts."""
+
+    Two formats, auto-detected the same way cap_discovery.py's read_cap_csv()
+    does (mirror that logic — don't re-derive it differently here):
+    - Headerless, fixed positions Type,x,y,z,label (SimNIBS's own built-in
+      caps, and this project's register_caps.py/cap_discovery.py output):
+      first row is already an Electrode/ReferenceElectrode data row. This is
+      the common case — guessing "no header found -> assume Name,X,Y,Z" (the
+      previous version of this function) silently misreads every column,
+      since column 0 here is the Type, not the name.
+    - Header row present: columns resolved by name (x/y/z/label/name/...).
+    """
     import csv as _csv
 
     cap_pos: dict = {}
@@ -607,25 +617,27 @@ def _load_cap_positions(csv_path: str) -> dict:
     if not rows:
         return cap_pos
 
-    hdr = [c.strip().lower() for c in rows[0]]
-    xi = next((i for i, h in enumerate(hdr) if h == 'x'), None)
-    yi = next((i for i, h in enumerate(hdr) if h == 'y'), None)
-    zi = next((i for i, h in enumerate(hdr) if h == 'z'), None)
-    ni = next((i for i, h in enumerate(hdr)
-                if h in ('label', 'name', 'ch_name', 'channel')), None)
-    has_header = xi is not None and yi is not None and zi is not None
+    if rows[0][0].strip().lower() in ("electrode", "referenceelectrode"):
+        data_rows = rows
+        xi, yi, zi, ni = 1, 2, 3, 4
+    else:
+        hdr = [c.strip().lower() for c in rows[0]]
+        data_rows = rows[1:]
+        xi = next((i for i, h in enumerate(hdr) if h == 'x'), None)
+        yi = next((i for i, h in enumerate(hdr) if h == 'y'), None)
+        zi = next((i for i, h in enumerate(hdr) if h == 'z'), None)
+        ni = next((i for i, h in enumerate(hdr)
+                    if h in ('label', 'name', 'ch_name', 'channel')), None)
+        if xi is None or yi is None or zi is None:
+            return cap_pos
 
-    for row in (rows[1:] if has_header else rows):
+    for row in data_rows:
         row = [c.strip() for c in row]
-        if len(row) < 4:
+        if len(row) <= max(xi, yi, zi):
             continue
         try:
-            if has_header:
-                x, y, z = float(row[xi]), float(row[yi]), float(row[zi])
-                name = row[ni] if ni is not None else row[0]
-            else:
-                name = row[0]
-                x, y, z = float(row[1]), float(row[2]), float(row[3])
+            x, y, z = float(row[xi]), float(row[yi]), float(row[zi])
+            name = row[ni] if ni is not None and ni < len(row) else row[0]
             if is_stimulation_electrode(name):
                 cap_pos[name] = np.array([x, y, z])
         except (ValueError, IndexError):
@@ -1000,18 +1012,28 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             print(f"  Adjacent-electrode filter: {len(adj_elec_pairs)} pairs excluded "
                   f"(BioSemi32 hardcoded topology)")
         else:
+            # Distance threshold: adjacent = Euclidean distance <= 1.6x the
+            # cap's own minimum inter-electrode spacing (matches this flag's
+            # documented definition just above, in OptimizerConfig). The
+            # previous ConvexHull+2D-Delaunay approach was a topological
+            # "shares a triangulation face" notion, not a proximity one, and
+            # silently missed genuinely close pairs that don't happen to
+            # share a triangle edge (verified on a real cap: FT10-T10 at
+            # 32mm and T8-TP8 at 30mm both slipped through undetected, well
+            # under the intended ~38mm threshold for that cap).
             _lf_elecs = [n for n in all_elec_names if n in _cap_pos]
-            if len(_lf_elecs) >= 3:
-                from scipy.spatial import ConvexHull, Delaunay
+            if len(_lf_elecs) >= 2:
+                from scipy.spatial.distance import pdist, squareform
                 _pos_arr = np.array([_cap_pos[n] for n in _lf_elecs])
-                for _simplex in ConvexHull(_pos_arr).simplices:
-                    for _ia, _ib in combinations(_simplex.tolist(), 2):
-                        adj_elec_pairs.add(frozenset([_lf_elecs[_ia], _lf_elecs[_ib]]))
-                for _simplex in Delaunay(_pos_arr[:, :2]).simplices:
-                    for _ia, _ib in combinations(_simplex.tolist(), 2):
-                        adj_elec_pairs.add(frozenset([_lf_elecs[_ia], _lf_elecs[_ib]]))
+                _dist = squareform(pdist(_pos_arr))
+                np.fill_diagonal(_dist, np.inf)
+                _min_spacing = float(_dist.min())
+                _threshold   = 1.6 * _min_spacing
+                _ia_idx, _ib_idx = np.where(np.triu(_dist <= _threshold, k=1))
+                for _ia, _ib in zip(_ia_idx.tolist(), _ib_idx.tolist()):
+                    adj_elec_pairs.add(frozenset([_lf_elecs[_ia], _lf_elecs[_ib]]))
                 print(f"  Adjacent-electrode filter: {len(adj_elec_pairs)} pairs excluded "
-                      f"(convex-hull + 2-D Delaunay, {len(_lf_elecs)} electrodes)")
+                      f"(distance <= 1.6x min spacing = {_threshold:.1f}mm, {len(_lf_elecs)} electrodes)")
 
     # ════════════════════════════════════════════════════════════════════════
     # STEP 3 — Exhaustive search over all electrode pair combinations
@@ -1168,9 +1190,14 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
         print(f"\n  Hierarchical (coarse-to-fine) search — {n_fine} fine iteration(s) configured")
         print(f"  Coarse round: {coarse_k}/{n_total} electrodes (farthest-point spatial sampling)")
+        def _montage_dict(best_ch1, best_ch2):
+            return {"ch1_plus": best_ch1[0], "ch1_minus": best_ch1[1],
+                    "ch2_plus": best_ch2[0], "ch2_minus": best_ch2[1]}
+
         coarse_names = _farthest_point_sample(all_elec_names, _cap_pos, coarse_k)
         round_result = _search(coarse_names)
         history = [{"round": "coarse", "n_electrodes": len(coarse_names),
+                    "montage": _montage_dict(round_result["best_ch1"], round_result["best_ch2"]),
                     **{k: v for k, v in round_result.items() if k not in ("best_ch1", "best_ch2")}}]
 
         candidate_set = set(coarse_names)
@@ -1196,13 +1223,15 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             candidate_set = new_candidates
             print(f"\n  Fine iteration {it + 1}/{n_fine}: {len(candidate_set)} electrodes "
                   f"(4 winners x {n_nb} nearest neighbours, deduplicated)")
-            new_result = _search(sorted(candidate_set, key=all_elec_names.index))
-            history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
-                             **{k: v for k, v in new_result.items() if k not in ("best_ch1", "best_ch2")}})
-
+            new_result  = _search(sorted(candidate_set, key=all_elec_names.index))
             prev_score  = round_result["best_score"]
             improvement = ((new_result["best_score"] - prev_score) / abs(prev_score)
                             if prev_score != 0 else float("inf"))
+            history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
+                             "montage": _montage_dict(new_result["best_ch1"], new_result["best_ch2"]),
+                             "improvement_vs_prev_round": improvement,
+                             **{k: v for k, v in new_result.items() if k not in ("best_ch1", "best_ch2")}})
+
             round_result = new_result
             print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
 

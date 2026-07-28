@@ -117,8 +117,14 @@ def load_subject_resources(
     electrode_shape:         str | None = None,
     electrode_dimensions:    list | None = None,
     electrode_gel_thickness: float | None = None,
+    leadfield_path:          str | None = None,
 ) -> SubjectResources:
     """Load leadfield + ROI/non-ROI masks for a subject. Call once, reuse.
+
+    leadfield_path: full path to the HDF5 file. When set, overrides all
+    auto-constructed paths (cap_name, electrode_dimensions, etc. are ignored
+    for path resolution but cap_name is still used for the params JSON lookup
+    next to the HDF5).
 
     electrode_shape/dimensions/gel_thickness are optional and opt-in: pass
     them to look up a leadfield from the newer per-settings cache that
@@ -129,14 +135,16 @@ def load_subject_resources(
     leadfield_volume/{id}_leadfield_{cap}.hdf5 path, unchanged, for any
     existing notebook/script call that doesn't pass them.
     """
-    from simnibs.simulation.sim_struct import TDCSLEADFIELD
     from simnibs.utils import TI_utils as TI
     from simnibs import mesh_io
 
     base_lf_dir = os.path.join(project_dir, "derivatives", "SimNIBS",
                                f"sub-{subject_id}", "leadfield_volume")
 
-    if electrode_dimensions is not None:
+    if leadfield_path is not None:
+        lf_hdf = leadfield_path
+        lf_par = os.path.splitext(lf_hdf)[0] + "_params.json"
+    elif electrode_dimensions is not None:
         from config import leadfield_tag
         tag    = leadfield_tag(cap_name, electrode_shape or "ellipse", electrode_dimensions,
                                electrode_gel_thickness if electrode_gel_thickness is not None else 1.0)
@@ -163,10 +171,15 @@ def load_subject_resources(
         with open(lf_par) as f:
             lf_params = json.load(f)
 
-    # Tissue-element centroids (same filtering as run_analysis)
+    # Always work with tissue elements only — keeps all leadfields comparable.
+    # If the leadfield stores all mesh elements (newer pipeline), slice it down
+    # to tissue elements so masks, centroids, and fields are all the same size.
     import nibabel as nib
     tissue_mask = np.isin(mesh.elm.tag1, TISSUE_TAGS)
     m_tissue    = mesh.crop_mesh(tags=TISSUE_TAGS)
+    # if leadfield.shape[1] != m_tissue.elm.nr:
+    #     leadfield = leadfield[:, tissue_mask, :]
+    #     print(f"  Sliced leadfield to tissue elements: {leadfield.shape[1]}")
     tags        = m_tissue.elm.tag1
     nodes       = m_tissue.nodes.node_coord
     conn        = m_tissue.elm.node_number_list[:, :4] - 1

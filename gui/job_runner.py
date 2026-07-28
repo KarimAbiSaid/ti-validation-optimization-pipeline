@@ -56,6 +56,17 @@ def _write_status(job_dir: str, **fields) -> None:
     os.replace(tmp_path, path)  # atomic — pollers never see a half-written file
 
 
+def report_progress(job_dir: str, **fields) -> None:
+    """Merges extra fields into a still-running job's status.json WITHOUT
+    touching "state" — for a long-running job function to report interim
+    progress (e.g. a running log of lines) that pollers can display before
+    the job finishes, rather than leaving them staring at a bare "running"
+    spinner for a multi-minute operation. Safe to call from inside the job
+    function itself, as often as needed; each call atomically rewrites the
+    whole file (same as the start/end writes)."""
+    _write_status(job_dir, **fields)
+
+
 def start_local_job(job_dir: str, fn, *args, **kwargs) -> None:
     """Run fn(*args, **kwargs) in a background thread. fn's return value must
     be JSON-serializable — it becomes status["result"] on success."""
