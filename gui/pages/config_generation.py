@@ -61,6 +61,11 @@ def _region_block_layout(prefix, title):
         html.Label("Name (short slug used in the config filename, e.g. \"hippo_r_phg\")"),
         dcc.Input(id=f"{prefix}-name-input", type="text", style={"width": "100%"}),
 
+        html.Label("...or pick an already-generated mask (any atlas, or a Mask Generation "
+                   "combined mask) — fills in the name above and skips atlas/region selection "
+                   "entirely, same as an Allen-sourced mask", style={"marginTop": "0.5rem", "display": "block"}),
+        dcc.Dropdown(id=f"{prefix}-existing-mask-dropdown", placeholder="Pick an existing mask..."),
+
         html.Label("Atlas source", style={"marginTop": "0.5rem", "display": "block"}),
         dcc.Dropdown(
             id=f"{prefix}-atlas-dropdown",
@@ -93,18 +98,11 @@ def _register_region_callbacks(prefix):
         meta = discovery.ATLAS_REGISTRY[atlas_name]
 
         if cd.uses_allen(atlas_name):
-            note = ("Allen-sourced masks aren't built by this pipeline directly. Generate the "
-                    "mask first via Mask Generation, then pick it below (writes the exact name "
-                    "into the Name field above). The Subject Readiness table shows whether it "
-                    "already exists for every selected subject.")
-            mask_names = discovery.list_mask_names(subject_ids)
-            region_ui = dcc.Dropdown(
-                id=f"{prefix}-existing-mask-dropdown",
-                options=[{"label": n, "value": n} for n in mask_names],
-                placeholder=("Pick an existing mask..." if mask_names
-                            else "No existing masks found for these subjects"),
-            )
-            return note, region_ui, None
+            note = ("Allen-sourced masks aren't built by this pipeline directly — generate the "
+                    "mask first via Mask Generation, then pick it from the \"...or pick an "
+                    "already-generated mask\" dropdown above. The Subject Readiness table shows "
+                    "whether it already exists for every selected subject.")
+            return note, html.Div(), None
 
         not_ready = [sid for sid in subject_ids if not discovery.full_atlas_check(atlas_name, sid)["ready"]]
 
@@ -194,12 +192,28 @@ def _register_region_callbacks(prefix):
         return out
 
     @callback(
+        Output(f"{prefix}-existing-mask-dropdown", "options"),
+        Input("cg-subject-dropdown", "value"),
+    )
+    def _load_existing_mask_options(subject_ids):
+        return [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
+
+    @callback(
         Output(f"{prefix}-name-input", "value"),
+        Output(f"{prefix}-selected-label-ids-store", "data", allow_duplicate=True),
         Input(f"{prefix}-existing-mask-dropdown", "value"),
         prevent_initial_call=True,
     )
     def _pick_existing_mask(mask_name):
-        return mask_name or dash.no_update
+        # Clearing the label-ids store too, not just filling the name field —
+        # otherwise a region selection made under a DIFFERENT atlas before
+        # picking this mask would still be sitting in the store, and
+        # build_roi_dict() would build labels from that stale selection
+        # instead of trusting the picked mask file as-is (empty labels,
+        # same as today's Allen-only path).
+        if not mask_name:
+            return dash.no_update, dash.no_update
+        return mask_name, {}
 
 
 _register_region_callbacks("cg-roi")
@@ -317,6 +331,29 @@ layout = html.Div([
             editable=True, row_deletable=True,
         ),
         html.Button("Add constraint group", id="cg-opt-constraint-groups-add-btn",
+                    n_clicks=0, style={"marginTop": "0.5rem"}),
+    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
+              "border": "1px solid #ccc", "borderRadius": "4px"}),
+
+    html.Div([
+        html.Label("ROI subgroup hard constraints", style={"fontWeight": "bold"}),
+        html.P("Rejects a montage if mean TI in mask_name falls BELOW min_mean_V_m, "
+               "independently for EACH row — regardless of the overall ROI mean above. "
+               "Useful when the ROI is a union of several distinct subregions (e.g. "
+               "hippocampus + entorhinal cortex) and a montage could otherwise clear the "
+               "combined-ROI floor while barely touching one of them. mask_name must match "
+               "an already-generated mask (Mask Generation page).",
+               style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+        _styled_table(
+            "cg-opt-roi-constraint-groups-table",
+            [
+                {"name": "name", "id": "name"},
+                {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
+                {"name": "min_mean_V_m", "id": "min_mean_V_m", "type": "numeric"},
+            ],
+            editable=True, row_deletable=True,
+        ),
+        html.Button("Add constraint group", id="cg-opt-roi-constraint-groups-add-btn",
                     n_clicks=0, style={"marginTop": "0.5rem"}),
     ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
               "border": "1px solid #ccc", "borderRadius": "4px"}),
@@ -600,6 +637,27 @@ def _update_constraint_group_mask_options(subject_ids):
 
 
 @callback(
+    Output("cg-opt-roi-constraint-groups-table", "data"),
+    Input("cg-opt-roi-constraint-groups-add-btn", "n_clicks"),
+    State("cg-opt-roi-constraint-groups-table", "data"),
+    prevent_initial_call=True,
+)
+def _add_roi_constraint_group_row(_n_clicks, rows):
+    rows = rows or []
+    rows.append({"name": "", "mask_name": "", "min_mean_V_m": None})
+    return rows
+
+
+@callback(
+    Output("cg-opt-roi-constraint-groups-table", "dropdown"),
+    Input("cg-subject-dropdown", "value"),
+)
+def _update_roi_constraint_group_mask_options(subject_ids):
+    options = [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
+    return {"mask_name": {"options": options, "clearable": True}}
+
+
+@callback(
     Output("cg-generate-results", "children"),
     Input("cg-generate-button", "n_clicks"),
     State("cg-generate-table", "data"),
@@ -622,6 +680,7 @@ def _update_constraint_group_mask_options(subject_ids):
     State("cg-opt-hier-neighbours", "value"),
     State("cg-opt-hier-early-stop", "value"),
     State("cg-opt-constraint-groups-table", "data"),
+    State("cg-opt-roi-constraint-groups-table", "data"),
     State("cg-elec-diameter", "value"),
     State("cg-elec-gel-thickness", "value"),
     State("cg-elec-max-current", "value"),
@@ -632,7 +691,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                        non_roi_name, non_roi_atlas, non_roi_label_ids, goals, cap_path,
                        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
                        hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
-                       constraint_group_rows,
+                       constraint_group_rows, roi_constraint_group_rows,
                        elec_diameter, elec_gel, elec_max_current, flags_checklist):
     rows = rows or []
     selected_rows = selected_rows or []
@@ -675,6 +734,24 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                              f"got {max_v!r}", style={"color": "#a00"})
         constraint_groups.append({"name": grp_name, "mask_name": mask_name, "max_mean_V_m": max_v})
 
+    roi_constraint_groups = []
+    for row in (roi_constraint_group_rows or []):
+        grp_name = (row.get("name") or "").strip()
+        mask_name = (row.get("mask_name") or "").strip()
+        min_v = row.get("min_mean_V_m")
+        if not grp_name and not mask_name and min_v in (None, ""):
+            continue   # blank row (added but never filled in) — skip silently
+        if not grp_name or not mask_name or min_v in (None, ""):
+            return html.Div("each ROI subgroup constraint row needs name, mask_name, "
+                             "and min_mean_V_m — remove any incomplete rows.",
+                             style={"color": "#a00"})
+        try:
+            min_v = float(min_v)
+        except (TypeError, ValueError):
+            return html.Div(f"ROI constraint group '{grp_name}': min_mean_V_m must be a number, "
+                             f"got {min_v!r}", style={"color": "#a00"})
+        roi_constraint_groups.append({"name": grp_name, "mask_name": mask_name, "min_mean_V_m": min_v})
+
     optimizer_overrides = {
         "postproc": postproc,
         "cpus": cpus,
@@ -686,6 +763,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         "neighbours_per_iteration": neighbours_per_iter,
         "early_stop_threshold": (hier_early_stop_pct or 0) / 100.0,
         "non_roi_hard_constraint_groups": constraint_groups,
+        "roi_hard_constraint_groups": roi_constraint_groups,
     }
     electrode_overrides = {
         "dimensions": [elec_diameter, elec_diameter],

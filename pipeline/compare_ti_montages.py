@@ -108,6 +108,19 @@ def _vol_mean_capped(values, volumes, pct=99):
     v   = np.minimum(values, cap)
     return float((v * volumes).sum() / volumes.sum())
 
+def _elm_mean_capped(vals, pct=99):
+    """Plain (unweighted, per-element) mean, capped at the pct percentile —
+    matches what run_pipeline.py's hard constraint actually enforces
+    (np.mean, no volume weighting). _vol_mean_capped kept above, unused for
+    now — see note about switching the pipeline's own hard-constraint check
+    to volume-weighted later."""
+    if len(vals) == 0:
+        return np.nan
+    cap = float(np.percentile(vals, pct))
+    v   = np.minimum(vals, cap)
+    return float(v.mean())
+
+
 def load_subject_resources(
     subject_id:   str,
     project_dir:  str,

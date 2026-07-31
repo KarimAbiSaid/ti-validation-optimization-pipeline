@@ -152,6 +152,18 @@ class OptimizerConfig:
     #       BNA_atlas_subjectspace.nii.gz (the original, still-supported path)
     non_roi_hard_constraint_groups: List[dict] = field(default_factory=list)
 
+    # Per-subgroup ROI hard constraints — the mirror image of
+    # non_roi_hard_constraint_groups above. A montage is rejected if mean TI
+    # in ANY listed group falls BELOW min_mean_V_m, regardless of the overall
+    # ROI mean (cfg.roi) — useful when the ROI is a union of several distinct
+    # subregions (e.g. hippocampus + entorhinal cortex) and a montage could
+    # otherwise clear the combined-ROI floor while barely touching one of them.
+    # Same two entry shapes as non_roi_hard_constraint_groups, just min_mean_V_m
+    # instead of max_mean_V_m:
+    #   {"name": str, "mask_name": str, "min_mean_V_m": float}
+    #   {"name": str, "bna_labels": {str: int}, "min_mean_V_m": float}
+    roi_hard_constraint_groups: List[dict] = field(default_factory=list)
+
     # Hierarchical / coarse-to-fine electrode search (opt-in). When False
     # (default) run_exhaustive_cap_optimization searches all electrodes in one
     # flat pass — identical to the original (pre-hierarchical) behaviour.

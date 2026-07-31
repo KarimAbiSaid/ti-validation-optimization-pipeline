@@ -915,13 +915,14 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         print(f"  Hard ROI constraint: mean TI in ROI >= {cfg.optimizer.focality_threshold[1]} V/m"
               f" (soft penalty otherwise)")
 
-    # ── Per-subgroup non-ROI hard constraints ────────────────────────────────
+    # ── Per-subgroup hard constraints (non-ROI ceilings + ROI floors) ────────
     # Each group is either mask-file-based (mask_name — an already-generated
     # sub-{id}_label-{mask_name}_mask.nii.gz, any atlas) or BNA-label-based
     # (bna_labels, mapped via the subject's warped BNA atlas) — see
-    # OptimizerConfig.non_roi_hard_constraint_groups in config.py.
-    nr_constraint_groups = []
-    _bna_elm_lbl = None  # lazily loaded only if a bna_labels group is actually present
+    # OptimizerConfig.non_roi_hard_constraint_groups / roi_hard_constraint_groups
+    # in config.py. Both share the same mask-resolution logic below, just with
+    # a different bound direction (non-ROI: reject above max; ROI: reject below min).
+    _bna_elm_lbl = None  # lazily loaded once, shared across both group kinds
 
     def _map_mask_file_to_elements(mask_path: str) -> np.ndarray:
         _img  = nib.load(mask_path)
@@ -937,53 +938,59 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         _m[_ok] = _data[_idx[_ok, 0], _idx[_ok, 1], _idx[_ok, 2]]
         return _m
 
-    for _grp in cfg.optimizer.non_roi_hard_constraint_groups:
-        if 'mask_name' in _grp:
-            _mask_path = cfg.mask_path(_grp['mask_name'])
-            if not os.path.isfile(_mask_path):
-                print(f"  WARNING: constraint group '{_grp['name']}' mask not found "
-                      f"({_mask_path}) — skipped")
-                continue
-            _gmask = _map_mask_file_to_elements(_mask_path) & gm_wm_mask   # GM+WM only
-        elif 'bna_labels' in _grp:
-            if _bna_elm_lbl is None:
-                bna_warped = os.path.join(cfg.sim_sub_dir, 'roi',
-                                          f'sub-{cfg.subject_id}_BNA_atlas_subjectspace.nii.gz')
-                if not os.path.isfile(bna_warped):
-                    print(f"  WARNING: BNA atlas not found — skipping bna_labels "
-                          f"constraint group '{_grp['name']}': {bna_warped}")
+    def _build_constraint_groups(specs: list, bound_key: str, out_key: str, symbol: str) -> list:
+        nonlocal _bna_elm_lbl
+        groups = []
+        for _grp in specs:
+            if 'mask_name' in _grp:
+                _mask_path = cfg.mask_path(_grp['mask_name'])
+                if not os.path.isfile(_mask_path):
+                    print(f"  WARNING: constraint group '{_grp['name']}' mask not found "
+                          f"({_mask_path}) — skipped")
                     continue
-                _bna_img  = nib.load(bna_warped)
-                _bna_data = np.asarray(_bna_img.dataobj, dtype=np.int32)
-                _bna_inv  = np.linalg.inv(_bna_img.affine)
-                _bna_vox  = (_bna_inv @ np.hstack([centroids, ones]).T).T[:, :3]
-                _bna_idx  = np.round(_bna_vox).astype(int)
-                _bna_sh   = _bna_data.shape
-                _bna_ok   = ((_bna_idx[:,0]>=0)&(_bna_idx[:,0]<_bna_sh[0])&
-                             (_bna_idx[:,1]>=0)&(_bna_idx[:,1]<_bna_sh[1])&
-                             (_bna_idx[:,2]>=0)&(_bna_idx[:,2]<_bna_sh[2]))
-                _bna_elm_lbl = np.zeros(len(centroids), dtype=np.int32)
-                _bna_elm_lbl[_bna_ok] = _bna_data[_bna_idx[_bna_ok,0],
-                                                   _bna_idx[_bna_ok,1],
-                                                   _bna_idx[_bna_ok,2]]
-            _labels = list(_grp['bna_labels'].values())
-            _gmask  = np.isin(_bna_elm_lbl, _labels) & gm_wm_mask   # GM+WM only
-        else:
-            print(f"  WARNING: constraint group '{_grp.get('name', '?')}' has neither "
-                  f"'mask_name' nor 'bna_labels' — skipped")
-            continue
+                _gmask = _map_mask_file_to_elements(_mask_path) & gm_wm_mask   # GM+WM only
+            elif 'bna_labels' in _grp:
+                if _bna_elm_lbl is None:
+                    bna_warped = os.path.join(cfg.sim_sub_dir, 'roi',
+                                              f'sub-{cfg.subject_id}_BNA_atlas_subjectspace.nii.gz')
+                    if not os.path.isfile(bna_warped):
+                        print(f"  WARNING: BNA atlas not found — skipping bna_labels "
+                              f"constraint group '{_grp['name']}': {bna_warped}")
+                        continue
+                    _bna_img  = nib.load(bna_warped)
+                    _bna_data = np.asarray(_bna_img.dataobj, dtype=np.int32)
+                    _bna_inv  = np.linalg.inv(_bna_img.affine)
+                    _bna_vox  = (_bna_inv @ np.hstack([centroids, ones]).T).T[:, :3]
+                    _bna_idx  = np.round(_bna_vox).astype(int)
+                    _bna_sh   = _bna_data.shape
+                    _bna_ok   = ((_bna_idx[:,0]>=0)&(_bna_idx[:,0]<_bna_sh[0])&
+                                 (_bna_idx[:,1]>=0)&(_bna_idx[:,1]<_bna_sh[1])&
+                                 (_bna_idx[:,2]>=0)&(_bna_idx[:,2]<_bna_sh[2]))
+                    _bna_elm_lbl = np.zeros(len(centroids), dtype=np.int32)
+                    _bna_elm_lbl[_bna_ok] = _bna_data[_bna_idx[_bna_ok,0],
+                                                       _bna_idx[_bna_ok,1],
+                                                       _bna_idx[_bna_ok,2]]
+                _labels = list(_grp['bna_labels'].values())
+                _gmask  = np.isin(_bna_elm_lbl, _labels) & gm_wm_mask   # GM+WM only
+            else:
+                print(f"  WARNING: constraint group '{_grp.get('name', '?')}' has neither "
+                      f"'mask_name' nor 'bna_labels' — skipped")
+                continue
 
-        _gidx = np.flatnonzero(_gmask)
-        if len(_gidx) == 0:
-            print(f"  WARNING: constraint group '{_grp['name']}' maps to 0 elements — skipped")
-            continue
-        nr_constraint_groups.append({
-            'name':     _grp['name'],
-            'lf':       leadfield[:, _gidx, :],
-            'max_mean': float(_grp['max_mean_V_m']),
-        })
-        print(f"  Subgroup constraint '{_grp['name']}': {len(_gidx)} elements, "
-              f"max mean TI <= {_grp['max_mean_V_m']} V/m")
+            _gidx = np.flatnonzero(_gmask)
+            if len(_gidx) == 0:
+                print(f"  WARNING: constraint group '{_grp['name']}' maps to 0 elements — skipped")
+                continue
+            groups.append({'name': _grp['name'], 'lf': leadfield[:, _gidx, :], 'idx': _gidx,
+                           out_key: float(_grp[bound_key])})
+            print(f"  Subgroup constraint '{_grp['name']}': {len(_gidx)} elements, "
+                  f"mean TI {symbol} {_grp[bound_key]} V/m")
+        return groups
+
+    nr_constraint_groups  = _build_constraint_groups(
+        cfg.optimizer.non_roi_hard_constraint_groups, 'max_mean_V_m', 'max_mean', '<=')
+    roi_constraint_groups = _build_constraint_groups(
+        cfg.optimizer.roi_hard_constraint_groups, 'min_mean_V_m', 'min_mean', '>=')
 
     # ════════════════════════════════════════════════════════════════════════
     # STEP 2b — Build electrode adjacency set (shunting prevention and source isolation)
@@ -1099,6 +1106,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         for i, (ep1, em1) in enumerate(valid_pairs):
             ef1_roi    = get_ef(lf_roi, ep1, em1)
             ef1_cgrps  = [get_ef(cg['lf'], ep1, em1) for cg in nr_constraint_groups]
+            ef1_rgrps  = [get_ef(cg['lf'], ep1, em1) for cg in roi_constraint_groups]
             # Forbidden inner-pair electrodes: shared electrode or cross-channel adjacent
             forbidden = nb_dict.get(ep1, set()) | nb_dict.get(em1, set()) | {ep1, em1}
 
@@ -1115,6 +1123,28 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                     ef2_nr  = get_ef(lf_non_roi, ep2, em2)
                     ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
 
+                    # Per-subgroup hard constraints (non-ROI ceilings + ROI
+                    # floors) are checked FIRST, before fallback tracking or
+                    # the overall ROI-floor gate — a montage that violates
+                    # any subgroup constraint is never eligible, not even as
+                    # the hard_roi_constraint fallback below (previously the
+                    # fallback only tracked raw ROI mean, blind to whether
+                    # that candidate actually respected subgroup constraints).
+                    _violated = False
+                    for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
+                        _ef2_cg = get_ef(_cg['lf'], ep2, em2)
+                        if float(np.mean(TI.get_maxTI(_ef1_cg, _ef2_cg))) > _cg['max_mean']:
+                            _violated = True
+                            break
+                    if not _violated:
+                        for _cg, _ef1_cg in zip(roi_constraint_groups, ef1_rgrps):
+                            _ef2_cg = get_ef(_cg['lf'], ep2, em2)
+                            if float(np.mean(TI.get_maxTI(_ef1_cg, _ef2_cg))) < _cg['min_mean']:
+                                _violated = True
+                                break
+                    if _violated:
+                        continue
+
                     if hard_constraint:
                         roi_mean = float(np.mean(ti_roi))
                         if roi_mean > fallback_score:
@@ -1123,19 +1153,6 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                             fallback_ch2   = (ep2, em2)
                         if roi_mean < roi_min_threshold:
                             continue   # hard constraint: below minimum dose, skip
-
-                    # Per-subgroup non-ROI hard constraints
-                    if nr_constraint_groups:
-                        _violated = False
-                        for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
-                            _ef2_cg = get_ef(_cg['lf'], ep2, em2)
-                            if float(np.mean(TI.get_maxTI(_ef1_cg, _ef2_cg))) > _cg['max_mean']:
-                                _violated = True
-                                break
-                        if _violated:
-                            continue
-
-                    if hard_constraint:
                         n_feasible += 1
 
                     # ROC returns a distance to the ideal point — lower is better.
@@ -1155,8 +1172,9 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         used_fallback = hard_constraint and best_ch1 is None
         if used_fallback:
             print(f"\n  WARNING: No montage meets hard ROI constraint "
-                  f"(mean TI >= {roi_min_threshold} V/m). "
-                  f"Falling back to best mean-ROI montage.")
+                  f"(mean TI >= {roi_min_threshold} V/m). Falling back to best "
+                  f"mean-ROI montage among those that still satisfy every "
+                  f"subgroup constraint (non-ROI ceilings + ROI floors).")
             best_ch1   = fallback_ch1
             best_ch2   = fallback_ch2
             best_score = fallback_score
@@ -1292,6 +1310,25 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         },
         "roi_TI_mean_V_m": round(roi_mean_V_m, 6),
     }
+    # Actual achieved value (plain per-element mean, same statistic the
+    # search enforces) for every subgroup constraint, for the WINNING
+    # montage specifically — not just each group's configured bound. Without
+    # this there was no way to tell from the results file alone whether a
+    # subgroup constraint was actually satisfied by the final pick.
+    if nr_constraint_groups:
+        results["non_roi_hard_constraint_groups"] = [
+            {"name": g["name"], "achieved_mean_V_m": round(float(np.mean(ti_full[g["idx"]])), 6),
+             "max_mean_V_m": g["max_mean"],
+             "satisfied": bool(float(np.mean(ti_full[g["idx"]])) <= g["max_mean"])}
+            for g in nr_constraint_groups
+        ]
+    if roi_constraint_groups:
+        results["roi_hard_constraint_groups"] = [
+            {"name": g["name"], "achieved_mean_V_m": round(float(np.mean(ti_full[g["idx"]])), 6),
+             "min_mean_V_m": g["min_mean"],
+             "satisfied": bool(float(np.mean(ti_full[g["idx"]])) >= g["min_mean"])}
+            for g in roi_constraint_groups
+        ]
     if history is not None:
         results["hierarchical_search"] = {
             "coarse_electrodes": history[0]["n_electrodes"],
