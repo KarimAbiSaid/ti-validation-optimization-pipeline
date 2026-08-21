@@ -316,6 +316,65 @@ layout = html.Div([
               "border": "1px solid #ccc", "borderRadius": "4px"}),
 
     html.Div([
+        dcc.Checklist(
+            id="cg-opt-amp-enable",
+            options=[{"label": " use_amplitude_sweep (re-rank the location search's top montages "
+                      "over a per-channel current grid)", "value": "use_amplitude_sweep"}],
+            value=[k for k in ("use_amplitude_sweep",) if cd.OPTIMIZER_DEFAULTS[k]],
+        ),
+        html.Div([
+            html.Div([
+                html.Label("amplitude_sweep_top_n"),
+                dcc.Input(id="cg-opt-amp-top-n", type="number", min=1, step=1,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"], style={"width": "100%"}),
+            ], style={"minWidth": "160px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("min mA"),
+                dcc.Input(id="cg-opt-amp-min-ma", type="number", step=0.01,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_min_mA"], style={"width": "100%"}),
+            ], style={"minWidth": "110px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("max mA"),
+                dcc.Input(id="cg-opt-amp-max-ma", type="number", step=0.01,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_mA"], style={"width": "100%"}),
+            ], style={"minWidth": "110px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("step mA"),
+                dcc.Input(id="cg-opt-amp-step-ma", type="number", step=0.01,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_step_mA"], style={"width": "100%"}),
+            ], style={"minWidth": "110px", "marginRight": "1rem"}),
+            html.Div([
+                html.Label("max per-pair mA (single-channel ceiling)"),
+                dcc.Input(id="cg-opt-amp-max-per-pair-ma", type="number", step=0.1,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_per_pair_mA"],
+                          style={"width": "100%"}),
+            ], style={"minWidth": "220px", "marginRight": "1rem"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+        html.Div([
+            html.Label("Ranking weights — roc / roi_mean / non_roi_mean / focality_ratio "
+                       "(should sum to ~1.0; not enforced)",
+                       style={"display": "block", "marginTop": "0.5rem"}),
+            html.Div([
+                dcc.Input(id="cg-opt-amp-weight-roc", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roc"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-amp-weight-roi-mean", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roi_mean"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-amp-weight-non-roi-mean", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["non_roi_mean"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-amp-weight-focality-ratio", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["focality_ratio"],
+                          style={"width": "100%"}),
+            ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px"}),
+            html.Div(id="cg-opt-amp-weight-sum-note", style={"fontSize": "12px", "color": "#666",
+                                                             "marginTop": "0.25rem"}),
+        ]),
+    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
+              "border": "1px solid #ccc", "borderRadius": "4px"}),
+
+    html.Div([
         html.Label("Non-ROI subgroup hard constraints", style={"fontWeight": "bold"}),
         html.P("Rejects a montage if mean TI in mask_name exceeds max_mean_V_m, "
                "independently for EACH row — regardless of the overall non-ROI union "
@@ -488,18 +547,25 @@ def _constraint_group_mask_names(rows: list[dict] | None) -> list[str]:
     Input("cg-subject-dropdown", "value"),
     Input("cg-roi-atlas-dropdown", "value"),
     Input("cg-roi-name-input", "value"),
+    Input("cg-roi-existing-mask-dropdown", "value"),
     Input("cg-nonroi-atlas-dropdown", "value"),
     Input("cg-nonroi-name-input", "value"),
+    Input("cg-nonroi-existing-mask-dropdown", "value"),
     Input("cg-cap-dropdown", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
+    Input("cg-opt-roi-constraint-groups-table", "data"),
 )
-def _update_readiness_table(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
-                            cap_path, constraint_group_rows):
-    if not subject_ids or not roi_atlas or not roi_name:
+def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
+                            non_roi_atlas, non_roi_name, non_roi_existing_mask,
+                            cap_path, constraint_group_rows, roi_constraint_group_rows):
+    if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask):
         return []
-    constraint_group_masks = _constraint_group_mask_names(constraint_group_rows)
+    constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
+                              + _constraint_group_mask_names(roi_constraint_group_rows))
     matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
-                                 cap_path, constraint_group_masks=constraint_group_masks)
+                                 cap_path, constraint_group_masks=constraint_group_masks,
+                                 roi_uses_existing_mask=bool(roi_existing_mask),
+                                 non_roi_uses_existing_mask=bool(non_roi_existing_mask))
     rows = []
     for sid in subject_ids:
         r = matrix[sid]
@@ -520,21 +586,28 @@ def _update_readiness_table(subject_ids, roi_atlas, roi_name, non_roi_atlas, non
     Input("cg-subject-dropdown", "value"),
     Input("cg-roi-atlas-dropdown", "value"),
     Input("cg-roi-name-input", "value"),
+    Input("cg-roi-existing-mask-dropdown", "value"),
     Input("cg-nonroi-atlas-dropdown", "value"),
     Input("cg-nonroi-name-input", "value"),
+    Input("cg-nonroi-existing-mask-dropdown", "value"),
     Input("cg-cap-dropdown", "value"),
     Input("cg-goals-checklist", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
+    Input("cg-opt-roi-constraint-groups-table", "data"),
     State("cg-generate-table", "selected_rows"),
 )
-def _update_generate_table(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
-                           cap_path, goals, constraint_group_rows, prev_selected):
-    if not subject_ids or not roi_atlas or not roi_name or not goals:
+def _update_generate_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
+                           non_roi_atlas, non_roi_name, non_roi_existing_mask,
+                           cap_path, goals, constraint_group_rows, roi_constraint_group_rows, prev_selected):
+    if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask) or not goals:
         return [], []
 
-    constraint_group_masks = _constraint_group_mask_names(constraint_group_rows)
+    constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
+                              + _constraint_group_mask_names(roi_constraint_group_rows))
     matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
-                                 cap_path, constraint_group_masks=constraint_group_masks)
+                                 cap_path, constraint_group_masks=constraint_group_masks,
+                                 roi_uses_existing_mask=bool(roi_existing_mask),
+                                 non_roi_uses_existing_mask=bool(non_roi_existing_mask))
     ready_subjects = [sid for sid in subject_ids if matrix[sid]["ready"]]
 
     rows = []
@@ -546,7 +619,8 @@ def _update_generate_table(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_
         rows.append({"subject": sid, "files_display": files_display, "overwrite_display": overwrite_display})
 
     if ctx.triggered_id in ("cg-subject-dropdown", "cg-roi-atlas-dropdown", "cg-roi-name-input",
-                           "cg-nonroi-atlas-dropdown", "cg-nonroi-name-input",
+                           "cg-roi-existing-mask-dropdown", "cg-nonroi-atlas-dropdown",
+                           "cg-nonroi-name-input", "cg-nonroi-existing-mask-dropdown",
                            "cg-cap-dropdown", "cg-goals-checklist") or not prev_selected:
         selected_rows = list(range(len(rows)))
     else:
@@ -573,13 +647,16 @@ def _select_all_ready(_n_clicks, data):
     Input("cg-roi-name-input", "value"),
     Input("cg-roi-atlas-dropdown", "value"),
     Input("cg-roi-selected-label-ids-store", "data"),
+    Input("cg-roi-existing-mask-dropdown", "value"),
     Input("cg-nonroi-name-input", "value"),
     Input("cg-nonroi-atlas-dropdown", "value"),
     Input("cg-nonroi-selected-label-ids-store", "data"),
+    Input("cg-nonroi-existing-mask-dropdown", "value"),
     Input("cg-overwrite-confirm", "value"),
 )
-def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_label_ids,
-                               non_roi_name, non_roi_atlas, non_roi_label_ids, confirm_value):
+def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_label_ids, roi_existing_mask,
+                               non_roi_name, non_roi_atlas, non_roi_label_ids, non_roi_existing_mask,
+                               confirm_value):
     rows = rows or []
     selected_rows = selected_rows or []
     selected = [rows[i] for i in selected_rows if i < len(rows)]
@@ -589,11 +666,14 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
         problems.append("select at least one ready subject")
     if not roi_name:
         problems.append("enter a ROI name")
-    if roi_atlas and not cd.uses_allen(roi_atlas) and not roi_label_ids:
+    # An explicitly-picked existing mask (any atlas, or no atlas at all)
+    # overrides needing a region selection — same as Allen already does,
+    # just not tied to one specific atlas (see build_roi_dict()).
+    if roi_atlas and not cd.uses_allen(roi_atlas) and not roi_label_ids and not roi_existing_mask:
         problems.append("select at least one ROI region")
     if not non_roi_name:
         problems.append("enter a non-ROI name")
-    if non_roi_atlas and not cd.uses_allen(non_roi_atlas) and not non_roi_label_ids:
+    if non_roi_atlas and not cd.uses_allen(non_roi_atlas) and not non_roi_label_ids and not non_roi_existing_mask:
         problems.append("select at least one non-ROI region")
 
     overwrite_rows = [r for r in selected if r["overwrite_display"].startswith("⚠")]
@@ -634,6 +714,22 @@ def _add_constraint_group_row(_n_clicks, rows):
 def _update_constraint_group_mask_options(subject_ids):
     options = [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
     return {"mask_name": {"options": options, "clearable": True}}
+
+
+@callback(
+    Output("cg-opt-amp-weight-sum-note", "children"),
+    Input("cg-opt-amp-weight-roc", "value"),
+    Input("cg-opt-amp-weight-roi-mean", "value"),
+    Input("cg-opt-amp-weight-non-roi-mean", "value"),
+    Input("cg-opt-amp-weight-focality-ratio", "value"),
+)
+def _update_amp_weight_sum_note(roc, roi_mean, non_roi_mean, focality_ratio):
+    # Sanity nudge only — the pipeline doesn't require these to sum to 1.0,
+    # so this never blocks generation, just flags a likely typo.
+    total = sum(v for v in (roc, roi_mean, non_roi_mean, focality_ratio) if v is not None)
+    color = "#666" if abs(total - 1.0) < 0.01 else "#a60"
+    return html.Span(f"sum: {total:.2f}" + ("" if color == "#666" else "  (doesn't sum to 1.0 — fine, just double-check)"),
+                     style={"color": color})
 
 
 @callback(
@@ -681,6 +777,16 @@ def _update_roi_constraint_group_mask_options(subject_ids):
     State("cg-opt-hier-early-stop", "value"),
     State("cg-opt-constraint-groups-table", "data"),
     State("cg-opt-roi-constraint-groups-table", "data"),
+    State("cg-opt-amp-enable", "value"),
+    State("cg-opt-amp-top-n", "value"),
+    State("cg-opt-amp-min-ma", "value"),
+    State("cg-opt-amp-max-ma", "value"),
+    State("cg-opt-amp-step-ma", "value"),
+    State("cg-opt-amp-max-per-pair-ma", "value"),
+    State("cg-opt-amp-weight-roc", "value"),
+    State("cg-opt-amp-weight-roi-mean", "value"),
+    State("cg-opt-amp-weight-non-roi-mean", "value"),
+    State("cg-opt-amp-weight-focality-ratio", "value"),
     State("cg-elec-diameter", "value"),
     State("cg-elec-gel-thickness", "value"),
     State("cg-elec-max-current", "value"),
@@ -692,6 +798,8 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
                        hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
                        constraint_group_rows, roi_constraint_group_rows,
+                       amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+                       amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
                        elec_diameter, elec_gel, elec_max_current, flags_checklist):
     rows = rows or []
     selected_rows = selected_rows or []
@@ -752,6 +860,17 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                              f"got {min_v!r}", style={"color": "#a00"})
         roi_constraint_groups.append({"name": grp_name, "mask_name": mask_name, "min_mean_V_m": min_v})
 
+    use_amplitude_sweep = "use_amplitude_sweep" in (amp_enable or [])
+    if use_amplitude_sweep:
+        if amp_min_ma is None or amp_max_ma is None or amp_step_ma is None:
+            return html.Div("amplitude sweep: min/max/step mA are all required when "
+                             "use_amplitude_sweep is enabled.", style={"color": "#a00"})
+        if amp_min_ma > amp_max_ma:
+            return html.Div(f"amplitude sweep: min mA ({amp_min_ma}) can't exceed max mA ({amp_max_ma}).",
+                             style={"color": "#a00"})
+        if amp_step_ma <= 0:
+            return html.Div("amplitude sweep: step mA must be positive.", style={"color": "#a00"})
+
     optimizer_overrides = {
         "postproc": postproc,
         "cpus": cpus,
@@ -764,6 +883,22 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         "early_stop_threshold": (hier_early_stop_pct or 0) / 100.0,
         "non_roi_hard_constraint_groups": constraint_groups,
         "roi_hard_constraint_groups": roi_constraint_groups,
+        "use_amplitude_sweep": use_amplitude_sweep,
+        "amplitude_sweep_top_n": int(amp_top_n) if amp_top_n else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"],
+        "amplitude_sweep_min_mA": amp_min_ma if amp_min_ma is not None else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_min_mA"],
+        "amplitude_sweep_max_mA": amp_max_ma if amp_max_ma is not None else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_mA"],
+        "amplitude_sweep_step_mA": amp_step_ma if amp_step_ma is not None else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_step_mA"],
+        "amplitude_sweep_max_per_pair_mA": (amp_max_per_pair_ma if amp_max_per_pair_ma is not None
+                                            else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_per_pair_mA"]),
+        "amplitude_sweep_weights": {
+            "roc": amp_weight_roc if amp_weight_roc is not None else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roc"],
+            "roi_mean": (amp_weight_roi_mean if amp_weight_roi_mean is not None
+                        else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roi_mean"]),
+            "non_roi_mean": (amp_weight_non_roi_mean if amp_weight_non_roi_mean is not None
+                             else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["non_roi_mean"]),
+            "focality_ratio": (amp_weight_focality_ratio if amp_weight_focality_ratio is not None
+                               else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["focality_ratio"]),
+        },
     }
     electrode_overrides = {
         "dimensions": [elec_diameter, elec_diameter],

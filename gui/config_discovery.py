@@ -49,6 +49,13 @@ OPTIMIZER_DEFAULTS = {
     "num_fine_iterations":       0,
     "neighbours_per_iteration":  [],
     "early_stop_threshold":      0.03,
+    "use_amplitude_sweep":            False,
+    "amplitude_sweep_top_n":          5,
+    "amplitude_sweep_min_mA":         1.8,
+    "amplitude_sweep_max_mA":         2.0,
+    "amplitude_sweep_step_mA":        0.02,
+    "amplitude_sweep_max_per_pair_mA": 2.0,
+    "amplitude_sweep_weights": {"roc": 0.7, "roi_mean": 0.1, "non_roi_mean": 0.1, "focality_ratio": 0.1},
 }
 ELECTRODE_DEFAULTS = {
     "shape":             "ellipse",
@@ -118,29 +125,36 @@ def roi_mask_exists(subject_id: str, name: str, mask_type: str,
 def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
                        non_roi_atlas: str | None, non_roi_name: str | None,
                        cap_path: str | None, project_dir: str = PROJECT_DIR,
-                       constraint_group_masks: list[str] | None = None) -> dict:
+                       constraint_group_masks: list[str] | None = None,
+                       roi_uses_existing_mask: bool = False,
+                       non_roi_uses_existing_mask: bool = False) -> dict:
     """{"ready": bool, "missing": [str, ...]} for one subject, across every
     prerequisite Config Generation needs for THIS roi/non-roi/cap
     combination: m2m + atlas-specific paths (BNA/SimNIBS/FreeSurfer), or the
-    pre-built mask file (Allen); registered cap CSV if cap_path is set (None
-    = default Okamoto cap, always available once m2m exists); mask_name-based
-    non-ROI subgroup hard constraints (optimizer.non_roi_hard_constraint_groups)
-    — these can never be built by Section 1 (no labels/bna_labels fallback),
-    so missing here means the run will silently skip that constraint."""
+    pre-built mask file (Allen, or ANY atlas when the "...or pick an
+    already-generated mask" dropdown was explicitly used — same
+    pre-built-file requirement as Allen, just not tied to one specific
+    atlas); registered cap CSV if cap_path is set (None = default Okamoto
+    cap, always available once m2m exists); mask_name-based ROI/non-ROI
+    subgroup hard constraints (optimizer.roi_hard_constraint_groups /
+    non_roi_hard_constraint_groups — pass the union of both tables' mask
+    names as constraint_group_masks) — these can never be built by Section 1
+    (no labels/bna_labels fallback), so missing here means the run will
+    silently skip that constraint."""
     missing: list[str] = []
 
-    if uses_allen(roi_atlas):
+    if roi_uses_existing_mask or uses_allen(roi_atlas):
         if not roi_mask_exists(subject_id, roi_name, "ROI", project_dir):
-            missing.append(f"ROI mask not on disk (Allen) — run Mask Generation first: {roi_name}")
+            missing.append(f"ROI mask not on disk — run Mask Generation first: {roi_name}")
     else:
         roi_check = discovery.full_atlas_check(roi_atlas, subject_id, project_dir)
         if not roi_check["ready"]:
             missing += [c["label"] for c in roi_check["checks"] if not c["exists"]]
 
-    if non_roi_atlas and non_roi_name:
-        if uses_allen(non_roi_atlas):
+    if non_roi_name and (non_roi_atlas or non_roi_uses_existing_mask):
+        if non_roi_uses_existing_mask or uses_allen(non_roi_atlas):
             if not roi_mask_exists(subject_id, non_roi_name, "non-ROI", project_dir):
-                missing.append(f"non-ROI mask not on disk (Allen) — run Mask Generation first: {non_roi_name}")
+                missing.append(f"non-ROI mask not on disk — run Mask Generation first: {non_roi_name}")
         else:
             non_roi_check = discovery.full_atlas_check(non_roi_atlas, subject_id, project_dir)
             if not non_roi_check["ready"]:
@@ -153,7 +167,7 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
 
     for mask_name in (constraint_group_masks or []):
         if not roi_mask_exists(subject_id, mask_name, "general", project_dir):
-            missing.append(f"non-ROI constraint mask not on disk — run Mask Generation first: {mask_name}")
+            missing.append(f"hard-constraint mask not on disk — run Mask Generation first: {mask_name}")
 
     seen = set()
     missing_unique = [m for m in missing if not (m in seen or seen.add(m))]
@@ -163,10 +177,13 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
 def readiness_matrix(subject_ids: list[str], roi_atlas: str, roi_name: str,
                       non_roi_atlas: str | None, non_roi_name: str | None,
                       cap_path: str | None, project_dir: str = PROJECT_DIR,
-                      constraint_group_masks: list[str] | None = None) -> dict:
+                      constraint_group_masks: list[str] | None = None,
+                      roi_uses_existing_mask: bool = False,
+                      non_roi_uses_existing_mask: bool = False) -> dict:
     return {
         sid: subject_readiness(sid, roi_atlas, roi_name, non_roi_atlas, non_roi_name, cap_path,
-                               project_dir, constraint_group_masks)
+                               project_dir, constraint_group_masks,
+                               roi_uses_existing_mask, non_roi_uses_existing_mask)
         for sid in subject_ids
     }
 

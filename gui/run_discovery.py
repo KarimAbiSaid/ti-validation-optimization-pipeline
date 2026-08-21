@@ -124,7 +124,7 @@ def _config_prereq_relpaths(cfg: dict) -> list[str]:
     """Relative-to-PROJECT_DIR paths (forward-slash, matching the remote
     scratch layout — see scitas_discovery.batch_upload) for every small
     file this config needs uploaded: registered cap CSV, ROI/non-ROI
-    masks, non-ROI constraint-group masks. Shared by
+    masks, ROI/non-ROI constraint-group masks. Shared by
     run_pipeline_on_scitas()'s own per-config upload step and
     batch_upload_prereqs()'s combined multi-config upload, so both stay in
     sync about what "this config's prerequisites" actually means."""
@@ -138,11 +138,12 @@ def _config_prereq_relpaths(cfg: dict) -> list[str]:
         if roi_cfg and roi_cfg.get("name"):
             paths.append(f"derivatives/SimNIBS/sub-{subject_id}/roi/"
                          f"sub-{subject_id}_label-{roi_cfg['name']}_mask.nii.gz")
-    for grp in cfg.get("optimizer", {}).get("non_roi_hard_constraint_groups", []):
-        mask_name = grp.get("mask_name")
-        if mask_name:
-            paths.append(f"derivatives/SimNIBS/sub-{subject_id}/roi/"
-                         f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
+    for groups_key in ("non_roi_hard_constraint_groups", "roi_hard_constraint_groups"):
+        for grp in cfg.get("optimizer", {}).get(groups_key, []):
+            mask_name = grp.get("mask_name")
+            if mask_name:
+                paths.append(f"derivatives/SimNIBS/sub-{subject_id}/roi/"
+                             f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
     return paths
 
 
@@ -202,13 +203,21 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
     Results stay on SCITAS scratch — sync them back via the Data
     Directory page if you want local copies, same as any other SCITAS data.
 
+    Also checks (unless skip_prereq_upload) that the pipeline source files
+    THIS job's flags actually need are present and up to date on SCITAS —
+    see scitas_discovery.ensure_pipeline_code_synced() — and re-uploads any
+    that are stale before submitting, so a file that's gone missing/out of
+    date on the cluster surfaces as a clear local error now instead of a
+    confusing remote import failure partway through a submitted job.
+
     skip_prereq_upload: set True when the caller already uploaded the
-    config/cap/masks itself (batch_upload_prereqs(), called once across
-    several configs at once — see the Run Pipeline page's multi-select
-    submit). The existence/rebuildability validation (does a mask exist
-    anywhere, can Section 1 rebuild it, else error) still always runs —
-    only the redundant individual re-upload of a file that's already there
-    is skipped. m2m_ and the BNA atlas are unaffected either way, since
+    config/cap/masks (and pipeline code) itself (batch_upload_prereqs()
+    plus its own code-sync call, called once across several configs at
+    once — see the Run Pipeline page's multi-select submit / batch_submit()).
+    The existence/rebuildability validation (does a mask exist anywhere,
+    can Section 1 rebuild it, else error) still always runs — only the
+    redundant individual re-upload of something that's already there is
+    skipped. m2m_ and the BNA atlas are unaffected either way, since
     batch_upload_prereqs() never includes them.
     """
     import scitas_discovery as sd
@@ -216,6 +225,13 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
     with open(config_path) as f:
         cfg = json.load(f)
     subject_id = cfg["subject_id"]
+
+    if not skip_prereq_upload:
+        code_sync = sd.ensure_pipeline_code_synced(sd.required_pipeline_files(cfg.get("flags", {})))
+        if code_sync["error"]:
+            return {"success": False, "job_id": None,
+                    "error": f"pipeline code sync failed: {code_sync['error']}"}
+
     scratch = sd.scitas_scratch_dir()
     container_root = cfg["project_dir"]  # e.g. "/mnt/BIDS_TI_Toolbox" — only exists INSIDE the
                                           # Apptainer container (see simnibs_ti_pipeline.sbatch's
@@ -331,36 +347,42 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
                          f"no labels/bna_labels for Section 1 to build it from (Allen-sourced, or a "
                          f"combined mask) — generate it via Mask Generation first."}
 
-    # Non-ROI subgroup hard-constraint masks (optimizer.non_roi_hard_constraint_groups).
-    # Only mask_name-based groups need this — bna_labels-based groups need no
-    # upload since Section 1 rebuilds the warped BNA atlas itself. Unlike
-    # ROI/non-ROI above, a mask_name group can NEVER be rebuilt remotely (no
-    # labels/bna_labels fallback exists for it in run_pipeline.py). Same
-    # always-reupload-if-local-exists reasoning as ROI/non-ROI above — a
-    # locally-missing mask (with no remote copy either) is a hard error.
-    for grp in cfg.get("optimizer", {}).get("non_roi_hard_constraint_groups", []):
-        mask_name = grp.get("mask_name")
-        if not mask_name:
-            continue
-        remote_mask = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/roi/sub-{subject_id}_label-{mask_name}_mask.nii.gz"
-        local_mask = os.path.join(PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi",
-                                  f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
+    # Subgroup hard-constraint masks — both non_roi_hard_constraint_groups
+    # (mean TI must stay BELOW max_mean_V_m) and roi_hard_constraint_groups
+    # (mean TI must stay ABOVE min_mean_V_m) reference masks the exact same
+    # way, so one helper covers both. Only mask_name-based groups need this
+    # — bna_labels-based groups need no upload since Section 1 rebuilds the
+    # warped BNA atlas itself. Unlike ROI/non-ROI above, a mask_name group
+    # can NEVER be rebuilt remotely (no labels/bna_labels fallback exists
+    # for it in run_pipeline.py). Same always-reupload-if-local-exists
+    # reasoning as ROI/non-ROI above — a locally-missing mask (with no
+    # remote copy either) is a hard error.
+    for groups_key, label in (("non_roi_hard_constraint_groups", "non-ROI"),
+                              ("roi_hard_constraint_groups", "ROI")):
+        for grp in cfg.get("optimizer", {}).get(groups_key, []):
+            mask_name = grp.get("mask_name")
+            if not mask_name:
+                continue
+            remote_mask = (f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/roi/"
+                          f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
+            local_mask = os.path.join(PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi",
+                                      f"sub-{subject_id}_label-{mask_name}_mask.nii.gz")
 
-        if os.path.isfile(local_mask):
-            if not skip_prereq_upload:
-                sd.remote_mkdir(os.path.dirname(remote_mask))
-                up = sd.scp_upload(local_mask, remote_mask, recursive=False)
-                if not up["success"]:
-                    return {"success": False, "job_id": None,
-                            "error": f"non-ROI constraint mask '{mask_name}' upload failed: {up['stderr']}"}
-            continue
+            if os.path.isfile(local_mask):
+                if not skip_prereq_upload:
+                    sd.remote_mkdir(os.path.dirname(remote_mask))
+                    up = sd.scp_upload(local_mask, remote_mask, recursive=False)
+                    if not up["success"]:
+                        return {"success": False, "job_id": None,
+                                "error": f"{label} constraint mask '{mask_name}' upload failed: {up['stderr']}"}
+                continue
 
-        if sd.remote_path_exists(remote_mask):
-            continue   # local missing but remote already has a copy — trust it
+            if sd.remote_path_exists(remote_mask):
+                continue   # local missing but remote already has a copy — trust it
 
-        return {"success": False, "job_id": None,
-                "error": f"non-ROI constraint mask '{mask_name}' (group '{grp.get('name', '?')}') "
-                         f"not found locally or on SCITAS — generate it via Mask Generation first."}
+            return {"success": False, "job_id": None,
+                    "error": f"{label} constraint mask '{mask_name}' (group '{grp.get('name', '?')}') "
+                             f"not found locally or on SCITAS — generate it via Mask Generation first."}
 
     export_vars = {"PIPELINE_CONFIGS": remote_config_path}
     if force_sections:
@@ -387,16 +409,24 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
 
 
 def batch_submit(config_paths: list[str], force_sections: list[str] | None = None) -> dict:
-    """{config_path: {"success", "job_id", "error", "subject_id"}} — gets
-    several configs' SLURM jobs INTO the queue using as few ssh connections
-    as possible across the whole batch, instead of each config running its
-    own full run_pipeline_on_scitas() sequence (prereq upload, m2m_/BNA
-    checks, sbatch submission — several ssh calls each). Firing that
-    sequence once per config, all at once for N configs, was still enough
-    separate connections in a short window to trip SCITAS's own
-    new-connection rate limiting even after batch_upload_prereqs() already
-    batched the small-file upload step — this batches the rest of it too
-    (existence checks, submission).
+    """{config_path: {"success", "job_id", "error", "subject_id",
+    "code_synced"}} — gets several configs' SLURM jobs INTO the queue
+    using as few ssh connections as possible across the whole batch,
+    instead of each config running its own full run_pipeline_on_scitas()
+    sequence (prereq upload, m2m_/BNA checks, sbatch submission — several
+    ssh calls each). Firing that sequence once per config, all at once for
+    N configs, was still enough separate connections in a short window to
+    trip SCITAS's own new-connection rate limiting even after
+    batch_upload_prereqs() already batched the small-file upload step —
+    this batches the rest of it too (existence checks, submission).
+
+    Also checks the pipeline SOURCE CODE itself once for the whole batch
+    (scitas_discovery.ensure_pipeline_code_synced()) before touching any
+    config-specific files — self-heals a required .py/.sbatch file gone
+    stale/missing on SCITAS scratch, so a submission never fails with a
+    confusing remote import error over something that could've been fixed
+    locally first. "code_synced" on every result records what (if
+    anything) got re-uploaded this way.
 
     Only gets each config's job queued — does NOT block waiting for
     completion. Callers run wait_for_submitted_job(job_id, subject_id) in
@@ -409,8 +439,29 @@ def batch_submit(config_paths: list[str], force_sections: list[str] | None = Non
         with open(path) as f:
             configs[path] = json.load(f)
 
-    out = {path: {"success": False, "job_id": None, "error": None, "subject_id": cfg["subject_id"]}
+    out = {path: {"success": False, "job_id": None, "error": None, "subject_id": cfg["subject_id"],
+                  "code_synced": []}
            for path, cfg in configs.items()}
+
+    # 0) Pipeline source code — one shared check for the WHOLE batch (union
+    #    of every config's own flags, so e.g. one recon_all-flagged config
+    #    in an otherwise-normal batch still gets recon_all_scitas.sbatch
+    #    synced too). Self-heals a file gone stale/missing on SCITAS scratch
+    #    before it turns into a confusing remote import error partway
+    #    through a submitted job — see scitas_discovery.
+    #    ensure_pipeline_code_synced(). "code_synced" is stamped onto every
+    #    entry (not a separate top-level field) so any caller inspecting
+    #    any one result can see what happened for the whole batch.
+    all_flags: dict = {}
+    for cfg in configs.values():
+        all_flags.update({k: v for k, v in cfg.get("flags", {}).items() if v})
+    code_sync = sd.ensure_pipeline_code_synced(sd.required_pipeline_files(all_flags))
+    if code_sync["error"]:
+        for path in out:
+            out[path]["error"] = f"pipeline code sync failed: {code_sync['error']}"
+        return out
+    for path in out:
+        out[path]["code_synced"] = code_sync["synced"]
 
     # 1) Config JSON + registered cap + ROI/non-ROI/constraint masks — one
     #    shared connection for every config's small files.
@@ -434,7 +485,12 @@ def batch_submit(config_paths: list[str], force_sections: list[str] | None = Non
         if cfg.get("bna_atlas_path"):
             container_root = cfg["project_dir"]
             check_paths.add(scratch + cfg["bna_atlas_path"][len(container_root):])
-    existence = sd.remote_paths_exist(sorted(check_paths))
+    try:
+        existence = sd.remote_paths_exist(sorted(check_paths))
+    except RuntimeError as e:
+        for path in out:
+            out[path]["error"] = f"m2m_/BNA existence check failed: {e}"
+        return out
 
     for path, cfg in configs.items():
         if out[path]["error"]:

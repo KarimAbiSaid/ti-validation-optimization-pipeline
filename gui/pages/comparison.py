@@ -188,6 +188,16 @@ layout = html.Div([
         html.Div(id="cx-nonroi-readiness-container", style={"marginTop": "0.5rem"}),
     ], id="cx-common-nonroi-panel", style={"marginBottom": "1.5rem"}),
 
+    # ── Extra regions (optional) ────────────────────────────────────────────
+    html.H3("Extra Regions (optional)", style={"marginTop": "1.5rem"}),
+    html.P("Additional existing mask names to also report TI_mean/TI_max for on every row, "
+           "alongside the main ROI/non-ROI — e.g. other candidate subregions you want stats for "
+           "without a second run. Add as many as you like; a region with no mask for a given "
+           "row's subject is silently skipped for that row.",
+           style={"fontSize": "12px", "color": "#666"}),
+    dcc.Dropdown(id="cx-extra-regions-dropdown", multi=True, placeholder="Select existing mask name(s)...",
+                style={"maxWidth": "600px", "marginBottom": "1.5rem"}),
+
     # ── Setups ───────────────────────────────────────────────────────────────
     html.H3("Setups"),
     html.P("Mode: \"leadfield\" (fast — Ch1/Ch2 must be electrode names) or \"oneoff\" (real FEM "
@@ -208,6 +218,17 @@ layout = html.Div([
     html.Button("Add Empty Row", id="cx-add-row-btn", n_clicks=0, style={"marginTop": "0.5rem"}),
 
     dcc.Store(id="cx-cap-registered-trigger", data=0),
+
+    # ── Fill from optimization results ──────────────────────────────────────
+    html.H3("Fill Channels/Currents from Optimization Results", style={"marginTop": "1.5rem"}),
+    html.P("Per row: pick one of that subject's finished TIoptimization runs (only run folders "
+           "containing exhaustive_results.json are listed) and click Fill to copy its best_montage "
+           "into that row's Ch1/Ch2 electrodes + mA.",
+           style={"fontSize": "12px", "color": "#666"}),
+    html.Button("Fill All (skips rows with no finished optimization result)",
+               id="cx-opt-fill-all-btn", n_clicks=0, style={"marginBottom": "0.5rem"}),
+    html.Div(id="cx-opt-fill-container"),
+    html.Div(id="cx-opt-fill-note", style={"fontSize": "13px", "margin": "0.5rem 0"}),
 
     html.Div([
         html.Button("Run Comparison", id="cx-run-btn", n_clicks=0,
@@ -346,6 +367,20 @@ def _register_atlas_region_callbacks(prefix):
 
 _register_atlas_region_callbacks("roi")
 _register_atlas_region_callbacks("nonroi")
+
+
+@callback(
+    Output("cx-extra-regions-dropdown", "options"),
+    Input("cx-setup-table", "data"),
+)
+def _load_extra_region_options(rows):
+    subjects = _unique_subjects(rows)
+    if not subjects:
+        return []
+    names = cx.list_existing_names(subjects)
+    total = len(subjects)
+    return [{"label": f"{name}  ({len(sids)}/{total} subjects)", "value": name}
+            for name, sids in sorted(names.items())]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -628,6 +663,146 @@ def _bump_cap_registered_trigger(_all_status_children, trigger_count):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Fill a row's channels/currents from an exhaustive-search result's
+# best_montage — one dropdown (which run) + one Fill button per table row
+# with a subject, both pattern-matched by row index (rebuilt whenever the
+# table's rows change, same technique as the cap-readiness panel above).
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(Output("cx-opt-fill-container", "children"), Input("cx-setup-table", "data"))
+def _render_opt_fill_controls(rows):
+    rows = rows or []
+    items = []
+    for i, row in enumerate(rows):
+        sid = (row.get("subject") or "").strip()
+        if not sid:
+            continue
+        runs = cx.list_exhaustive_runs(sid)
+        opts = [{"label": r["run_dir"], "value": r["run_dir"]} for r in runs]
+        items.append(html.Div([
+            html.Span(f"Row {i + 1} (sub-{sid}): ", style={"fontWeight": "bold", "marginRight": "0.5rem"}),
+            dcc.Dropdown(
+                id={"type": "cx-opt-run-dropdown", "index": i}, options=opts, disabled=not opts,
+                placeholder=("no finished TIoptimization run found" if not opts else "Select run..."),
+                style={"minWidth": "420px", "display": "inline-block", "marginRight": "0.5rem",
+                      "verticalAlign": "middle"},
+            ),
+            html.Button("Fill", id={"type": "cx-opt-fill-btn", "index": i}, n_clicks=0, disabled=not opts),
+        ], style={"marginBottom": "0.4rem", "display": "flex", "alignItems": "center"}))
+    if not items:
+        return html.Div("Add a subject in the table above to see its optimization runs.",
+                        style={"color": "#666", "fontSize": "13px"})
+    return html.Div(items)
+
+
+@callback(
+    Output("cx-setup-table", "data", allow_duplicate=True),
+    Output("cx-opt-fill-note", "children"),
+    Input({"type": "cx-opt-fill-btn", "index": ALL}, "n_clicks"),
+    State({"type": "cx-opt-fill-btn", "index": ALL}, "id"),
+    State({"type": "cx-opt-run-dropdown", "index": ALL}, "id"),
+    State({"type": "cx-opt-run-dropdown", "index": ALL}, "value"),
+    State("cx-setup-table", "data"),
+    prevent_initial_call=True,
+)
+def _on_opt_fill_click(n_clicks_list, btn_ids, dd_ids, dd_values, rows):
+    triggered = ctx.triggered_id
+    if not triggered or triggered.get("type") != "cx-opt-fill-btn":
+        return dash.no_update, dash.no_update
+    row_idx = triggered["index"]
+
+    # Ignore the "new Fill button appeared" pattern-matching trigger that
+    # fires when the container above is rebuilt (e.g. a row got added) —
+    # only act on an actual click (n_clicks > 0 for this specific button).
+    if not any(bid["index"] == row_idx and nc for bid, nc in zip(btn_ids, n_clicks_list)):
+        return dash.no_update, dash.no_update
+
+    run_dir = next((v for did, v in zip(dd_ids, dd_values) if did["index"] == row_idx), None)
+    if not run_dir:
+        return dash.no_update, html.Div("Select a run first.", style={"color": "#a00"})
+
+    rows = rows or []
+    if row_idx >= len(rows):
+        return dash.no_update, html.Div("That row no longer exists.", style={"color": "#a00"})
+    sid = (rows[row_idx].get("subject") or "").strip()
+    if not sid:
+        return dash.no_update, html.Div("That row has no subject.", style={"color": "#a00"})
+
+    result_path = os.path.join(cx.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{sid}",
+                               "TIoptimization", run_dir, "exhaustive_results.json")
+    montage = cx.load_best_montage(result_path)
+    if not montage:
+        return dash.no_update, html.Div(f"Couldn't read best_montage from {run_dir}/exhaustive_results.json.",
+                                        style={"color": "#a00"})
+
+    rows[row_idx].update({
+        "ch1_plus": montage["ch1_plus"], "ch1_minus": montage["ch1_minus"],
+        "ch1_current": montage["ch1_current_mA"],
+        "ch2_plus": montage["ch2_plus"], "ch2_minus": montage["ch2_minus"],
+        "ch2_current": montage["ch2_current_mA"],
+    })
+    return rows, html.Div(f"✓ Row {row_idx + 1} (sub-{sid}) filled from {run_dir}.", style={"color": "#060"})
+
+
+@callback(
+    Output("cx-setup-table", "data", allow_duplicate=True),
+    Output("cx-opt-fill-note", "children", allow_duplicate=True),
+    Input("cx-opt-fill-all-btn", "n_clicks"),
+    State({"type": "cx-opt-run-dropdown", "index": ALL}, "id"),
+    State({"type": "cx-opt-run-dropdown", "index": ALL}, "value"),
+    State("cx-setup-table", "data"),
+    prevent_initial_call=True,
+)
+def _on_opt_fill_all_click(_n_clicks, dd_ids, dd_values, rows):
+    """Fills every row that has a subject with a resolvable run — the run
+    already picked in that row's own dropdown if there is one, else the only
+    run if that subject has exactly one, else the row is skipped (ambiguous
+    — no result to guess from). A subject with zero finished runs is skipped
+    the same way. Never errors out the whole batch over one row."""
+    rows = rows or []
+    selected_by_index = {did["index"]: v for did, v in zip(dd_ids, dd_values)}
+    filled, no_result, ambiguous = [], [], []
+
+    for i, row in enumerate(rows):
+        sid = (row.get("subject") or "").strip()
+        if not sid:
+            continue
+        run_dir = selected_by_index.get(i)
+        if not run_dir:
+            runs = cx.list_exhaustive_runs(sid)
+            if len(runs) == 1:
+                run_dir = runs[0]["run_dir"]
+            elif not runs:
+                no_result.append(i + 1)
+                continue
+            else:
+                ambiguous.append(i + 1)
+                continue
+
+        result_path = os.path.join(cx.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{sid}",
+                                   "TIoptimization", run_dir, "exhaustive_results.json")
+        montage = cx.load_best_montage(result_path)
+        if not montage:
+            no_result.append(i + 1)
+            continue
+
+        row.update({
+            "ch1_plus": montage["ch1_plus"], "ch1_minus": montage["ch1_minus"],
+            "ch1_current": montage["ch1_current_mA"],
+            "ch2_plus": montage["ch2_plus"], "ch2_minus": montage["ch2_minus"],
+            "ch2_current": montage["ch2_current_mA"],
+        })
+        filled.append(i + 1)
+
+    parts = [f"✓ filled {len(filled)} row(s){f': {filled}' if filled else ''}"]
+    if no_result:
+        parts.append(f"skipped {len(no_result)} (no finished optimization result): {no_result}")
+    if ambiguous:
+        parts.append(f"skipped {len(ambiguous)} (multiple runs — pick one manually first): {ambiguous}")
+    return rows, html.Div("; ".join(parts), style={"color": "#060" if filled else "#a60"})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ROI / non-ROI readiness (per subject in the table) — no action needed,
 # just flags what's missing and points at Mask Generation
 # ═════════════════════════════════════════════════════════════════════════════
@@ -687,10 +862,12 @@ def _update_nonroi_readiness(rows, nonroi_label):
     State("cx-common-elec-dim1", "value"),
     State("cx-common-elec-dim2", "value"),
     State("cx-common-elec-gel", "value"),
+    State("cx-extra-regions-dropdown", "value"),
     prevent_initial_call=True,
 )
 def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_label,
-                   nonroi_toggle, nonroi_label, elec_toggle, common_dim1, common_dim2, common_gel):
+                   nonroi_toggle, nonroi_label, elec_toggle, common_dim1, common_dim2, common_gel,
+                   extra_region_labels):
     rows = [r for r in (rows or []) if (r.get("subject") or "").strip()]
     if not rows:
         return None, True, html.Div("No setups — fill in at least one row.", style={"color": "#a00"})
@@ -725,7 +902,7 @@ def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_
             ch1_current_mA=float(row.get("ch1_current") or 0),
             ch2_plus=(row.get("ch2_plus") or "").strip(), ch2_minus=(row.get("ch2_minus") or "").strip(),
             ch2_current_mA=float(row.get("ch2_current") or 0),
-            label=row_label,
+            label=row_label, extra_region_labels=extra_region_labels or None,
         )
         row_key = str(i)
         display_row = {"subject": subject_id, "label": row_label}

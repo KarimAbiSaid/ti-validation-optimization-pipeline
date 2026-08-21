@@ -13,6 +13,7 @@ import sys
 import re
 import json
 import time
+import heapq
 import datetime
 import argparse
 import subprocess
@@ -1052,9 +1053,15 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     the search.'''
     current_A = cfg.electrode.current_mA * 1e-3   # mA → A
 
-    def get_ef(lf_subset: np.ndarray, e_plus: str, e_minus: str) -> np.ndarray:
-        """E-field at a subset of elements for one electrode pair."""
-        return TI.get_field([e_plus, e_minus, current_A], lf_subset, idx_lf)
+    def get_ef(lf_subset: np.ndarray, e_plus: str, e_minus: str,
+              current_A_override: float = None) -> np.ndarray:
+        """E-field at a subset of elements for one electrode pair. Uses the
+        configured cfg.electrode.current_mA by default; current_A_override
+        lets the amplitude sweep (STEP 3.5) re-evaluate the same pair at a
+        different current — cheap, since TI.get_field() scales the
+        leadfield-derived field linearly in current."""
+        I = current_A_override if current_A_override is not None else current_A
+        return TI.get_field([e_plus, e_minus, I], lf_subset, idx_lf)
 
     # Pre-filter: build neighbour lookup from the (subset-independent) global
     # adjacency set once — reused unchanged by every round of search below,
@@ -1102,6 +1109,15 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         n_feasible = 0
         n_eval     = 0
         t_start    = time.time()
+
+        # Top-N tracking for the amplitude sweep (STEP 3.5) — a small
+        # min-heap of (score, tiebreak, ch1, ch2), tiebreak avoids ever
+        # comparing tuples of electrode-name pairs when scores are equal.
+        # Only paid for when the sweep is actually enabled — negligible
+        # overhead either way (heap of size top_n, not the full candidate count).
+        top_n = cfg.optimizer.amplitude_sweep_top_n if cfg.optimizer.use_amplitude_sweep else 0
+        top_heap: list = []
+        _tiebreak = 0
 
         for i, (ep1, em1) in enumerate(valid_pairs):
             ef1_roi    = get_ef(lf_roi, ep1, em1)
@@ -1167,6 +1183,14 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                     best_ch1   = (ep1, em1)
                     best_ch2   = (ep2, em2)
 
+                if top_n > 0:
+                    _tiebreak += 1
+                    entry = (score, _tiebreak, (ep1, em1), (ep2, em2))
+                    if len(top_heap) < top_n:
+                        heapq.heappush(top_heap, entry)
+                    elif score > top_heap[0][0]:
+                        heapq.heapreplace(top_heap, entry)
+
         elapsed = time.time() - t_start
 
         used_fallback = hard_constraint and best_ch1 is None
@@ -1184,8 +1208,17 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         if hard_constraint:
             print(f"  Feasible montages (ROI >= {roi_min_threshold} V/m): {n_feasible}")
 
+        # Highest score first. Note: if used_fallback fired, top_candidates
+        # may be empty — nothing reached the scoring step at all when no
+        # montage cleared the ROI-floor threshold (the amplitude sweep
+        # falls back to a single-current evaluation of best_ch1/best_ch2 in
+        # that case; see STEP 3.5 below).
+        top_candidates = [{"ch1": c[2], "ch2": c[3], "score": c[0]}
+                          for c in sorted(top_heap, key=lambda c: c[0], reverse=True)]
+
         return {
             "best_ch1": best_ch1, "best_ch2": best_ch2, "best_score": best_score,
+            "top_candidates": top_candidates,
             "n_feasible": n_feasible, "n_eval": n_eval, "elapsed": elapsed,
             "n_valid_pairs": n_valid, "n_combos": n_combos, "used_fallback": used_fallback,
         }
@@ -1194,7 +1227,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     history = None
     if cfg.optimizer.use_hierarchical_search:
         n_total  = len(all_elec_names)
-        coarse_k = max(round(0.5 * n_total), min(n_total, 32))
+        # coarse_k = max(round(0.5 * n_total), min(n_total, 32))
+        coarse_k =  min(n_total, 32) #take all the electrodes up to 32, then start sampling
         missing  = [nm for nm in all_elec_names if nm not in _cap_pos]
         if missing:
             abort(f"Hierarchical search needs electrode positions for every cap "
@@ -1216,7 +1250,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         round_result = _search(coarse_names)
         history = [{"round": "coarse", "n_electrodes": len(coarse_names),
                     "montage": _montage_dict(round_result["best_ch1"], round_result["best_ch2"]),
-                    **{k: v for k, v in round_result.items() if k not in ("best_ch1", "best_ch2")}}]
+                    **{k: v for k, v in round_result.items()
+                       if k not in ("best_ch1", "best_ch2", "top_candidates")}}]
 
         candidate_set = set(coarse_names)
         for it in range(n_fine):
@@ -1248,7 +1283,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
                              "montage": _montage_dict(new_result["best_ch1"], new_result["best_ch2"]),
                              "improvement_vs_prev_round": improvement,
-                             **{k: v for k, v in new_result.items() if k not in ("best_ch1", "best_ch2")}})
+                             **{k: v for k, v in new_result.items()
+                                if k not in ("best_ch1", "best_ch2", "top_candidates")}})
 
             round_result = new_result
             print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
@@ -1267,17 +1303,151 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     elapsed    = sum(h["elapsed"] for h in history) if history else final["elapsed"]
     n_feasible = sum(h["n_feasible"] for h in history) if history else final["n_feasible"]
 
-    print(f"\n  ══ Best montage ══")
+    print(f"\n  ══ Best montage (electrode locations) ══")
     print(f"  Ch1: {best_ch1[0]}+ / {best_ch1[1]}-  @ {cfg.electrode.current_mA} mA")
     print(f"  Ch2: {best_ch2[0]}+ / {best_ch2[1]}-  @ {cfg.electrode.current_mA} mA")
     print(f"  Score ({score_label}): {best_score:.4f}")
 
     # ════════════════════════════════════════════════════════════════════════
+    # STEP 3.5 — Amplitude sweep (opt-in)
+    # ════════════════════════════════════════════════════════════════════════
+    # Takes the location search's top-N montages and sweeps per-channel
+    # current amplitude over a small grid, re-scoring every surviving
+    # (montage, I_ch1, I_ch2) combination with a normalized, weighted
+    # composite of 4 metrics (ROC distance, ROI mean, non-ROI mean,
+    # focality ratio). Cheap — get_ef()'s current override just rescales the
+    # already-cached leadfield-derived field, no new FEM/leadfield lookup.
+    ch1_current_mA = cfg.electrode.current_mA
+    ch2_current_mA = cfg.electrode.current_mA
+    sweep_pool  = None   # full ranked candidate list, for results.json reporting
+    sweep_stats = None
+
+    if cfg.optimizer.use_amplitude_sweep:
+        if not use_focality:
+            print("\n  WARNING: use_amplitude_sweep is set but goal != 'focality' "
+                  "(no non-ROI/ROC to sweep against) — skipping amplitude sweep.")
+        else:
+            top_candidates = final.get("top_candidates") or []
+            if not top_candidates:
+                print("\n  WARNING: no top-N candidates recorded for the amplitude "
+                      "sweep (likely because the hard-constraint fallback fired, so "
+                      "nothing reached the scoring step) — skipping amplitude sweep.")
+            else:
+                print(f"\n  ══════════════════════════════════════════════════════")
+                print(f"  Amplitude sweep — {len(top_candidates)} montage(s)")
+                print(f"  ══════════════════════════════════════════════════════")
+                amps_mA = np.round(np.arange(
+                    cfg.optimizer.amplitude_sweep_min_mA,
+                    cfg.optimizer.amplitude_sweep_max_mA + 1e-9,
+                    cfg.optimizer.amplitude_sweep_step_mA), 6)
+                amps_mA = amps_mA[amps_mA <= cfg.optimizer.amplitude_sweep_max_per_pair_mA + 1e-9]
+                max_total_mA = cfg.electrode.max_total_current
+                print(f"  Current grid: {list(amps_mA)} mA  |  per-pair cap "
+                      f"{cfg.optimizer.amplitude_sweep_max_per_pair_mA} mA  |  "
+                      f"total cap {max_total_mA} mA")
+
+                _sweep_t0 = time.time()
+                pool = []   # every constraint-surviving (montage, I1, I2) combo, raw metrics
+                for cand in top_candidates:
+                    ep1, em1 = cand["ch1"]
+                    ep2, em2 = cand["ch2"]
+                    for I1_mA in amps_mA:
+                        I1_A = float(I1_mA) * 1e-3
+                        ef1_roi_i   = get_ef(lf_roi, ep1, em1, I1_A)
+                        ef1_nr_i    = get_ef(lf_non_roi, ep1, em1, I1_A)
+                        ef1_rgrps_i = [get_ef(cg['lf'], ep1, em1, I1_A) for cg in roi_constraint_groups]
+                        ef1_cgrps_i = [get_ef(cg['lf'], ep1, em1, I1_A) for cg in nr_constraint_groups]
+
+                        for I2_mA in amps_mA:
+                            if I1_mA + I2_mA > max_total_mA + 1e-9:
+                                continue
+                            I2_A = float(I2_mA) * 1e-3
+
+                            ef2_roi_i = get_ef(lf_roi, ep2, em2, I2_A)
+                            ti_roi_i  = TI.get_maxTI(ef1_roi_i, ef2_roi_i)
+                            roi_mean_i = float(np.mean(ti_roi_i))
+                            if hard_constraint and roi_mean_i < roi_min_threshold:
+                                continue
+
+                            ef2_nr_i = get_ef(lf_non_roi, ep2, em2, I2_A)
+                            ti_nr_i  = TI.get_maxTI(ef1_nr_i, ef2_nr_i)
+                            nonroi_mean_i = float(np.mean(ti_nr_i))
+
+                            # Same hard constraints the location search enforces
+                            violated = False
+                            for cg, ef1_cg in zip(nr_constraint_groups, ef1_cgrps_i):
+                                ef2_cg = get_ef(cg['lf'], ep2, em2, I2_A)
+                                if float(np.mean(TI.get_maxTI(ef1_cg, ef2_cg))) > cg['max_mean']:
+                                    violated = True
+                                    break
+                            if not violated:
+                                for cg, ef1_cg in zip(roi_constraint_groups, ef1_rgrps_i):
+                                    ef2_cg = get_ef(cg['lf'], ep2, em2, I2_A)
+                                    if float(np.mean(TI.get_maxTI(ef1_cg, ef2_cg))) < cg['min_mean']:
+                                        violated = True
+                                        break
+                            if violated:
+                                continue
+
+                            roc_dist = float(ROC(ti_roi_i, ti_nr_i, cfg.optimizer.focality_threshold, focal=True))
+                            focality_ratio = roi_mean_i / nonroi_mean_i if nonroi_mean_i > 0 else float("inf")
+
+                            pool.append({
+                                "ch1": (ep1, em1), "ch2": (ep2, em2),
+                                "I1_mA": float(I1_mA), "I2_mA": float(I2_mA),
+                                "roc_dist": roc_dist, "roi_mean": roi_mean_i,
+                                "non_roi_mean": nonroi_mean_i, "focality_ratio": float(focality_ratio),
+                            })
+                _sweep_elapsed = time.time() - _sweep_t0
+                sweep_stats = {"n_montages": len(top_candidates), "grid_size_mA": len(amps_mA),
+                              "n_combinations_evaluated": len(top_candidates) * len(amps_mA) * len(amps_mA),
+                              "n_surviving": len(pool), "elapsed_s": round(_sweep_elapsed, 2)}
+                print(f"  Evaluated in {_sweep_elapsed:.1f}s — {len(pool)} combination(s) "
+                      f"satisfied every hard constraint")
+
+                if not pool:
+                    print("  WARNING: no (montage, current) combination in the sweep "
+                          "satisfied every hard constraint — keeping the location "
+                          f"search's original pick at {cfg.electrode.current_mA} mA per channel.")
+                else:
+                    def _minmax_norm(vals, invert):
+                        lo, hi = min(vals), max(vals)
+                        if hi - lo < 1e-12:
+                            return [1.0] * len(vals)   # degenerate (all tied) — don't let it dominate
+                        return [(1.0 - (v - lo) / (hi - lo)) if invert else ((v - lo) / (hi - lo))
+                                for v in vals]
+
+                    roc_n    = _minmax_norm([c["roc_dist"] for c in pool], invert=True)
+                    roi_n    = _minmax_norm([c["roi_mean"] for c in pool], invert=False)
+                    nonroi_n = _minmax_norm([c["non_roi_mean"] for c in pool], invert=True)
+                    focal_n  = _minmax_norm([c["focality_ratio"] for c in pool], invert=False)
+
+                    w = cfg.optimizer.amplitude_sweep_weights
+                    for c, rn, rin, nn, fn in zip(pool, roc_n, roi_n, nonroi_n, focal_n):
+                        c["composite_score"] = (w["roc"] * rn + w["roi_mean"] * rin +
+                                                w["non_roi_mean"] * nn + w["focality_ratio"] * fn)
+
+                    pool.sort(key=lambda c: c["composite_score"], reverse=True)
+                    winner = pool[0]
+                    best_ch1, best_ch2 = winner["ch1"], winner["ch2"]
+                    ch1_current_mA, ch2_current_mA = winner["I1_mA"], winner["I2_mA"]
+                    best_score = -winner["roc_dist"]   # keep "higher = better" convention used elsewhere
+                    sweep_pool = pool
+
+                    print(f"\n  ══ Best montage (after amplitude sweep) ══")
+                    print(f"  Ch1: {best_ch1[0]}+ / {best_ch1[1]}-  @ {ch1_current_mA:.2f} mA")
+                    print(f"  Ch2: {best_ch2[0]}+ / {best_ch2[1]}-  @ {ch2_current_mA:.2f} mA")
+                    print(f"  Composite score: {winner['composite_score']:.4f}  "
+                          f"(from {len(pool)} surviving combinations)")
+
+    # ════════════════════════════════════════════════════════════════════════
     # STEP 4 — Save the best TI field on the full head mesh
     # ════════════════════════════════════════════════════════════════════════
-    # Recompute best TI field on ALL mesh elements (not just ROI) for visualization
-    ef1_full = TI.get_field([best_ch1[0], best_ch1[1], current_A], leadfield, idx_lf)
-    ef2_full = TI.get_field([best_ch2[0], best_ch2[1], current_A], leadfield, idx_lf)
+    # Recompute best TI field on ALL mesh elements (not just ROI) for
+    # visualization — per-channel currents (identical unless the amplitude
+    # sweep above changed them).
+    ef1_full = TI.get_field([best_ch1[0], best_ch1[1], ch1_current_mA * 1e-3], leadfield, idx_lf)
+    ef2_full = TI.get_field([best_ch2[0], best_ch2[1], ch2_current_mA * 1e-3], leadfield, idx_lf)
     ti_full  = TI.get_maxTI(ef1_full, ef2_full)   # (M,) TI amplitude at every element
 
     # Attach TI field to the mesh and save — same filename as TesFlexOptimization
@@ -1306,10 +1476,39 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             "ch1_minus":   best_ch1[1],
             "ch2_plus":    best_ch2[0],
             "ch2_minus":   best_ch2[1],
-            "current_mA":  cfg.electrode.current_mA,
+            # current_mA kept for backward compatibility with consumers that
+            # assume one shared current (e.g. compare_montages.ipynb) — always
+            # the configured base current, regardless of the sweep. The
+            # authoritative per-channel values (possibly DIFFERENT from each
+            # other and from current_mA when the amplitude sweep changed them)
+            # are ch1_current_mA/ch2_current_mA — consumers that care about
+            # per-channel current should switch to those.
+            "current_mA":      cfg.electrode.current_mA,
+            "ch1_current_mA":  ch1_current_mA,
+            "ch2_current_mA":  ch2_current_mA,
         },
         "roi_TI_mean_V_m": round(roi_mean_V_m, 6),
     }
+    if cfg.optimizer.use_amplitude_sweep:
+        results["amplitude_sweep"] = {
+            "enabled": True,
+            "applied": sweep_pool is not None,   # False if skipped/no survivors — see WARNING prints above
+            "stats": sweep_stats,
+            "weights": cfg.optimizer.amplitude_sweep_weights,
+            # Top 10 ranked candidates only — the full pool (montages x grid)
+            # can be large and isn't needed for a human to sanity-check the
+            # ranking; re-run with the same config to regenerate the full set.
+            "top_ranked": [
+                {"ch1_plus": c["ch1"][0], "ch1_minus": c["ch1"][1],
+                 "ch2_plus": c["ch2"][0], "ch2_minus": c["ch2"][1],
+                 "I1_mA": c["I1_mA"], "I2_mA": c["I2_mA"],
+                 "roc_dist": round(c["roc_dist"], 6), "roi_mean_V_m": round(c["roi_mean"], 6),
+                 "non_roi_mean_V_m": round(c["non_roi_mean"], 6),
+                 "focality_ratio": round(c["focality_ratio"], 6),
+                 "composite_score": round(c["composite_score"], 6)}
+                for c in (sweep_pool[:10] if sweep_pool else [])
+            ],
+        }
     # Actual achieved value (plain per-element mean, same statistic the
     # search enforces) for every subgroup constraint, for the WINNING
     # montage specifically — not just each group's configured bound. Without

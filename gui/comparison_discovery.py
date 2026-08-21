@@ -13,6 +13,7 @@ concern, not a data-layer one.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -74,6 +75,48 @@ def list_existing_names(subject_ids: list[str], project_dir: str = PROJECT_DIR) 
     return out
 
 
+def list_exhaustive_runs(subject_id: str, project_dir: str = PROJECT_DIR) -> list[dict]:
+    """{"run_dir", "path"} for every sub-{id}/TIoptimization/*/ folder that
+    has a finished exhaustive_results.json — for the Comparison page's "fill
+    row from optimization result" picker. A subject can have several runs
+    (different ROI, different search settings, reruns), so this deliberately
+    doesn't guess which one — it lists every one that actually finished, run
+    folder names first (newest run-{timestamp} suffix sorts first)."""
+    ti_dir = os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "TIoptimization")
+    if not os.path.isdir(ti_dir):
+        return []
+    out = []
+    for name in sorted(os.listdir(ti_dir), reverse=True):
+        result_path = os.path.join(ti_dir, name, "exhaustive_results.json")
+        if os.path.isfile(result_path):
+            out.append({"run_dir": name, "path": result_path})
+    return out
+
+
+def load_best_montage(result_path: str) -> dict | None:
+    """{"ch1_plus", "ch1_minus", "ch1_current_mA", "ch2_plus", "ch2_minus",
+    "ch2_current_mA"} from an exhaustive_results.json's top-level
+    best_montage — None if the file's missing/unreadable or has no
+    best_montage. Falls back to the shared "current_mA" key for either
+    channel's current when the newer per-channel keys aren't present
+    (older result files)."""
+    try:
+        with open(result_path) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    best = data.get("best_montage")
+    if not best:
+        return None
+    shared = best.get("current_mA")
+    return {
+        "ch1_plus": best.get("ch1_plus", ""), "ch1_minus": best.get("ch1_minus", ""),
+        "ch1_current_mA": best.get("ch1_current_mA", shared),
+        "ch2_plus": best.get("ch2_plus", ""), "ch2_minus": best.get("ch2_minus", ""),
+        "ch2_current_mA": best.get("ch2_current_mA", shared),
+    }
+
+
 def _resolve_oneoff_electrode(subject_id: str, cap_name: str | None, value, project_dir: str = PROJECT_DIR):
     """value: either an electrode name (resolved against cap_name's
     registered positions) or a raw 'x, y, z' string. Returns (coord, error)."""
@@ -100,6 +143,23 @@ def _resolve_oneoff_electrode(subject_id: str, cap_name: str | None, value, proj
     return elec["coords"][idx].tolist(), None
 
 
+def resolve_extra_region_masks(subject_id: str, region_labels: list[str] | None,
+                               project_dir: str = PROJECT_DIR) -> dict[str, str]:
+    """{region_label: mask_path} for whichever of the given labels actually
+    resolve to a real mask file for this subject — a label that doesn't
+    (mask never generated for this particular subject) is silently dropped
+    rather than failing the row, since "extra regions" is meant as an
+    opportunistic bonus stat, not a hard requirement like the main ROI."""
+    if not region_labels:
+        return {}
+    out = {}
+    for region_label in region_labels:
+        mask_path = resolve_mask(subject_id, region_label, project_dir)
+        if mask_path:
+            out[region_label] = mask_path
+    return out
+
+
 def run_leadfield_row(
     subject_id: str, cap_name: str, roi_label: str, non_roi_label: str | None,
     ch1_plus: str, ch1_minus: str, ch1_current_mA: float,
@@ -107,17 +167,23 @@ def run_leadfield_row(
     label: str, project_dir: str = PROJECT_DIR,
     electrode_shape: str | None = None, electrode_dimensions: list | None = None,
     electrode_gel_thickness: float | None = None,
+    extra_region_labels: list[str] | None = None,
 ) -> dict:
     """Runs synchronously (fast/algebraic) — call directly, no background job needed.
 
     electrode_shape/dimensions/gel_thickness: which cached leadfield variant
     to use for this cap (see fem_discovery.leadfield_status) — leave unset to
     get "any variant for this cap" (today's coarse behaviour, from before
-    per-settings variants existed)."""
+    per-settings variants existed).
+
+    extra_region_labels: additional mask labels to also report TI_mean/
+    TI_max for (see resolve_extra_region_masks) — a label with no mask for
+    this subject is dropped, not an error."""
     roi_mask = resolve_mask(subject_id, roi_label, project_dir)
     if not roi_mask:
         return {"success": False, "error": f"ROI mask not found for sub-{subject_id}, label '{roi_label}'"}
     non_roi_mask = resolve_mask(subject_id, non_roi_label, project_dir) if non_roi_label else None
+    extra_masks = resolve_extra_region_masks(subject_id, extra_region_labels, project_dir)
 
     status = fd.leadfield_status(subject_id, cap_name, project_dir,
                                  shape=electrode_shape, dimensions=electrode_dimensions,
@@ -132,6 +198,7 @@ def run_leadfield_row(
         ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=ch1_current_mA,
         ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=ch2_current_mA,
         electrode_dims=electrode_dimensions, label=label, project_dir=project_dir,
+        extra_mask_paths=extra_masks,
     )
 
 
@@ -140,14 +207,19 @@ def run_oneoff_row(
     ch1_plus: str, ch1_minus: str, ch1_current_mA: float,
     ch2_plus: str, ch2_minus: str, ch2_current_mA: float,
     label: str, project_dir: str = PROJECT_DIR,
+    extra_region_labels: list[str] | None = None,
 ) -> dict:
     """Real FEM solves — meant to run inside a background job (job_runner.py),
     not called directly from a Dash callback. Resolves each electrode cell
-    (name-via-cap or raw x,y,z) then delegates to fem_discovery.run_one_off_fem."""
+    (name-via-cap or raw x,y,z) then delegates to fem_discovery.run_one_off_fem.
+
+    extra_region_labels: see run_leadfield_row — same opportunistic,
+    drop-if-missing extra-stats mechanism."""
     roi_mask = resolve_mask(subject_id, roi_label, project_dir)
     if not roi_mask:
         return {"success": False, "error": f"ROI mask not found for sub-{subject_id}, label '{roi_label}'"}
     non_roi_mask = resolve_mask(subject_id, non_roi_label, project_dir) if non_roi_label else None
+    extra_masks = resolve_extra_region_masks(subject_id, extra_region_labels, project_dir)
 
     coords = {}
     for key, val in [("ch1_plus", ch1_plus), ("ch1_minus", ch1_minus),
@@ -161,5 +233,5 @@ def run_oneoff_row(
         subject_id=subject_id, roi_mask_path=roi_mask, non_roi_mask_path=non_roi_mask,
         ch1_plus_coord=coords["ch1_plus"], ch1_minus_coord=coords["ch1_minus"], ch1_current_mA=ch1_current_mA,
         ch2_plus_coord=coords["ch2_plus"], ch2_minus_coord=coords["ch2_minus"], ch2_current_mA=ch2_current_mA,
-        label=label, project_dir=project_dir,
+        label=label, project_dir=project_dir, extra_mask_paths=extra_masks,
     )

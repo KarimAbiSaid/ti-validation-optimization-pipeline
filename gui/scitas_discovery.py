@@ -38,9 +38,20 @@ LOCAL_PIPELINE_DIR = str(Path(__file__).resolve().parent.parent / "pipeline")
 
 # Files whose remote copy on SCITAS scratch actually gets executed there —
 # tracked so the GUI can show a "does this match what's on the cluster"
-# status before submitting a job. Syncing is a deliberate, explicit action
-# (sync_pipeline_code()) — never done silently as a side effect of
-# submitting a job, since it changes state on a shared resource.
+# status. Syncing an ARBITRARY tracked file is still a deliberate, explicit
+# action (sync_pipeline_code(), e.g. from the SCITAS Connection page) —
+# never done silently as a side effect of an unrelated action. The one
+# exception is required_pipeline_files() below: whichever of these files a
+# given job actually needs to run gets auto-synced immediately before
+# submission if stale (see ensure_pipeline_code_synced()) — a subject-set
+# of these 9, chosen deliberately and narrowly, not "sync everything on
+# every submit". This exists because these files went missing from SCITAS
+# scratch mid-project (cause unknown, likely cleaned up alongside unrelated
+# work happening directly on the cluster) with no local signal that
+# anything was wrong until a job failed with a confusing remote import
+# error — self-healing this narrow, well-understood case is worth the
+# small "ask before touching SCITAS" exception; syncing an unrelated file
+# nobody asked about would not be.
 TRACKED_PIPELINE_FILES = [
     "config.py",
     "run_pipeline.py",
@@ -52,6 +63,66 @@ TRACKED_PIPELINE_FILES = [
     "simnibs_ti_pipeline.sbatch",
     "recon_all_scitas.sbatch",
 ]
+
+# Of TRACKED_PIPELINE_FILES, the ones actually imported/executed by a
+# simnibs_ti_pipeline.sbatch job (run_pipeline_on_scitas()/batch_submit())
+# — never generate_configs.py/register_caps.py/compare_ti_montages.py,
+# which are local-only CLI tools run by a developer's own shell, never
+# imported by run_pipeline.py or any .sbatch script. Also NOT
+# charm_scitas.sbatch/recon_all_scitas.sbatch despite run_charm/
+# run_recon_all being flags on this same config: run_pipeline.py's own
+# Section 0 (run_charm()/run_recon_all() in run_pipeline.py) calls the
+# `charm`/`recon-all` CLI binaries directly — it never shells out to those
+# separate standalone .sbatch scripts. Those two are each their own,
+# independent submission (charm_scitas.sbatch via the Head Modeling page's
+# own run_charm_on_scitas() in charm_discovery.py, which computes its own
+# required-files list; recon_all_scitas.sbatch via the manual
+# submit_recon_all_scitas.sh CLI script only, not currently reachable from
+# the GUI at all). Traced by hand from simnibs_ti_pipeline.sbatch's own
+# apptainer exec call and run_pipeline.py's imports.
+_ALWAYS_REQUIRED_FILES = ("simnibs_ti_pipeline.sbatch", "run_pipeline.py", "config.py")
+_FLAG_REQUIRED_FILES = {
+    "run_roi_masks": "create_masks.py",   # imported inside create_roi_masks() (Section 1)
+}
+
+
+def required_pipeline_files(flags: dict) -> list[str]:
+    """Which TRACKED_PIPELINE_FILES a simnibs_ti_pipeline.sbatch job (see
+    run_pipeline_on_scitas()/batch_submit()) with this config's flags
+    actually needs present and up to date on SCITAS to run successfully.
+    Only for THAT submission path — charm's own SCITAS submission
+    (charm_discovery.py) needs a different, much shorter list; see this
+    function's module-level comment above for why."""
+    files = list(_ALWAYS_REQUIRED_FILES)
+    for flag, fname in _FLAG_REQUIRED_FILES.items():
+        if flags.get(flag):
+            files.append(fname)
+    return files
+
+
+def ensure_pipeline_code_synced(filenames: list[str]) -> dict:
+    """Checks exactly the given pipeline files and re-uploads any that are
+    stale or missing on SCITAS — self-healing the narrow case where one of
+    these files has gone missing/out of date on the cluster, before it
+    turns into a confusing remote import error partway through a submitted
+    job instead of a clear local one now. Cheap when everything's already
+    in sync (just a handful of remote hash checks); only actually
+    re-uploads what's stale. Callers pass exactly the files THEIR
+    submission path needs (see required_pipeline_files() for
+    simnibs_ti_pipeline.sbatch jobs; charm's own submission needs just
+    ["charm_scitas.sbatch"]). Returns {"synced": [filenames actually re-uploaded],
+    "error": str | None}."""
+    status = code_sync_status(filenames=filenames)
+    stale = [f for f, s in status.items() if not s["in_sync"]]
+    if not stale:
+        return {"synced": [], "error": None}
+
+    result = sync_pipeline_code(filenames=stale)
+    failed = {f: r["error"] for f, r in result.items() if not r["success"]}
+    if failed:
+        return {"synced": [f for f in stale if f not in failed],
+                "error": f"failed to sync: {failed}"}
+    return {"synced": stale, "error": None}
 
 _SSH_TIMEOUT = 30       # a single ssh command (submit, squeue, sacct, test -e) should be fast
 POLL_INTERVAL_S = 30    # how often wait_for_job() checks squeue/sacct while blocking
@@ -148,29 +219,59 @@ def scitas_pipeline_dir() -> str:
     return f"{scitas_scratch_dir()}/code/pipeline"
 
 
+_SSH_RETRY_ATTEMPTS = 3
+_SSH_RETRY_DELAY_S = 2
+
+
+def _run_subprocess_with_retry(cmd: list[str], timeout: int, label: str) -> dict:
+    """subprocess.run(cmd), retrying up to _SSH_RETRY_ATTEMPTS times (with a
+    short delay between attempts) if it fails. SCITAS/network connectivity
+    has shown real transient flakiness live — "Connection closed" mid-
+    transfer, connection timeouts — that a single retry a few seconds later
+    resolves; without this, one blip fails an entire job submission and
+    requires the user to notice and manually retry themselves. A genuine,
+    deterministic failure (e.g. a local file that doesn't exist) just fails
+    the same way on every attempt, costing a few extra seconds before
+    returning the same error — an acceptable trade-off for automatically
+    recovering from the transient case. Deliberately NOT connection
+    multiplexing (ControlMaster) — that was tried and reverted earlier:
+    it introduced its own Windows/Cygwin-specific socket bugs worse than
+    the problem it solved. This is just "try again," nothing stateful."""
+    result = None
+    for attempt in range(_SSH_RETRY_ATTEMPTS):
+        try:
+            # encoding/errors explicit: remote output isn't guaranteed to be
+            # decodable as Windows' default cp1252 (subprocess's own internal
+            # stdout-reader thread crashes with UnicodeDecodeError otherwise —
+            # seen live from real SCITAS output during testing).
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                  encoding="utf-8", errors="replace")
+            result = {"success": proc.returncode == 0, "returncode": proc.returncode,
+                     "stdout": proc.stdout, "stderr": proc.stderr}
+        except subprocess.TimeoutExpired:
+            result = {"success": False, "returncode": None, "stdout": "",
+                     "stderr": f"{label} timed out after {timeout}s"}
+        except Exception as e:
+            result = {"success": False, "returncode": None, "stdout": "", "stderr": str(e)}
+
+        if result["success"] or attempt == _SSH_RETRY_ATTEMPTS - 1:
+            return result
+        time.sleep(_SSH_RETRY_DELAY_S)
+    return result
+
+
 def ssh_run(remote_command: str, timeout: int = _SSH_TIMEOUT) -> dict:
     """Runs remote_command on SCITAS via `ssh <host> <command>` (BatchMode=
     yes — fail fast instead of hanging if key auth doesn't work, since this
     may run inside a background thread with no TTY to prompt on). Host/user/
     identity file come from load_settings() — defaults to jed.hpc.epfl.ch
-    resolved via ~/.ssh/config unless overridden. Returns {"success",
-    "returncode", "stdout", "stderr"}."""
+    resolved via ~/.ssh/config unless overridden. Retries transient failures
+    — see _run_subprocess_with_retry(). Returns {"success", "returncode",
+    "stdout", "stderr"}."""
     extra_args, host = _ssh_target()
     cmd = (["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={min(timeout, 15)}"]
           + extra_args + [host, remote_command])
-    try:
-        # encoding/errors explicit: remote output isn't guaranteed to be
-        # decodable as Windows' default cp1252 (subprocess's own internal
-        # stdout-reader thread crashes with UnicodeDecodeError otherwise —
-        # seen live from real SCITAS output during testing).
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              encoding="utf-8", errors="replace")
-    except subprocess.TimeoutExpired:
-        return {"success": False, "returncode": None, "stdout": "", "stderr": f"ssh timed out after {timeout}s"}
-    except Exception as e:
-        return {"success": False, "returncode": None, "stdout": "", "stderr": str(e)}
-    return {"success": proc.returncode == 0, "returncode": proc.returncode,
-            "stdout": proc.stdout, "stderr": proc.stderr}
+    return _run_subprocess_with_retry(cmd, timeout, "ssh")
 
 
 def _scp_host_spec() -> str:
@@ -184,15 +285,7 @@ def _scp(args: list[str], timeout: int) -> dict:
     identity_file = load_settings()["identity_file"]
     identity_args = ["-i", identity_file] if identity_file else []
     cmd = ["scp", "-o", "BatchMode=yes"] + identity_args + args
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              encoding="utf-8", errors="replace")
-    except subprocess.TimeoutExpired:
-        return {"success": False, "returncode": None, "stdout": "", "stderr": f"scp timed out after {timeout}s"}
-    except Exception as e:
-        return {"success": False, "returncode": None, "stdout": "", "stderr": str(e)}
-    return {"success": proc.returncode == 0, "returncode": proc.returncode,
-            "stdout": proc.stdout, "stderr": proc.stderr}
+    return _run_subprocess_with_retry(cmd, timeout, "scp")
 
 
 def scp_upload(local_path: str, remote_path: str, recursive: bool = True, timeout: int = 900) -> dict:
@@ -258,8 +351,22 @@ def batch_upload(local_root: str, relpaths: list[str], timeout: int = 900) -> di
 
 
 def remote_path_exists(remote_path: str) -> bool:
+    """True/False for whether remote_path exists on SCITAS. Raises
+    RuntimeError if the check itself couldn't be performed (ssh_run failed
+    even after its own retries — see _run_subprocess_with_retry). This is
+    deliberately NOT the same as returning False: seen live, a connection
+    blip made this silently report "missing" for a file confirmed present
+    (a plain `ls` on the cluster showed it right there), which then
+    triggered a needless — and, since the connection was still having
+    trouble, ALSO failing — re-upload attempt instead of a clear error
+    about the check itself. Callers should catch this per-item (one
+    subject/file's connection hiccup shouldn't abort an entire batch) —
+    see batch_submit_charm()/batch_submit() for the pattern."""
     result = ssh_run(f"test -e {shlex.quote(remote_path)} && echo YES || echo NO")
-    return result["success"] and "YES" in (result["stdout"] or "")
+    if not result["success"]:
+        raise RuntimeError(f"couldn't check whether {remote_path} exists on SCITAS "
+                          f"(connection issue): {result['stderr']}")
+    return "YES" in (result["stdout"] or "")
 
 
 def remote_mkdir(remote_path: str) -> dict:
@@ -302,7 +409,13 @@ def remote_paths_exist(paths: list[str]) -> dict[str, bool]:
     subjects' m2m_ folders + the shared BNA atlas, checked together before
     submitting several SCITAS jobs at once). Each path is base64-encoded on
     the way in and decoded remotely so spaces or other special characters
-    in a path can't break the loop's word-splitting."""
+    in a path can't break the loop's word-splitting.
+
+    Raises RuntimeError if the check itself couldn't be performed (ssh_run
+    failed even after its own retries) — same reasoning as
+    remote_path_exists(): a failed connection check must not be reported as
+    "these paths don't exist", since that silently triggers needless (and
+    likely also-failing) re-uploads for every path in the batch at once."""
     if not paths:
         return {}
     import base64
@@ -310,17 +423,18 @@ def remote_paths_exist(paths: list[str]) -> dict[str, bool]:
     script = (f'for enc in {encoded}; do p=$(echo "$enc" | base64 -d); '
              f'if [ -e "$p" ]; then echo "$enc Y"; else echo "$enc N"; fi; done')
     result = ssh_run(script, timeout=60)
+    if not result["success"]:
+        raise RuntimeError(f"couldn't check remote paths on SCITAS (connection issue): {result['stderr']}")
     out = {p: False for p in paths}
-    if result["success"]:
-        for line in (result["stdout"] or "").splitlines():
-            parts = line.split()
-            if len(parts) == 2:
-                try:
-                    p = base64.b64decode(parts[0]).decode()
-                except Exception:
-                    continue
-                if p in out:
-                    out[p] = (parts[1] == "Y")
+    for line in (result["stdout"] or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            try:
+                p = base64.b64decode(parts[0]).decode()
+            except Exception:
+                continue
+            if p in out:
+                out[p] = (parts[1] == "Y")
     return out
 
 
@@ -413,25 +527,19 @@ def wait_for_job(job_id: str, poll_interval: int = POLL_INTERVAL_S, max_wait_s: 
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_connection(timeout: int = 10) -> dict:
-    """Read-only. {"success", "host", "username", "error"}."""
+    """Read-only. {"success", "host", "username", "error"}. Retries
+    transient failures — see _run_subprocess_with_retry()."""
     extra_args, host = _ssh_target()
     cmd = (["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}"]
           + extra_args + [host, "echo CONNECTION_OK && echo USER=$USER"])
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5,
-                              encoding="utf-8", errors="replace")
-    except subprocess.TimeoutExpired:
-        return {"success": False, "host": host, "username": None,
-                "error": f"connection timed out after {timeout}s"}
-    except Exception as e:
-        return {"success": False, "host": host, "username": None, "error": str(e)}
+    result = _run_subprocess_with_retry(cmd, timeout + 5, "ssh")
 
-    if proc.returncode != 0 or "CONNECTION_OK" not in (proc.stdout or ""):
-        err = (proc.stderr or proc.stdout or "unknown error").strip()
+    if not result["success"] or "CONNECTION_OK" not in (result["stdout"] or ""):
+        err = (result["stderr"] or result["stdout"] or "unknown error").strip()
         return {"success": False, "host": host, "username": None, "error": err}
 
     username = None
-    for line in proc.stdout.splitlines():
+    for line in result["stdout"].splitlines():
         if line.startswith("USER="):
             username = line[len("USER="):]
     return {"success": True, "host": host, "username": username, "error": None}

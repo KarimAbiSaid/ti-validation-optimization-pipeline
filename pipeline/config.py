@@ -187,6 +187,47 @@ class OptimizerConfig:
     # (further rounds would just repeat the same search).
     early_stop_threshold: float = 0.03
 
+    # ── Amplitude sweep (opt-in) ─────────────────────────────────────────
+    # After the electrode-location search (flat or hierarchical) finishes,
+    # take its top N montages and sweep per-channel current amplitudes over
+    # a small grid, re-scoring every (montage, I_ch1, I_ch2) combination
+    # with a weighted, normalized multi-criteria score. Cheap to run — TI
+    # fields scale linearly with current (E(I) = I * E(1A)), so each
+    # combination is a re-scale + get_maxTI() + mean/ROC pass, not a new
+    # FEM/leadfield lookup.
+    use_amplitude_sweep: bool = False
+
+    # How many of the location-search's best montages to carry into the sweep.
+    amplitude_sweep_top_n: int = 5
+
+    # Per-channel current sweep range (mA) — both channels swept
+    # independently over this same range, so N grid values -> N x N
+    # combinations per montage.
+    amplitude_sweep_min_mA:  float = 1.8
+    amplitude_sweep_max_mA:  float = 2.0
+    amplitude_sweep_step_mA: float = 0.02
+
+    # Hard ceiling on ANY single channel's current (mA) — independent of the
+    # sweep range above (defensive: still enforced even if min/max_mA were
+    # misconfigured) and independent of electrode.max_total_current (the
+    # combined ch1+ch2 ceiling, already existed) — both are enforced. With
+    # the defaults (2.0 per pair, 4.0 total from ElectrodeConfig), the total
+    # ceiling never actually binds (2.0+2.0=4.0), so only the per-pair
+    # ceiling matters unless max_total_current is later lowered.
+    amplitude_sweep_max_per_pair_mA: float = 2.0
+
+    # Composite ranking weights (should sum to 1.0) across 4 metrics, each
+    # min-max normalized to [0,1] across only the hard-constraint-surviving
+    # candidate pool (montage x current-grid combos that got rejected never
+    # enter the normalization bounds) — roc (ROC() distance, inverted so
+    # higher=better), roi_mean, non_roi_mean (inverted), and focality_ratio
+    # (roi_mean / non_roi_mean). ROC dominates by design — it already
+    # reflects how many ROI/non-ROI elements satisfy the configured
+    # thresholds; the other three add robustness/tie-breaking on top.
+    amplitude_sweep_weights: dict = field(default_factory=lambda: {
+        "roc": 0.7, "roi_mean": 0.1, "non_roi_mean": 0.1, "focality_ratio": 0.1,
+    })
+
 
 @dataclass
 class SimulationConfig:

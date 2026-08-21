@@ -158,6 +158,7 @@ def compute_ti(
     ch2_plus: str, ch2_minus: str, ch2_current_mA: float,
     electrode_dims: list[float] | None = None, label: str = "setup",
     output_dir: str | None = None, project_dir: str = PROJECT_DIR,
+    extra_mask_paths: dict[str, str] | None = None,
 ) -> dict:
     """Returns {"success", "error"} or, on success, {"success": True, "label",
     "montage", "stats", "msh_path", "npz_path", "json_path"}.
@@ -167,13 +168,20 @@ def compute_ti(
     combination. Now identical to compute_ti_custom_leadfield() (both take an
     explicit path); kept as a separate name since callers already spell it
     this way, and "custom" no longer means anything different once every
-    leadfield lookup resolves to an explicit path first."""
+    leadfield lookup resolves to an explicit path first.
+
+    extra_mask_paths: {region_label: mask_path} — additional masks to also
+    report TI_mean/TI_max for in "stats" (as "TI_mean_{label}_V_m" /
+    "TI_max_{label}_V_m"), alongside the primary ROI/non-ROI. See
+    compute_ti_custom_leadfield() for how these are computed without a
+    second field solve."""
     return compute_ti_custom_leadfield(
         subject_id=subject_id, hdf5_path=hdf5_path, roi_mask_path=roi_mask_path,
         non_roi_mask_path=non_roi_mask_path,
         ch1_plus=ch1_plus, ch1_minus=ch1_minus, ch1_current_mA=ch1_current_mA,
         ch2_plus=ch2_plus, ch2_minus=ch2_minus, ch2_current_mA=ch2_current_mA,
         electrode_dims=electrode_dims, label=label, output_dir=output_dir, project_dir=project_dir,
+        extra_mask_paths=extra_mask_paths,
     )
 
 
@@ -232,10 +240,18 @@ def compute_ti_custom_leadfield(
     ch2_plus: str, ch2_minus: str, ch2_current_mA: float,
     electrode_dims: list[float] | None = None, label: str = "setup",
     output_dir: str | None = None, project_dir: str = PROJECT_DIR,
+    extra_mask_paths: dict[str, str] | None = None,
 ) -> dict:
     """Same as compute_ti(), but for a leadfield living outside the standard
     leadfield_volume/ location (an explicit hdf5_path rather than a
-    subject+cap_name lookup)."""
+    subject+cap_name lookup).
+
+    extra_mask_paths: {region_label: mask_path} — stats for these are
+    computed from the SAME already-solved field (compute_ti_setup's raw
+    "ti" array + the resources already loaded above), not a second field
+    solve, so this is cheap to add. A path that's missing/unreadable is
+    skipped for that region rather than failing the whole row — the primary
+    ROI/non-ROI result is unaffected either way."""
     if not os.path.isfile(hdf5_path):
         return {"success": False, "error": f"leadfield not found: {hdf5_path}"}
 
@@ -267,11 +283,37 @@ def compute_ti_custom_leadfield(
     except Exception as e:
         return {"success": False, "error": str(e)}
 
+    stats = dict(result["stats"])
+    if extra_mask_paths:
+        stats.update(_extra_region_stats(result["ti"], resources.centroids, resources.elm_volumes,
+                                         extra_mask_paths))
+
     return {
         "success": True, "label": result["label"], "montage": result["montage"],
-        "stats": result["stats"], "msh_path": result["msh_path"],
+        "stats": stats, "msh_path": result["msh_path"],
         "npz_path": result["npz_path"], "json_path": result["json_path"],
     }
+
+
+def _extra_region_stats(ti, centroids, elm_volumes, extra_mask_paths: dict[str, str]) -> dict:
+    """{"TI_mean_{label}_V_m", "TI_max_{label}_V_m"} for every extra region
+    whose mask file exists — same volume-weighted 99th-percentile-capped
+    mean as the pipeline's own ROI/non-ROI stats (compare_ti_montages.
+    _vol_mean_capped), computed against an already-solved field so no
+    second FEM/leadfield solve is needed. A missing/unreadable mask is
+    silently skipped for that one region."""
+    from compare_ti_montages import _mask_to_elements, _vol_mean_capped
+
+    out = {}
+    for region_label, mask_path in extra_mask_paths.items():
+        if not mask_path or not os.path.isfile(mask_path):
+            continue
+        mask = _mask_to_elements(mask_path, centroids)
+        if not mask.any():
+            continue
+        out[f"TI_mean_{region_label}_V_m"] = _vol_mean_capped(ti[mask], elm_volumes[mask])
+        out[f"TI_max_{region_label}_V_m"] = float(ti[mask].max())
+    return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -457,10 +499,16 @@ def run_manual_fem_channel(
 
 
 def compute_ti_from_fem_meshes(msh1_path: str, msh2_path: str, roi_mask_path: str,
-                                non_roi_mask_path: str | None = None) -> dict:
+                                non_roi_mask_path: str | None = None,
+                                extra_mask_paths: dict[str, str] | None = None) -> dict:
     """TI envelope + ROI/non-ROI stats from two single-channel FEM meshes —
     crop to WM+GM+CSF on read, restrict analysis to WM+GM, volume-weighted
     99th-percentile-capped mean (this project's standard metric).
+
+    extra_mask_paths: {region_label: mask_path} — additional masks to also
+    report TI_mean/TI_max for, from these SAME two already-solved meshes (no
+    extra FEM solve). A missing/unreadable mask is skipped for that region.
+
     Returns {"success", "stats", "error"}."""
     import numpy as np
     from simnibs import mesh_io
@@ -529,6 +577,16 @@ def compute_ti_from_fem_meshes(msh1_path: str, msh2_path: str, roi_mask_path: st
                     if nr_mean:
                         stats["focality_ratio_non_roi"] = roi_mean / nr_mean
 
+        if extra_mask_paths:
+            for region_label, mask_path in extra_mask_paths.items():
+                if not mask_path or not os.path.isfile(mask_path):
+                    continue
+                xmask = _mask_to_elements(mask_path, c_v)
+                if not xmask.any():
+                    continue
+                stats[f"TI_mean_{region_label}_V_m"] = _vol_mean_capped(ti_v[xmask], vol_v[xmask])
+                stats[f"TI_max_{region_label}_V_m"] = float(ti_v[xmask].max())
+
         return {"success": True, "stats": stats, "error": None}
     except Exception as e:
         return {"success": False, "stats": None, "error": str(e)}
@@ -540,6 +598,7 @@ def run_one_off_fem(
     ch2_plus_coord, ch2_minus_coord, ch2_current_mA: float,
     label: str = "manual_fem", electrode_dims: tuple = (19.5, 19.5),
     electrode_thickness: float = 4.0, force: bool = False, project_dir: str = PROJECT_DIR,
+    extra_mask_paths: dict[str, str] | None = None,
 ) -> dict:
     """Both channels' FEM + TI stats in one call — the full one-off
     (no-leadfield) pipeline, meant to run inside a background job (this is
@@ -560,7 +619,8 @@ def run_one_off_fem(
     if not ch2["success"]:
         return {"success": False, "error": f"Channel 2 FEM failed: {ch2['error']}"}
 
-    ti = compute_ti_from_fem_meshes(ch1["msh_path"], ch2["msh_path"], roi_mask_path, non_roi_mask_path)
+    ti = compute_ti_from_fem_meshes(ch1["msh_path"], ch2["msh_path"], roi_mask_path, non_roi_mask_path,
+                                     extra_mask_paths=extra_mask_paths)
     if not ti["success"]:
         return {"success": False, "error": f"TI computation failed: {ti['error']}"}
 
