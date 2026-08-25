@@ -1097,6 +1097,23 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
     roi_min_threshold = cfg.optimizer.focality_threshold[1] if hard_constraint else None
 
+    # Montage-evaluation cache — persists across every _search() call within
+    # this one run (coarse round + every fine iteration), not just within a
+    # single round. The same 4-electrode montage can recur
+    # across hierarchical search rounds (e.g. the previous round's winners
+    # are always included in every subsequent round's candidate set), even
+    # under a DIFFERENT (ep1,em1,ep2,em2) ordering/polarity assignment,
+    # since each round's candidate-electrode list order differs (farthest-
+    # point-sampling order for the coarse round vs. all_elec_names order
+    # for fine rounds). Keyed as a frozenset-of-frozensets so the key is the
+    # same regardless of which pair is "channel 1" vs "channel 2" and
+    # regardless of which electrode within a pair is +/- — verified
+    # empirically that TI.get_maxTI() is fully invariant to both (channel
+    # swap and either channel's sign flip all reproduce the identical
+    # result), so this is a pure performance optimization with no change in
+    # behaviour, not an approximation.
+    montage_cache: dict = {}
+
     def _count_combos(valid_pairs: list) -> int:
         """Number of valid montages (pairs-of-pairs with no shared/adjacent electrode)."""
         n = 0
@@ -1151,54 +1168,79 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                 if ep2 in forbidden or em2 in forbidden:
                     continue   # skip: shared electrode or cross-channel adjacency
 
-                ef2_roi = get_ef(lf_roi, ep2, em2)
-                ti_roi  = TI.get_maxTI(ef1_roi, ef2_roi)
                 n_eval += 1
 
-                if use_focality:
-                    ef1_nr  = get_ef(lf_non_roi, ep1, em1)
-                    ef2_nr  = get_ef(lf_non_roi, ep2, em2)
-                    ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
+                # Cache check — see montage_cache's own comment above for
+                # why this key is safe (verified order/sign invariance) and
+                # why the same montage can legitimately recur across rounds.
+                # Everything below this block (the violated/hard-constraint/
+                # score-comparison/top-heap logic) is UNCHANGED from before
+                # memoization was added — only the computation of
+                # (_violated, _roi_mean, _score) itself is now cached.
+                _mkey = frozenset((frozenset((ep1, em1)), frozenset((ep2, em2))))
+                _cached = montage_cache.get(_mkey)
+                if _cached is not None:
+                    _violated, _roi_mean, _score = _cached
+                else:
+                    ef2_roi = get_ef(lf_roi, ep2, em2)
+                    ti_roi  = TI.get_maxTI(ef1_roi, ef2_roi)
 
-                    # Per-subgroup hard constraints (non-ROI ceilings + ROI
-                    # floors) are checked FIRST, before fallback tracking or
-                    # the overall ROI-floor gate — a montage that violates
-                    # any subgroup constraint is never eligible, not even as
-                    # the hard_roi_constraint fallback below (previously the
-                    # fallback only tracked raw ROI mean, blind to whether
-                    # that candidate actually respected subgroup constraints).
                     _violated = False
-                    for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
-                        _ef2_cg = get_ef(_cg['lf'], ep2, em2)
-                        if _vol_mean(TI.get_maxTI(_ef1_cg, _ef2_cg), _cg['vols'], _cg['vols_sum']) > _cg['max_mean']:
-                            _violated = True
-                            break
-                    if not _violated:
-                        for _cg, _ef1_cg in zip(roi_constraint_groups, ef1_rgrps):
+                    _roi_mean = None
+                    _score    = None
+
+                    if use_focality:
+                        ef1_nr  = get_ef(lf_non_roi, ep1, em1)
+                        ef2_nr  = get_ef(lf_non_roi, ep2, em2)
+                        ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
+
+                        # Per-subgroup hard constraints (non-ROI ceilings +
+                        # ROI floors) are checked FIRST, before fallback
+                        # tracking or the overall ROI-floor gate — a montage
+                        # that violates any subgroup constraint is never
+                        # eligible, not even as the hard_roi_constraint
+                        # fallback below (previously the fallback only
+                        # tracked raw ROI mean, blind to whether that
+                        # candidate actually respected subgroup constraints).
+                        for _cg, _ef1_cg in zip(nr_constraint_groups, ef1_cgrps):
                             _ef2_cg = get_ef(_cg['lf'], ep2, em2)
-                            if _vol_mean(TI.get_maxTI(_ef1_cg, _ef2_cg), _cg['vols'], _cg['vols_sum']) < _cg['min_mean']:
+                            if _vol_mean(TI.get_maxTI(_ef1_cg, _ef2_cg), _cg['vols'], _cg['vols_sum']) > _cg['max_mean']:
                                 _violated = True
                                 break
-                    if _violated:
-                        continue
+                        if not _violated:
+                            for _cg, _ef1_cg in zip(roi_constraint_groups, ef1_rgrps):
+                                _ef2_cg = get_ef(_cg['lf'], ep2, em2)
+                                if _vol_mean(TI.get_maxTI(_ef1_cg, _ef2_cg), _cg['vols'], _cg['vols_sum']) < _cg['min_mean']:
+                                    _violated = True
+                                    break
 
-                    if hard_constraint:
-                        roi_mean = _vol_mean(ti_roi, roi_vols, roi_vols_sum)
-                        if roi_mean > fallback_score:
-                            fallback_score = roi_mean
-                            fallback_ch1   = (ep1, em1)
-                            fallback_ch2   = (ep2, em2)
-                        if roi_mean < roi_min_threshold:
-                            continue   # hard constraint: below minimum dose, skip
-                        n_feasible += 1
+                        if not _violated:
+                            if hard_constraint:
+                                _roi_mean = _vol_mean(ti_roi, roi_vols, roi_vols_sum)
+                            # ROC returns a distance to the ideal point —
+                            # lower is better. Negate so higher score =
+                            # better (consistent with the mean-goal case).
+                            _score = -ROC(ti_roi, ti_nr,
+                                         cfg.optimizer.focality_threshold, focal=True)
+                    else:
+                        _score = _vol_mean(ti_roi, roi_vols, roi_vols_sum)
+                        _roi_mean = _score
 
-                    # ROC returns a distance to the ideal point — lower is better.
-                    # Negate so higher score = better (consistent with mean case).
-                    score = -ROC(ti_roi, ti_nr,
-                                 cfg.optimizer.focality_threshold, focal=True)
-                else:
-                    score = _vol_mean(ti_roi, roi_vols, roi_vols_sum)
+                    montage_cache[_mkey] = (_violated, _roi_mean, _score)
 
+                if _violated:
+                    continue
+
+                if use_focality and hard_constraint:
+                    if _roi_mean > fallback_score:
+                        fallback_score = _roi_mean
+                        fallback_ch1   = (ep1, em1)
+                        fallback_ch2   = (ep2, em2)
+                    if _roi_mean < roi_min_threshold:
+                        continue   # hard constraint: below minimum dose, skip
+                    n_feasible += 1
+
+                score = _score
                 if score > best_score:
                     best_score = score
                     best_ch1   = (ep1, em1)
