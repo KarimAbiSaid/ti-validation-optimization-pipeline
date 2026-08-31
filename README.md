@@ -2,7 +2,7 @@
 
 Tools for transcranial interferential (TI) stimulation electrode montage optimization and validation, built on [SimNIBS](https://simnibs.github.io/simnibs/). Given a subject's MRI, finds/validates the electrode montage that maximizes TI field amplitude inside a target brain region.
 
-<span style="color: rgb(255, 12, 12);"> **NOTE: THIS FOLDER SHOULD BE PLACED INSIDE YOUR PROJECT DIRECTORY, AND RENAMED TO "code" SO AS NOT TO HAVE ANY PATH MISMATCHES!!!! meaning, if your project directory is called something like FEM_GUI_VALIDATION, then here you should have FEM_GUI_VALIDATION/code/\<the content of the repo>, meaning that this file should lie in FEM_GUI_VALIDATION/code/README.md**
+<span style="color: rgb(255, 12, 12);"> **NOTE: THIS FOLDER SHOULD BE PLACED INSIDE YOUR PROJECT DIRECTORY, AND RENAMED TO "code" SO AS NOT TO HAVE ANY PATH MISMATCHES!!!! meaning, if your project directory is called something like FEM_GUI_VALIDATION, then here you should have FEM_GUI_VALIDATION/code/\<the content of the repo>, instead of FEM_GUI_VALIDATION/ti-validation-optimization-pipeline/\<the content of the repo> meaning that this file should lie in FEM_GUI_VALIDATION/code/README.md**
 
 
 Two parts:
