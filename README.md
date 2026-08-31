@@ -12,7 +12,7 @@ Two parts:
 
 ## Repo-Provided Resources
 
-Generic, non-personalized resources ship inside this repo, under `resources/` (resolved relative to the code itself — see `gui/common.py`'s `RESOURCES_DIR` — not the external project directory below):
+Generic, non-personalized resources ship inside this repo, under `resources/` (resolved relative to the code itself, see `gui/common.py`'s `RESOURCES_DIR`, not the external project directory below):
 
 ```text
 code/resources/
