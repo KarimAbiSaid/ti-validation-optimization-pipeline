@@ -4,8 +4,8 @@ Tools for transcranial interferential (TI) stimulation electrode montage optimiz
 
 Two parts:
 
-- **`gui/`** — a modular, phased Dash GUI (head modeling → mask generation → cap registration → FEM/TI validation → multi-setup comparison → config generation, planned). See [`gui/README.md`](gui/README.md) for phase-by-phase details.
-- **`pipeline/`** — the underlying SCITAS/HPC batch pipeline (`run_pipeline.py`, `generate_configs.py`, SLURM `.sbatch` scripts) the GUI wraps and reuses directly. See [`pipeline/PROJECT_CONTEXT_SUMMARY.md`](pipeline/PROJECT_CONTEXT_SUMMARY.md).
+- **`gui/`**: a modular, phased Dash GUI (head modeling → mask generation → cap registration → FEM/TI validation → multi-setup comparison → config generation, planned). <span style="color: rgb(255, 12, 12);">**FOR THE USERS TESTING THE GUI, PLEASE REFER TO THE [`code/gui/README.md`](code/gui/README.md) FOR NOW, THE REST WILL BE UPDATED WHILE THE PIPELINE ITSELF IS BEING CHANGED AS THIS PAGE IS STILL A WIP!!!**
+- **`pipeline/`**: the underlying SCITAS/HPC batch pipeline (`run_pipeline.py`, `generate_configs.py`, SLURM `.sbatch` scripts) the GUI wraps and reuses directly. See [`pipeline/PROJECT_CONTEXT_SUMMARY.md`](pipeline/PROJECT_CONTEXT_SUMMARY.md).
 
 
 ---
