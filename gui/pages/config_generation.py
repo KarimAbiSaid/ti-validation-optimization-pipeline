@@ -28,6 +28,45 @@ import dash
 from dash import html, dcc, dash_table, callback, Input, Output, State, ctx
 
 import discovery
+
+
+def _stepper_row(id_, value, step, minimum, width="70px"):
+    """A number dcc.Input paired with explicit -/+ buttons — some browsers'
+    native spin-button clicks don't reliably register inside a Dash
+    dcc.Input, so these buttons (wired via _register_stepper_callback
+    below) are a guaranteed-to-work alternative alongside typing directly."""
+    return html.Div([
+        html.Button("−", id=f"{id_}-dec", n_clicks=0,
+                    style={"width": "26px", "padding": "0"}),
+        dcc.Input(id=id_, type="number", min=minimum, step=step, value=value,
+                 style={"width": width, "textAlign": "center", "margin": "0 0.25rem"}),
+        html.Button("+", id=f"{id_}-inc", n_clicks=0,
+                    style={"width": "26px", "padding": "0"}),
+    ], style={"display": "flex", "alignItems": "center"})
+
+
+def _register_stepper_callback(id_, step, minimum, maximum=None):
+    @callback(
+        Output(id_, "value"),
+        Input(f"{id_}-dec", "n_clicks"),
+        Input(f"{id_}-inc", "n_clicks"),
+        State(id_, "value"),
+        prevent_initial_call=True,
+    )
+    def _step(_n_dec, _n_inc, current):
+        try:
+            current = float(current)
+        except (TypeError, ValueError):
+            current = minimum if minimum is not None else 0
+        new_val = current + (step if ctx.triggered_id == f"{id_}-inc" else -step)
+        if minimum is not None:
+            new_val = max(minimum, new_val)
+        if maximum is not None:
+            new_val = min(maximum, new_val)
+        if float(step).is_integer():
+            new_val = int(round(new_val))
+        return new_val
+    return _step
 import cap_discovery
 import config_discovery as cd
 
@@ -298,8 +337,7 @@ layout = html.Div([
         html.Div([
             html.Div([
                 html.Label("num_fine_iterations"),
-                dcc.Input(id="cg-opt-hier-num-iter", type="number", min=0, step=1,
-                          value=cd.OPTIMIZER_DEFAULTS["num_fine_iterations"], style={"width": "100%"}),
+                _stepper_row("cg-opt-hier-num-iter", cd.OPTIMIZER_DEFAULTS["num_fine_iterations"], 1, 0),
             ], style={"minWidth": "160px", "marginRight": "1rem"}),
             html.Div([
                 html.Label("neighbours per iteration (comma-separated, one value per fine iteration)"),
@@ -308,8 +346,8 @@ layout = html.Div([
             ], style={"minWidth": "280px", "marginRight": "1rem"}),
             html.Div([
                 html.Label("early_stop_threshold (%)"),
-                dcc.Input(id="cg-opt-hier-early-stop", type="number", min=0, step=0.5,
-                          value=cd.OPTIMIZER_DEFAULTS["early_stop_threshold"] * 100, style={"width": "100%"}),
+                _stepper_row("cg-opt-hier-early-stop", cd.OPTIMIZER_DEFAULTS["early_stop_threshold"] * 100,
+                            0.5, 0),
             ], style={"minWidth": "160px", "marginRight": "1rem"}),
         ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
     ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
@@ -325,8 +363,7 @@ layout = html.Div([
         html.Div([
             html.Div([
                 html.Label("amplitude_sweep_top_n"),
-                dcc.Input(id="cg-opt-amp-top-n", type="number", min=1, step=1,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"], style={"width": "100%"}),
+                _stepper_row("cg-opt-amp-top-n", cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"], 1, 1),
             ], style={"minWidth": "160px", "marginRight": "1rem"}),
             html.Div([
                 html.Label("min mA"),
@@ -385,7 +422,7 @@ layout = html.Div([
             [
                 {"name": "name", "id": "name"},
                 {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
-                {"name": "max_mean_V_m", "id": "max_mean_V_m", "type": "numeric"},
+                {"name": "max_mean_V_m", "id": "max_mean_V_m"},
             ],
             editable=True, row_deletable=True,
         ),
@@ -408,7 +445,7 @@ layout = html.Div([
             [
                 {"name": "name", "id": "name"},
                 {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
-                {"name": "min_mean_V_m", "id": "min_mean_V_m", "type": "numeric"},
+                {"name": "min_mean_V_m", "id": "min_mean_V_m"},
             ],
             editable=True, row_deletable=True,
         ),
@@ -494,6 +531,10 @@ layout = html.Div([
         {"name": "Size", "id": "size_display"},
     ]),
 ])
+
+_register_stepper_callback("cg-opt-hier-num-iter", 1, 0)
+_register_stepper_callback("cg-opt-hier-early-stop", 0.5, 0)
+_register_stepper_callback("cg-opt-amp-top-n", 1, 1)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

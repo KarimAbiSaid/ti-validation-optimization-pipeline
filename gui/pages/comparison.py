@@ -112,10 +112,10 @@ def _base_columns(show_cap, show_roi, show_nonroi, show_elec=False):
     cols += [
         {"name": "Ch1+", "id": "ch1_plus"},
         {"name": "Ch1-", "id": "ch1_minus"},
-        {"name": "Ch1 mA", "id": "ch1_current", "type": "numeric"},
+        {"name": "Ch1 mA", "id": "ch1_current"},
         {"name": "Ch2+", "id": "ch2_plus"},
         {"name": "Ch2-", "id": "ch2_minus"},
-        {"name": "Ch2 mA", "id": "ch2_current", "type": "numeric"},
+        {"name": "Ch2 mA", "id": "ch2_current"},
     ]
     if show_roi:
         cols.append({"name": "ROI mask", "id": "roi", "presentation": "dropdown"})

@@ -3,17 +3,17 @@ pages/data_directory.py — Data Directory settings.
 
 Formalizes what common.py already calls PROJECT_DIR: the external location
 (possibly a different drive, or a remote/network-mounted path) holding
-rawdata/ and derivatives/ — kept separate from the code+environment location
-(code/gui, code/pipeline — always resolved relative to this repo) and from
+rawdata/ and derivatives/, kept separate from the code+environment location
+(code/gui, code/pipeline, always resolved relative to this repo) and from
 the SCITAS cluster (see pages/scitas_connection.py). Three distinct places,
 three distinct settings.
 
 Changing the path here takes effect on GUI restart (see common.py's
-priority-order note) — this page does not attempt to hot-swap PROJECT_DIR
+priority-order note), this page does not attempt to hot-swap PROJECT_DIR
 for the currently-running process.
 
 The "sync from SCITAS" section pulls specific subjects/folders down on
-demand (scp -r) — deliberately not an automatic/whole-tree sync, since
+demand (scp -r) deliberately not an automatic/whole-tree sync, since
 derivatives (leadfields especially) can be very large.
 """
 import os
@@ -35,12 +35,12 @@ def _run_sync_job(job_dir: str, subject_ids: list[str], folder_tags: list[str], 
     """Runs inside a job_runner background thread. Wraps
     sd.sync_subject_data with a progress_cb that live-updates the job's own
     status.json (job_runner.report_progress) as lines arrive, instead of
-    only reporting a result at the very end — the actual point of
+    only reporting a result at the very end, the actual point of
     backgrounding this at all, since a sync can be a multi-minute
     operation (large derivatives, especially TIoptimization results) that
     used to just block the page behind a bare spinner.
 
-    Returns {"sid|tag": {"success","error"}, ...} — sync_subject_data's own
+    Returns {"sid|tag": {"success","error"}, ...}, sync_subject_data's own
     (subject_id, folder_tag) tuple keys aren't valid JSON object keys, so
     they're flattened to a single "sid|tag" string here before job_runner
     writes this as the job's result."""
@@ -78,13 +78,13 @@ layout = html.Div([
     html.H2("Data Directory"),
     html.P("Three separate places, three separate settings: where the code+environment live (fixed, "
            "this repo), the Local (analysis) data directory below, and the Server (SCITAS) data "
-           "directory further down. rawdata/derivatives can live on any of the last two — useful for "
+           "directory further down. rawdata/derivatives can live on any of the last two, this would be useful for "
            "pointing large data at a different drive, a remote-mounted path, or a differently-laid-out "
            "SCITAS account.", style={"fontSize": "13px", "color": "#666"}),
 
     html.H3("Local (analysis) Data Directory"),
     html.P("Where rawdata/ and derivatives/ live on THIS machine (subject MRIs, meshes, leadfields, "
-           "results) — what every GUI page actually reads/writes to.",
+           "results) - what every GUI page reads/writes to. This one is basically the same as the PROJECT_DIR, which is where you already ran the GUI from",
            style={"fontSize": "13px", "color": "#666"}),
     html.Div(id="dd-current-path", style={"marginBottom": "1rem", "fontFamily": "monospace"}),
 
@@ -102,10 +102,10 @@ layout = html.Div([
 
     html.Hr(style={"marginTop": "2rem"}),
     html.H3("Server (SCITAS) Data Directory"),
-    html.P("The project root on the bare SCITAS filesystem — code/, rawdata/, derivatives/ all live "
+    html.P("The project root on the bare SCITAS filesystem where code/, rawdata/, derivatives/ all live "
            "under it there (mirroring the local layout), outside any Apptainer container. Defaults to "
-           "/scratch/{your username}/BIDS_TI_Toolbox; only change this if your SCITAS project actually "
-           "lives somewhere else. Takes effect immediately (no GUI restart needed) — every SCITAS "
+           "/scratch/{your username}/BIDS_TI_Toolbox; only change this if your SCITAS project exists "
+           "somewhere else. Takes effect immediately (no GUI restart needed), and every SCITAS "
            "action (Head Modeling, Run Pipeline, code sync, this page's own sync-from-SCITAS below) "
            "uses it.", style={"fontSize": "13px", "color": "#666"}),
     html.Div(id="dd-server-current-path", style={"marginBottom": "0.5rem", "fontFamily": "monospace"}),
@@ -223,7 +223,7 @@ def _on_server_save_click(_n_clicks, path):
     current = sd.load_settings()
     sd.save_settings(host=current["host"], username=current["username"],
                      identity_file=current["identity_file"], server_data_dir=(path or "").strip() or None)
-    return html.Div("✓ Saved — takes effect immediately for SCITAS actions.", style={"color": "#060"})
+    return html.Div("✓ Saved: takes effect immediately for SCITAS actions.", style={"color": "#060"})
 
 
 @callback(
@@ -235,7 +235,7 @@ def _on_server_save_click(_n_clicks, path):
 def _on_load_remote_click(_n_clicks):
     subjects = sd.list_remote_subjects()
     if not subjects:
-        return [], html.Span("No subjects found on SCITAS scratch (or connection failed — check "
+        return [], html.Span("No subjects found on SCITAS scratch (or connection failed, check "
                              "SCITAS Connection).", style={"color": "#a00"})
     status = sd.remote_data_status(subjects)
     rows = []
@@ -276,7 +276,7 @@ def _on_sync_click(_n_clicks, rows, selected_rows, folder_tags):
     os.makedirs(SYNC_JOB_BASE_DIR, exist_ok=True)
     _job_id, job_dir = jr.new_job_dir(SYNC_JOB_BASE_DIR)
     jr.start_local_job(job_dir, _run_sync_job, job_dir, subject_ids, folder_tags, common.PROJECT_DIR)
-    note = html.Div(f"Syncing {len(subject_ids)} subject(s) x {len(folder_tags)} folder(s) — "
+    note = html.Div(f"Syncing {len(subject_ids)} subject(s) x {len(folder_tags)} folder(s), "
                     f"polling every 1s...", style={"color": "#666"})
     return job_dir, False, note, "", ""
 

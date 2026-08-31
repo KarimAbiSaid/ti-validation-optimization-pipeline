@@ -1159,6 +1159,12 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
         for i, (ep1, em1) in enumerate(valid_pairs):
             ef1_roi    = get_ef(lf_roi, ep1, em1)
+            # ef1_nr only depends on ep1/em1 (fixed for the whole inner loop
+            # below), same as ef1_roi/ef1_cgrps/ef1_rgrps — hoisted here
+            # instead of being recomputed on every ep2/em2 iteration
+            # (previously recomputed once per inner-loop pass for no reason;
+            # pure hoisting, same values, no behaviour change).
+            ef1_nr     = get_ef(lf_non_roi, ep1, em1) if use_focality else None
             ef1_cgrps  = [get_ef(cg['lf'], ep1, em1) for cg in nr_constraint_groups]
             ef1_rgrps  = [get_ef(cg['lf'], ep1, em1) for cg in roi_constraint_groups]
             # Forbidden inner-pair electrodes: shared electrode or cross-channel adjacent
@@ -1190,7 +1196,6 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                     _score    = None
 
                     if use_focality:
-                        ef1_nr  = get_ef(lf_non_roi, ep1, em1)
                         ef2_nr  = get_ef(lf_non_roi, ep2, em2)
                         ti_nr   = TI.get_maxTI(ef1_nr, ef2_nr)
 
