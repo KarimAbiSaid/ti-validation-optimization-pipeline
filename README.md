@@ -2,9 +2,12 @@
 
 Tools for transcranial interferential (TI) stimulation electrode montage optimization and validation, built on [SimNIBS](https://simnibs.github.io/simnibs/). Given a subject's MRI, finds/validates the electrode montage that maximizes TI field amplitude inside a target brain region.
 
+<span style="color: rgb(255, 12, 12);"> **NOTE: THIS FOLDER SHOULD BE PLACED INSIDE YOUR PROJECT DIRECTORY, AND RENAMED TO "code" SO AS NOT TO HAVE ANY PATH MISMATCHES!!!! meaning, if your project directory is called something like FEM_GUI_VALIDATION, then here you should have FEM_GUI_VALIDATION/code/\<the content of the repo>, meaning that this file should lie in FEM_GUI_VALIDATION/code/README.md**
+
+
 Two parts:
 
-- **`gui/`**: a modular, phased Dash GUI (head modeling → mask generation → cap registration → FEM/TI validation → multi-setup comparison → config generation, planned). <span style="color: rgb(255, 12, 12);">**FOR THE USERS TESTING THE GUI, PLEASE REFER TO THE [`code/gui/README.md`](code/gui/README.md) FOR NOW, THE REST WILL BE UPDATED WHILE THE PIPELINE ITSELF IS BEING CHANGED AS THIS PAGE IS STILL A WIP!!!**
+- **`gui/`**: a modular, phased Dash GUI (head modeling → mask generation → cap registration → FEM/TI validation → multi-setup comparison → config generation, planned). <span style="color: rgb(255, 12, 12);">**FOR THE USERS TESTING THE GUI, PLEASE REFER TO THE ["gui/README.md`](gui/README.md) FOR NOW, THE REST WILL BE UPDATED WHILE THE PIPELINE ITSELF IS BEING CHANGED AS THIS PAGE IS STILL A WIP!!!**
 - **`pipeline/`**: the underlying SCITAS/HPC batch pipeline (`run_pipeline.py`, `generate_configs.py`, SLURM `.sbatch` scripts) the GUI wraps and reuses directly. See [`pipeline/PROJECT_CONTEXT_SUMMARY.md`](pipeline/PROJECT_CONTEXT_SUMMARY.md).
 
 
