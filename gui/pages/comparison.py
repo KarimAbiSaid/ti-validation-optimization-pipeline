@@ -26,8 +26,9 @@ import comparison_discovery as cx
 import discovery
 import fem_discovery as fd
 import job_runner as jr
+import viz_discovery as vz
 
-dash.register_page(__name__, path="/comparison", name="Comparison", category="Simulation", order=2)
+dash.register_page(__name__, path="/comparison", name="Comparison", category="Simulation", order=3)
 
 _EMPTY_ROW = {"subject": "", "mode": "leadfield", "cap": "", "roi": "", "nonroi": "", "elec": "",
               "ch1_plus": "", "ch1_minus": "", "ch1_current": 2.0,
@@ -240,6 +241,13 @@ layout = html.Div([
     html.Div(id="cx-run-note", style={"fontSize": "13px", "margin": "0.5rem 0"}),
 
     dcc.Loading(html.Div(id="cx-results", style={"marginTop": "1.5rem"})),
+
+    # ── Render Figure (per setup, on demand) ──────────────────────────────────
+    html.H3("Render Figure", style={"marginTop": "1.5rem"}),
+    html.P("Leadfield-mode setups only, for now. Renders inside a translucent whole-brain shell; "
+           "highlighted regions render opaque on top — pick any combination of existing masks "
+           "for that setup's subject.", style={"fontSize": "12px", "color": "#666"}),
+    html.Div(id="cx-viz-container"),
 
     html.Div([
         html.Label("Export filename"),
@@ -905,7 +913,14 @@ def _on_run_click(_n_clicks, rows, cap_toggle, common_cap_path, roi_toggle, roi_
             label=row_label, extra_region_labels=extra_region_labels or None,
         )
         row_key = str(i)
-        display_row = {"subject": subject_id, "label": row_label}
+        # cap/ch1/ch2 carried along for the per-row "Render Figure" section
+        # below (leadfield rows only, for now — see its own note) — not
+        # used by the compute itself, which already got everything via
+        # kwargs above.
+        display_row = {
+            "subject": subject_id, "label": row_label, "mode": mode, "cap": cap_val or None,
+            "ch1": [kwargs["ch1_plus"], kwargs["ch1_minus"]], "ch2": [kwargs["ch2_plus"], kwargs["ch2_minus"]],
+        }
 
         if mode == "oneoff":
             base_dir = os.path.join(cx.PROJECT_DIR, "derivatives", "SimNIBS",
@@ -1027,6 +1042,132 @@ def _render_results(jobs):
     return html.Div([
         html.H4("Status"), status_table,
         html.H4("Comparison", style={"marginTop": "1.5rem"}), comparison_table,
+    ])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Render Figure — one on-demand background job per setup, pattern-matched by
+# row index (own Store/Interval/result Div per row, so N setups can each be
+# rendering independently). Leadfield-mode rows only, for now: the figure
+# needs field_mesh_path + named electrodes, which every successful leadfield
+# result already carries (msh_path + the row's own ch1/ch2 names); one-off
+# rows need coordinate-based electrode drawing this doesn't support yet.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(Output("cx-viz-container", "children"), Input("cx-jobs-store", "data"))
+def _render_viz_controls(jobs):
+    if not jobs:
+        return ""
+
+    items = []
+    for row_key in sorted(jobs.keys(), key=int):
+        entry = jobs[row_key]
+        row = entry.get("row") or {}
+        result = entry.get("result") or {}
+        if row.get("mode") != "leadfield" or not result.get("success") or not result.get("msh_path"):
+            continue
+        sid = row.get("subject")
+        region_opts = [{"label": r, "value": r} for r in vz.available_regions(sid)] if sid else []
+        idx = int(row_key)
+        items.append(html.Div([
+            html.Span(f"{row.get('label') or f'sub-{sid}'}: ",
+                     style={"fontWeight": "bold", "marginRight": "0.5rem"}),
+            dcc.Dropdown(id={"type": "cx-viz-highlight", "index": idx}, options=region_opts, multi=True,
+                        placeholder="Highlight region(s)...",
+                        style={"minWidth": "260px", "display": "inline-block", "marginRight": "0.5rem",
+                              "verticalAlign": "middle"}),
+            dcc.Input(id={"type": "cx-viz-vmax", "index": idx}, type="number", value=1.0, step=0.05,
+                     placeholder="vmax", style={"width": "80px", "marginRight": "0.5rem"}),
+            html.Button("Render Figure", id={"type": "cx-viz-render-btn", "index": idx}, n_clicks=0),
+            dcc.Store(id={"type": "cx-viz-job-store", "index": idx}),
+            dcc.Interval(id={"type": "cx-viz-interval", "index": idx}, interval=2000, disabled=True),
+            html.Div(id={"type": "cx-viz-result", "index": idx}, style={"marginTop": "0.5rem"}),
+        ], style={"marginBottom": "1rem", "paddingBottom": "0.75rem", "borderBottom": "1px solid #eee"}))
+
+    if not items:
+        return html.Div("No leadfield-mode results yet to render.",
+                        style={"color": "#666", "fontSize": "13px"})
+    return html.Div(items)
+
+
+@callback(
+    Output({"type": "cx-viz-job-store", "index": MATCH}, "data"),
+    Output({"type": "cx-viz-interval", "index": MATCH}, "disabled"),
+    Output({"type": "cx-viz-result", "index": MATCH}, "children"),
+    Input({"type": "cx-viz-render-btn", "index": MATCH}, "n_clicks"),
+    State({"type": "cx-viz-render-btn", "index": MATCH}, "id"),
+    State({"type": "cx-viz-highlight", "index": MATCH}, "value"),
+    State({"type": "cx-viz-vmax", "index": MATCH}, "value"),
+    State("cx-jobs-store", "data"),
+    prevent_initial_call=True,
+)
+def _on_viz_render_click(n_clicks, btn_id, highlight_labels, vmax, jobs):
+    if not n_clicks:
+        return dash.no_update, dash.no_update, dash.no_update
+    if not highlight_labels:
+        return None, True, html.Div("Select at least one region.", style={"color": "#a00"})
+
+    row_key = str(btn_id["index"])
+    entry = (jobs or {}).get(row_key)
+    if not entry:
+        return None, True, html.Div("That setup no longer exists.", style={"color": "#a00"})
+    row = entry.get("row") or {}
+    result = entry.get("result") or {}
+    subject_id = row.get("subject")
+    cap_name = row.get("cap")
+    if not cap_name:
+        return None, True, html.Div("No cap on this row — can't resolve electrode positions.",
+                                    style={"color": "#a00"})
+    electrodes_csv = cd.registered_cap_path(subject_id, cap_name)
+    if not os.path.isfile(electrodes_csv):
+        return None, True, html.Div(f"Registered cap CSV not found: {electrodes_csv}",
+                                    style={"color": "#a00"})
+
+    label = row.get("label") or f"sub-{subject_id}_row{row_key}"
+    out_path = os.path.join(cx.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}",
+                            "comparison", "figures", f"{label}_maxTI_3views.png")
+    base_dir = os.path.join(cx.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}",
+                            "comparison", "figures", "_jobs")
+    _job_id, job_dir = jr.new_job_dir(base_dir)
+    jr.start_local_job(
+        job_dir, vz.build_figure_subprocess, subject_id, result["msh_path"],
+        tuple(row["ch1"]), tuple(row["ch2"]), electrodes_csv,
+        highlight_labels, out_path, float(vmax or 1.0),
+    )
+    return job_dir, False, html.Div("Rendering — polling every 2s...", style={"color": "#666"})
+
+
+@callback(
+    Output({"type": "cx-viz-job-store", "index": MATCH}, "data", allow_duplicate=True),
+    Output({"type": "cx-viz-interval", "index": MATCH}, "disabled", allow_duplicate=True),
+    Output({"type": "cx-viz-result", "index": MATCH}, "children", allow_duplicate=True),
+    Input({"type": "cx-viz-interval", "index": MATCH}, "n_intervals"),
+    State({"type": "cx-viz-job-store", "index": MATCH}, "data"),
+    prevent_initial_call=True,
+)
+def _poll_viz_job(_n_intervals, job_dir):
+    if not job_dir:
+        return job_dir, True, dash.no_update
+    status = jr.read_status(job_dir)
+    if not status or status["state"] == "running":
+        return job_dir, False, html.Div("… rendering", style={"color": "#666"})
+    if status["state"] == "error":
+        return job_dir, True, html.Div(f"✗ {status['error']}", style={"color": "#a00"})
+
+    result = status["result"] or {}
+    if not result.get("success"):
+        return job_dir, True, html.Div(f"✗ {result.get('error')}", style={"color": "#a00"})
+
+    import base64
+    with open(result["out_path"], "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    fr = result.get("field_range") or {}
+    note = (f"✓ drew: {', '.join(result['regions_drawn'])} — "
+           f"whole-mesh {fr.get('min', 0):.3f}-{fr.get('max', 0):.3f} V/m "
+           f"(saved to {result['out_path']})")
+    return job_dir, True, html.Div([
+        html.P(note, style={"color": "#060", "fontSize": "12px"}),
+        html.Img(src=f"data:image/png;base64,{b64}", style={"maxWidth": "100%"}),
     ])
 
 

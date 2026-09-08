@@ -21,6 +21,7 @@ import cap_discovery as cd
 import discovery
 import fem_discovery as fd
 import job_runner as jr
+import viz_discovery as vz
 
 dash.register_page(__name__, path="/fem", name="FEM Validation", category="Simulation", order=1)
 
@@ -152,6 +153,55 @@ layout = html.Div([
                 style={"padding": "0.5rem 1.5rem"}),
 
     dcc.Loading(html.Div(id="fv-compute-results", style={"marginTop": "1.5rem"})),
+    dcc.Store(id="fv-render-context"),
+
+    html.Div([
+        html.H4("Render Figure", style={"marginTop": "0"}),
+        html.P("3-view TI field figure for the compute above, inside a translucent whole-brain shell. "
+               "Highlighted regions render opaque on top — pick any combination of existing masks "
+               "(e.g. hippocampus AND amygdala together).",
+               style={"fontSize": "13px", "color": "#666"}),
+
+        html.Div([
+            html.P("...or load an already-computed simulation directly — no new compute needed "
+                   "(scans this subject's Compute TI/Run Comparison results and finished Run "
+                   "Pipeline exhaustive-search runs).",
+                   style={"fontSize": "12px", "color": "#666", "marginBottom": "0.5rem"}),
+            html.Div([
+                html.Div([
+                    html.Label("Existing simulation"),
+                    dcc.Dropdown(id="fv-viz-existing-dropdown", placeholder="Select subject above first...",
+                                style={"minWidth": "420px"}),
+                ], style={"marginRight": "1.5rem"}),
+                html.Div([
+                    html.Label("Cap (for electrode positions)"),
+                    dcc.Dropdown(id="fv-viz-existing-cap-dropdown", placeholder="—",
+                                style={"minWidth": "260px"}),
+                ], style={"marginRight": "1.5rem"}),
+                html.Button("Load", id="fv-viz-load-existing-button", n_clicks=0, disabled=True),
+            ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end"}),
+            html.Div(id="fv-viz-existing-note", style={"fontSize": "12px", "marginTop": "0.35rem"}),
+            dcc.Store(id="fv-viz-existing-meshes-store"),
+        ], style={"marginBottom": "1rem", "paddingBottom": "0.75rem", "borderBottom": "1px solid #eee"}),
+
+        html.Div([
+            html.Div([
+                html.Label("Highlight region(s)"),
+                dcc.Dropdown(id="fv-viz-highlight-dropdown", multi=True,
+                            placeholder="Select region(s)...", style={"minWidth": "300px"}),
+            ], style={"marginRight": "1.5rem"}),
+            html.Div([
+                html.Label("Color scale max (V/m)"),
+                dcc.Input(id="fv-viz-vmax", type="number", value=1.0, step=0.05,
+                         style={"width": "100px"}),
+            ]),
+        ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end", "marginBottom": "0.75rem"}),
+        html.Button("Render Figure", id="fv-viz-render-button", n_clicks=0, disabled=True),
+        dcc.Store(id="fv-viz-job-store"),
+        dcc.Interval(id="fv-viz-interval", interval=2000, disabled=True),
+        dcc.Loading(html.Div(id="fv-viz-results", style={"marginTop": "1rem"})),
+        dcc.Download(id="fv-viz-download"),
+    ], style={"marginTop": "1rem", "padding": "0.75rem", "border": "1px solid #ccc", "borderRadius": "4px"}),
 
     html.Hr(style={"marginTop": "2.5rem"}),
     html.H3("Alternative Leadfield Sources"),
@@ -349,8 +399,13 @@ def _parse_dims(text):
         return None
 
 
+def _cap_name_for_hdf5(subject_id, hdf5_path):
+    return next((lf["cap_name"] for lf in fd.list_leadfields(subject_id) if lf["hdf5_path"] == hdf5_path), None)
+
+
 @callback(
     Output("fv-compute-results", "children"),
+    Output("fv-render-context", "data"),
     Input("fv-compute-button", "n_clicks"),
     State("fv-subject-dropdown", "value"),
     State("fv-cap-dropdown", "value"),
@@ -375,7 +430,7 @@ def _on_compute_click(_n_clicks, subject_id, hdf5_path, roi_mask, non_roi_mask,
     if not all([ch1_plus, ch1_minus, ch2_plus, ch2_minus]):
         missing.append("channel electrodes")
     if missing:
-        return html.Div("Missing: " + ", ".join(missing), style={"color": "#a00"})
+        return html.Div("Missing: " + ", ".join(missing), style={"color": "#a00"}), None
 
     result = fd.compute_ti(
         subject_id=subject_id, hdf5_path=hdf5_path,
@@ -386,10 +441,24 @@ def _on_compute_click(_n_clicks, subject_id, hdf5_path, roi_mask, non_roi_mask,
     )
 
     if not result["success"]:
-        return html.Div(f"✗ {result['error']}", style={"color": "#a00"})
+        return html.Div(f"✗ {result['error']}", style={"color": "#a00"}), None
 
     stats_rows = [{"metric": k, "value": f"{v:.4f}" if isinstance(v, float) else str(v)}
                   for k, v in result["stats"].items()]
+
+    # For the Render Figure section below: everything build_figure() needs,
+    # resolved now while we still have hdf5_path/cap_name in hand (the
+    # figure re-derives nothing from the leadfield itself — just the
+    # electrode-position CSV that cap was registered from).
+    cap_name = _cap_name_for_hdf5(subject_id, hdf5_path)
+    electrodes_csv = cd.registered_cap_path(subject_id, cap_name) if cap_name else None
+    render_context = None
+    if cap_name and electrodes_csv and os.path.isfile(electrodes_csv):
+        render_context = {
+            "subject_id": subject_id, "msh_path": result["msh_path"],
+            "ch1": [ch1_plus, ch1_minus], "ch2": [ch2_plus, ch2_minus],
+            "electrodes_csv": electrodes_csv, "label": label or "setup",
+        }
 
     return html.Div([
         html.P(f"✓ {result['label']}  —  mesh: {result['msh_path']}", style={"color": "#060"}),
@@ -397,7 +466,7 @@ def _on_compute_click(_n_clicks, subject_id, hdf5_path, roi_mask, non_roi_mask,
             {"name": "Metric", "id": "metric"},
             {"name": "Value", "id": "value"},
         ], data=stats_rows),
-    ])
+    ]), render_context
 
 
 def _stats_table(result_key, stats):
@@ -407,6 +476,181 @@ def _stats_table(result_key, stats):
         {"name": "Metric", "id": "metric"},
         {"name": "Value", "id": "value"},
     ], data=rows)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Load an existing simulation directly — no new compute. Populates
+# fv-render-context the same way a successful Compute TI click does, so
+# everything downstream (region pickers, Render Figure) works unchanged.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("fv-viz-existing-dropdown", "options"),
+    Output("fv-viz-existing-meshes-store", "data"),
+    Input("fv-subject-dropdown", "value"),
+)
+def _load_existing_meshes(subject_id):
+    if not subject_id:
+        return [], []
+    meshes = vz.list_existing_meshes(subject_id)
+    options = [{"label": f"{m['label']}  [{m['source']}]", "value": i} for i, m in enumerate(meshes)]
+    return options, meshes
+
+
+@callback(
+    Output("fv-viz-existing-cap-dropdown", "options"),
+    Output("fv-viz-existing-cap-dropdown", "value"),
+    Output("fv-viz-existing-note", "children"),
+    Input("fv-viz-existing-dropdown", "value"),
+    State("fv-subject-dropdown", "value"),
+    State("fv-viz-existing-meshes-store", "data"),
+)
+def _load_existing_cap_options(mesh_idx, subject_id, meshes):
+    if mesh_idx is None or not meshes or mesh_idx >= len(meshes):
+        return [], None, ""
+    m = meshes[mesh_idx]
+    names = [m["ch1_plus"], m["ch1_minus"], m["ch2_plus"], m["ch2_minus"]]
+    caps = vz.find_matching_caps(subject_id, names)
+    options = [{"label": c, "value": c} for c in caps]
+    if not caps:
+        return [], None, html.Div(f"✗ no registered cap for sub-{subject_id} contains all of "
+                                  f"{names} — register the right cap first.", style={"color": "#a00"})
+    note = (html.Div(f"{len(caps)} caps contain these electrode names — pick the right one.",
+                     style={"color": "#a60"}) if len(caps) > 1
+           else html.Div("✓ exactly one matching cap.", style={"color": "#060"}))
+    return options, (caps[0] if len(caps) == 1 else None), note
+
+
+@callback(
+    Output("fv-viz-load-existing-button", "disabled"),
+    Input("fv-viz-existing-dropdown", "value"),
+    Input("fv-viz-existing-cap-dropdown", "value"),
+)
+def _toggle_load_existing_button(mesh_idx, cap_name):
+    return mesh_idx is None or not cap_name
+
+
+@callback(
+    Output("fv-render-context", "data", allow_duplicate=True),
+    Output("fv-viz-existing-note", "children", allow_duplicate=True),
+    Input("fv-viz-load-existing-button", "n_clicks"),
+    State("fv-viz-existing-dropdown", "value"),
+    State("fv-viz-existing-cap-dropdown", "value"),
+    State("fv-subject-dropdown", "value"),
+    State("fv-viz-existing-meshes-store", "data"),
+    prevent_initial_call=True,
+)
+def _on_load_existing_click(_n_clicks, mesh_idx, cap_name, subject_id, meshes):
+    if mesh_idx is None or not cap_name or not meshes or mesh_idx >= len(meshes):
+        return dash.no_update, html.Div("Select a simulation and a cap first.", style={"color": "#a00"})
+    m = meshes[mesh_idx]
+    electrodes_csv = cd.registered_cap_path(subject_id, cap_name)
+    if not os.path.isfile(electrodes_csv):
+        return dash.no_update, html.Div(f"Registered cap CSV not found: {electrodes_csv}",
+                                        style={"color": "#a00"})
+    render_context = {
+        "subject_id": subject_id, "msh_path": m["msh_path"],
+        "ch1": [m["ch1_plus"], m["ch1_minus"]], "ch2": [m["ch2_plus"], m["ch2_minus"]],
+        "electrodes_csv": electrodes_csv, "label": m["label"],
+    }
+    return render_context, html.Div(f"✓ Loaded {m['label']} ({m['source']}) — pick regions below and Render.",
+                                    style={"color": "#060"})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Render Figure (background job — extract + render together, ~15-45s on a
+# real subject; too slow for a synchronous Dash callback)
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("fv-viz-highlight-dropdown", "options"),
+    Output("fv-viz-render-button", "disabled"),
+    Input("fv-render-context", "data"),
+)
+def _load_viz_regions(render_context):
+    if not render_context:
+        return [], True
+    options = [{"label": r, "value": r} for r in vz.available_regions(render_context["subject_id"])]
+    return options, False
+
+
+@callback(
+    Output("fv-viz-job-store", "data"),
+    Output("fv-viz-interval", "disabled"),
+    Output("fv-viz-results", "children"),
+    Input("fv-viz-render-button", "n_clicks"),
+    State("fv-render-context", "data"),
+    State("fv-viz-highlight-dropdown", "value"),
+    State("fv-viz-vmax", "value"),
+    prevent_initial_call=True,
+)
+def _on_render_click(_n_clicks, render_context, highlight_labels, vmax):
+    if not render_context:
+        return None, True, html.Div("Compute TI above first.", style={"color": "#a00"})
+    if not highlight_labels:
+        return None, True, html.Div("Select at least one region.", style={"color": "#a00"})
+
+    subject_id = render_context["subject_id"]
+    out_path = os.path.join(fd.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}",
+                            "comparison", "figures", f"{render_context['label']}_maxTI_3views.png")
+    base_dir = os.path.join(fd.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}",
+                            "comparison", "figures", "_jobs")
+    _job_id, job_dir = jr.new_job_dir(base_dir)
+    jr.start_local_job(
+        job_dir, vz.build_figure_subprocess, subject_id, render_context["msh_path"],
+        tuple(render_context["ch1"]), tuple(render_context["ch2"]), render_context["electrodes_csv"],
+        highlight_labels, out_path, float(vmax or 1.0),
+    )
+    return job_dir, False, html.Div("Rendering — polling every 2s...", style={"color": "#666"})
+
+
+@callback(
+    Output("fv-viz-job-store", "data", allow_duplicate=True),
+    Output("fv-viz-interval", "disabled", allow_duplicate=True),
+    Output("fv-viz-results", "children", allow_duplicate=True),
+    Input("fv-viz-interval", "n_intervals"),
+    State("fv-viz-job-store", "data"),
+    prevent_initial_call=True,
+)
+def _poll_viz_job(_n_intervals, job_dir):
+    if not job_dir:
+        return job_dir, True, dash.no_update
+    status = jr.read_status(job_dir)
+    if not status or status["state"] == "running":
+        return job_dir, False, html.Div("… rendering", style={"color": "#666"})
+    if status["state"] == "error":
+        return job_dir, True, html.Div(f"✗ {status['error']}", style={"color": "#a00"})
+
+    result = status["result"] or {}
+    if not result.get("success"):
+        return job_dir, True, html.Div(f"✗ {result.get('error')}", style={"color": "#a00"})
+
+    import base64
+    with open(result["out_path"], "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    fr = result.get("field_range") or {}
+    note = (f"✓ drew: {', '.join(result['regions_drawn'])}  —  "
+           f"whole-mesh {fr.get('min', 0):.3f}-{fr.get('max', 0):.3f} V/m "
+           f"(check your color scale max against this)")
+    return job_dir, True, html.Div([
+        html.P(note, style={"color": "#060", "fontSize": "13px"}),
+        html.Img(src=f"data:image/png;base64,{b64}", style={"maxWidth": "100%"}),
+        html.Div(html.Button("Download PNG", id="fv-viz-download-button", n_clicks=0),
+                 style={"marginTop": "0.5rem"}),
+        dcc.Store(id="fv-viz-out-path", data=result["out_path"]),
+    ])
+
+
+@callback(
+    Output("fv-viz-download", "data"),
+    Input("fv-viz-download-button", "n_clicks"),
+    State("fv-viz-out-path", "data"),
+    prevent_initial_call=True,
+)
+def _on_download_click(_n_clicks, out_path):
+    if not out_path:
+        return dash.no_update
+    return dcc.send_file(out_path)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

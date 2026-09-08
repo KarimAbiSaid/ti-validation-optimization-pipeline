@@ -329,11 +329,14 @@ _LEADFIELD_TISSUES = [1, 2, 3, 4, 5]
 def generate_leadfield(
     subject_id: str, registered_cap_path: str,
     shape: str = "ellipse", dimensions: tuple = (14.0, 14.0),
-    gel_thickness: float = 1.0, cpus: int = 1, project_dir: str = PROJECT_DIR,
+    gel_thickness: float = 1.0, cpus: int = 1, force: bool = False, project_dir: str = PROJECT_DIR,
 ) -> dict:
     """registered_cap_path: the SUBJECT-SPACE cap CSV (e.g. from
     cap_discovery.registered_cap_path() — Phase 2's Register/Adopt output),
-    NOT the MNI-space source cap. Returns {"success", "hdf5_path", "error"}."""
+    NOT the MNI-space source cap. force=True skips the cache-hit check
+    below and always recomputes, even when the exact same (cap, shape,
+    dimensions, gel_thickness) was already built. Returns {"success",
+    "hdf5_path", "error"}."""
     import json
 
     m2m_path = get_m2m_path(subject_id, project_dir)
@@ -361,7 +364,7 @@ def generate_leadfield(
     # The tag already encodes shape/dimensions/gel_thickness, so a mismatch
     # here would only mean a corrupted/foreign params.json — the params
     # comparison is a belt-and-suspenders check, not the primary cache key.
-    if os.path.isfile(hdf5_path) and os.path.isfile(params_path):
+    if not force and os.path.isfile(hdf5_path) and os.path.isfile(params_path):
         with open(params_path) as f:
             saved = json.load(f)
         if saved == current_params:
@@ -421,6 +424,132 @@ def generate_leadfield(
         if scratch_dir and os.path.isdir(scratch_dir):
             import shutil
             shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def run_leadfield_on_scitas(
+    subject_id: str, cap_name: str,
+    shape: str = "ellipse", dimensions: tuple = (14.0, 14.0),
+    gel_thickness: float = 1.0, force: bool = False, project_dir: str = PROJECT_DIR,
+) -> dict:
+    """SCITAS equivalent of generate_leadfield() — submits
+    generate_leadfield_scitas.sbatch, blocks until the remote job leaves the
+    queue, then scp's the resulting {tag}/ leadfield directory back to this
+    machine. Call inside a job_runner background job (blocking — same
+    contract as generate_leadfield()). Same config.leadfield_tag() cache-key
+    convention on both sides, so a leadfield built here and synced down is
+    picked up by leadfield_status()/list_leadfields() exactly like a
+    locally-generated one.
+
+    cap_name: a REGISTERED cap's bare name (no .csv) — its
+    m2m_{id}/eeg_positions/{cap_name}.csv is uploaded if missing/stale
+    remotely (small, so always re-checked — same convention this project
+    uses for every other small per-subject file). cpus is NOT a parameter
+    here: SCITAS jobs use whatever generate_leadfield_scitas.sbatch's own
+    #SBATCH --cpus-per-task requests (8), same as every other SCITAS job
+    type in this project (submit_sbatch() has no per-submission CPU
+    override).
+
+    Returns {"success", "hdf5_path", "error", "cached"?, "params_used"?}."""
+    import json
+    import shutil
+
+    import scitas_discovery as sd
+    from config import leadfield_tag
+
+    m2m_path = get_m2m_path(subject_id, project_dir)
+    if not os.path.isdir(m2m_path):
+        return {"success": False, "hdf5_path": None, "error": f"m2m not found locally: {m2m_path}"}
+    local_cap_csv = os.path.join(m2m_path, "eeg_positions", f"{cap_name}.csv")
+    if not os.path.isfile(local_cap_csv):
+        return {"success": False, "hdf5_path": None, "error": f"registered cap not found: {local_cap_csv}"}
+
+    tag = leadfield_tag(cap_name, shape, list(dimensions), gel_thickness)
+    lf_dir = os.path.join(leadfield_dir(subject_id, project_dir), tag)
+    fname = f"{subject_id}_leadfield_{cap_name}.hdf5"
+    hdf5_path = os.path.join(lf_dir, fname)
+    params_path = os.path.join(lf_dir, f"{subject_id}_leadfield_{cap_name}_params.json")
+    current_params = {"shape": shape, "dimensions": list(dimensions), "gel_thickness": gel_thickness,
+                      "tissues": _LEADFIELD_TISSUES, "interpolation": None}
+
+    if not force and os.path.isfile(hdf5_path) and os.path.isfile(params_path):
+        with open(params_path) as f:
+            saved = json.load(f)
+        if saved == current_params:
+            return {"success": True, "hdf5_path": hdf5_path, "error": None, "cached": True,
+                    "params_used": current_params}
+
+    # generate_leadfield_cli.py/generate_leadfield_scitas.sbatch are fully
+    # self-contained (only import this project's own config.leadfield_tag)
+    # — checking/re-uploading just these two files self-heals them going
+    # stale/missing on SCITAS scratch before that turns into a submission
+    # failure.
+    code_sync = sd.ensure_pipeline_code_synced(["generate_leadfield_cli.py", "generate_leadfield_scitas.sbatch"])
+    if code_sync["error"]:
+        return {"success": False, "hdf5_path": None, "error": f"pipeline code sync failed: {code_sync['error']}"}
+
+    scratch = sd.scitas_scratch_dir()
+    remote_sub_dir = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}"
+    remote_m2m = f"{remote_sub_dir}/m2m_{subject_id}"
+    remote_cap_csv = f"{remote_m2m}/eeg_positions/{cap_name}.csv"
+    remote_lf_dir = f"{remote_sub_dir}/leadfield_volume/{tag}"
+    remote_hdf5 = f"{remote_lf_dir}/{fname}"
+
+    # remote_path_exists() below can raise RuntimeError if the check itself
+    # fails (connection issue) — deliberately left uncaught here: this
+    # function is meant to run inside a job_runner background job (see its
+    # docstring), which already catches any exception generically and shows
+    # it as a clean job error. No extra handling needed on top of that.
+    if not sd.remote_path_exists(remote_m2m):
+        mk = sd.remote_mkdir(remote_sub_dir)
+        if not mk["success"]:
+            return {"success": False, "hdf5_path": None,
+                    "error": f"couldn't create remote subject dir: {mk['stderr']}"}
+        up = sd.scp_upload(m2m_path, remote_sub_dir, recursive=True)
+        if not up["success"]:
+            return {"success": False, "hdf5_path": None,
+                    "error": f"m2m_{subject_id}/ upload to SCITAS failed: {up['stderr']}"}
+    else:
+        mk = sd.remote_mkdir(f"{remote_m2m}/eeg_positions")
+        if not mk["success"]:
+            return {"success": False, "hdf5_path": None,
+                    "error": f"couldn't create remote eeg_positions dir: {mk['stderr']}"}
+        up = sd.scp_upload(local_cap_csv, remote_cap_csv, recursive=False)
+        if not up["success"]:
+            return {"success": False, "hdf5_path": None,
+                    "error": f"cap CSV upload to SCITAS failed: {up['stderr']}"}
+
+    submit = sd.submit_sbatch(
+        script_path=f"{sd.scitas_pipeline_dir()}/generate_leadfield_scitas.sbatch",
+        job_name=f"leadfield_{subject_id}",
+        export_vars={"LF_SUBJECT": subject_id, "LF_CAP": cap_name, "LF_SHAPE": shape,
+                    "LF_DIM1": dimensions[0], "LF_DIM2": dimensions[1], "LF_GEL": gel_thickness},
+    )
+    if not submit["success"]:
+        return {"success": False, "hdf5_path": None, "error": f"sbatch submission failed: {submit['error']}"}
+
+    wait = sd.wait_for_job(submit["job_id"], max_wait_s=3 * 3600)
+    if not wait["success"]:
+        return {"success": False, "hdf5_path": None,
+                "error": f"SCITAS job {submit['job_id']} did not complete "
+                         f"(final state: {wait['final_state']}). {wait['error'] or ''}"}
+
+    if not sd.remote_path_exists(remote_hdf5):
+        return {"success": False, "hdf5_path": None,
+                "error": f"SCITAS job {submit['job_id']} completed but leadfield not found remotely: {remote_hdf5}"}
+
+    # Clear any stale/partial local copy first so scp's recursive directory
+    # copy can't nest ({tag}/{tag}/...) — same hazard the local
+    # generate_leadfield() avoids via its scratch-then-move dance.
+    shutil.rmtree(lf_dir, ignore_errors=True)
+    os.makedirs(os.path.dirname(lf_dir), exist_ok=True)
+    down = sd.scp_download(remote_lf_dir, os.path.dirname(lf_dir), recursive=True)
+    if not down["success"]:
+        return {"success": False, "hdf5_path": None,
+                "error": f"leadfield succeeded on SCITAS (job {submit['job_id']}) but syncing it back failed: "
+                         f"{down['stderr']}. Remote result is intact at {remote_lf_dir}."}
+
+    return {"success": True, "hdf5_path": hdf5_path, "error": None, "cached": False,
+            "params_used": current_params}
 
 
 # ═════════════════════════════════════════════════════════════════════════════

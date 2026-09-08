@@ -62,6 +62,8 @@ TRACKED_PIPELINE_FILES = [
     "charm_scitas.sbatch",
     "simnibs_ti_pipeline.sbatch",
     "recon_all_scitas.sbatch",
+    "generate_leadfield_cli.py",
+    "generate_leadfield_scitas.sbatch",
 ]
 
 # Of TRACKED_PIPELINE_FILES, the ones actually imported/executed by a

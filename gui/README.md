@@ -13,7 +13,7 @@ The nav groups pages by category (i.e., preprocessing/simulation/etc) rather tha
 | Category | Pages (nav order) |
 | -------- | ------------------ |
 | **Preprocessing** | Head Modeling → Mask Generation → Cap Registration |
-| **Simulation** | FEM Validation → Comparison |
+| **Simulation** | FEM Validation → Leadfield Generation → Comparison |
 | **Optimization** | Config Generation → Run Pipeline |
 | **Settings** | SCITAS Connection → Data Directory |
 
@@ -23,6 +23,7 @@ The nav groups pages by category (i.e., preprocessing/simulation/etc) rather tha
 | 1 | Mask Generation | ✅ local creation |
 | 2 | Cap Registration | ✅ local creation as well |
 | 3 | Manual FEM for TI validation | ✅ local |
+| — | Leadfield Generation (standalone, any cap) | ✅ local + SCITAS (not a numbered phase — see below) |
 | 4 | Comparison view (multiple FEM setups side by side) | ✅ local |
 | 5 | Config file generation | ✅ local |
 | 6 | Run Pipeline + SCITAS/cluster job orchestration | ✅ local + SCITAS |
@@ -70,6 +71,29 @@ The nav groups pages by category (i.e., preprocessing/simulation/etc) rather tha
   - **Run one-off FEM**: no leadfield at all: electrodes placed anywhere (by name from a registered cap, or raw `x, y, z`, snapped to the scalp surface, tag `1005`), one `simnibs.run_simnibs()` physics solve per channel (~1 min each, also backgrounded/polled), then TI stats computed directly from the two resulting meshes (reimplements the 52Y validation notebook's Step 4: crop to WM+GM+CSF, restrict to WM+GM, volume-weighted 99th-percentile-capped mean). *NOTE: THIS STILL REQUIRES TO HAVE SET UP A MESH, AND SO RUN CHARM ETC...*, *NOTE 2 for me for later: THE x,y,z POSITIONS ARE ASSUMED IN SUBJECT SPACE (RAS, or what's in the T1), SO CHECK WHETHER THE INPUTS ARE GOTTEN IN THAT SPACE OR REQUIRE A TRANSFORM (RAS+, MNI, ETC)*
 - **`job_runner.py`** (phase-agnostic): minimal background-job runner — launches a Python callable in a thread, tracks status in a `status.json` file inside a per-job directory. File-based rather than in-memory specifically so the same polling UI works unchanged for a SCITAS job (see Phase 0/6), a SCITAS run just passes a different callable (`run_x_on_scitas`, which submits + blocks polling the remote queue) to the exact same `start_local_job()`, rather than needing a separate code path. Its own `submit_to_scitas()` stub predates that pattern and isn't called by any page anymore. Not deleted, but effectively unused now.
 - Both long-running actions are cached by their exact parameters (leadfield: shape/dims/gel/tissues; one-off FEM: per-channel `.msh` already on disk), rerunning with identical settings should return instantly instead of redoing the physics solve.
+- **Render Figure** (leadfield-mode results only, for now): a 3-view TI-field figure for the compute above — see the **Render Figure (`viz_discovery.py`)** section right below for the mechanics (Comparison, further down, uses the exact same module).
+
+### Leadfield Generation
+
+Standalone page (not numbered — sits in the **Simulation** nav category between FEM Validation and Comparison) for building a leadfield for any (subject, cap, electrode geometry) combination on its own, rather than only as a sub-flow of FEM Validation.
+
+- **Local or SCITAS**, same job_runner-polled contract as Head Modeling — `fem_discovery.generate_leadfield()` (in-process `TDCSLEADFIELD`) or `fem_discovery.run_leadfield_on_scitas()` (submits `generate_leadfield_scitas.sbatch`, blocks on the SLURM queue, `scp`'s the result back). Both write to the exact same `leadfield_volume/{tag}/` cache convention (`config.leadfield_tag()`), so a leadfield built on either side is picked up by `leadfield_status()`/`list_leadfields()` identically once synced.
+- SCITAS side is two new pipeline files: `generate_leadfield_cli.py` (generic CLI, parameterized shape/dimensions/gel — sibling of the existing `generate_lfsize_leadfield.py` used by the charm-stochasticity study) and `generate_leadfield_scitas.sbatch`. Both are tracked by `scitas_discovery.TRACKED_PIPELINE_FILES`, so they show up in SCITAS Connection's manual code-sync table too.
+- `force` (recompute even if an identical-params leadfield is already cached) is supported on both sides now — added to `generate_leadfield()`'s signature (it didn't have one before this page existed; `fem_validation.py`'s own "Generate & Save Leadfield" call site is unaffected, since it never passed one).
+
+### Render Figure (`viz_discovery.py`)
+
+A 3-view (axial/coronal/sagittal) `max_TI` figure inside a translucent head, on FEM Validation (leadfield-mode results) and Comparison (per-setup, on demand — leadfield-mode rows only). Adapted from a standalone two-environment CLI pipeline in `code/viz/` (written by **Wei** — credited there and in `.claude/skills/ti-field-figures/SKILL.md`) into one in-process module for the GUI:
+
+- **One environment, not two.** `code/viz/`'s original design used a second, isolated venv for `pyvista`/`vtk` specifically to protect a *bare* SimNIBS install's pinned `numpy` from pip's dependency resolution. This GUI's own env already carries `simnibs`+`numpy`+`nibabel`+`matplotlib`; adding `pyvista` to it (see **Requirements** above) pulls in only its own small dependency set and touches neither `numpy` nor `matplotlib` — verified via `pip install --dry-run` before actually installing.
+- **Regions come from this project's own mask files** (`sub-{id}_label-{name}_mask.nii.gz`), not `code/viz/`'s SAMSEG-label-code system — the same "existing mask" picker used elsewhere in the GUI doubles as "which regions to render." Any number of regions can be highlighted at once (e.g. hippocampus AND amygdala together), rendered opaque on top of an always-present, uncolored, very-low-opacity **whole-brain shell** (`GM_SURF_TAG`/1002, the pial surface — same simple pre-existing-triangle-tag technique as the scalp shell, no tet-boundary computation needed) drawn alongside the scalp shell. This replaced an earlier separate **context region** picker (one region drawn translucent + field-colored, e.g. cortex, so a highlight buried inside it would show through) — the brain shell does that exact job unconditionally, for free, on every figure, so the separate context concept (and its own opacity/color controls) was removed as redundant. All highlighted regions share one field colorbar (same physical quantity); regions are told apart by a text label at each one's centroid, not by color-coding.
+- Field is fixed to `max_TI` (the actual TI envelope) — not exposed as a choice, since every other stat in this project already standardizes on it and picking `normE_ch1`/`normE_ch2` (ordinary single-channel tDCS fields SimNIBS computes on the way there) would silently plot the wrong physical quantity.
+- A heavy boundary surface (e.g. whole cortex) is quadric-decimated before caching, since VTK's `decimate()` drops all attribute data — geometry is decimated bare, then the field is resampled onto the new vertices via nearest-neighbor lookup against the original (pre-decimation) mesh. A small per-vertex jitter (extract time) and Taubin (shrinkage-free) smoothing (render time, retunable without re-extracting) soften the raw FEM mesh's faceted look; both are cosmetic only, off by default at zero.
+- **Rendering runs in a subprocess, not the calling thread.** VTK's off-screen `Plotter()` was found (empirically, not documented anywhere) to hang indefinitely if constructed on a non-main thread — and `job_runner.py`'s background jobs are always a thread. `build_figure_subprocess()` re-invokes this same module as `python -m viz_discovery` in a fresh process (this GUI's own interpreter) and reads back its JSON result; that's the function pages actually call, never `build_figure()` directly from a Dash callback's background job.
+- Combined extract+render takes roughly 15–90s on a real subject (more regions and a cold subprocess import both add time) — always backgrounded/polled, never synchronous.
+- Output is a real PNG on disk (`derivatives/SimNIBS/sub-{id}/comparison/figures/`), shown inline via a base64-encoded `html.Img` (this GUI's first use of that pattern — no Flask static route exists yet) plus, on FEM Validation, a Download button (`dcc.Download`/`dcc.send_file`, same mechanism Comparison's CSV export already uses).
+- **Load an existing simulation directly** (FEM Validation only, for now) — `viz_discovery.list_existing_meshes()` scans a subject's already-computed `comparison/*_head_mesh.msh` outputs (via their `ti_stats_{label}.json` sidecar, which already records the full montage) and every finished Run Pipeline exhaustive-search run's own winning-montage mesh (`TIoptimization/<run>/{id}_tes_flex_opt_head_mesh.msh`, montage from that run's `exhaustive_results.json` — same file the "Fill from Optimization Results" feature already reads), so a figure can be rendered from a past run with zero new compute. Neither source records which registered cap the electrode names came from, so `find_matching_caps()` narrows to caps whose own electrode set contains all four needed names — auto-selected only when exactly one matches; more than one (a real, observed case — several 10-10 cap layouts share common names at different coordinates) is left for the user to pick rather than silently guessed.
+- **Scope for now**: leadfield-mode rows/meshes only (a figure needs named electrodes matched against a cap's position CSV; one-off/manual-FEM rows use raw `x, y, z` and aren't supported yet — planned next).
 
 ### Phase 4: Comparison
 
@@ -79,6 +103,7 @@ The nav groups pages by category (i.e., preprocessing/simulation/etc) rather tha
 - ROI/non-ROI labels are filled two ways: an **Atlas → Region** picker (any potential region from that atlas's full list, via the same `discovery.build_lut()` Phase 1 uses) or an **existing mask names** picker (scanned from real files across the table's current subjects, e.g. `hippocampus_BNA (2/2 subjects)`), either just prefills the label field, which stays freely editable for custom multi-region-union names.
 - **Run Comparison**: leadfield rows compute synchronously (fast); one-off rows each get their own background job (`job_runner.py`) and the page polls until all are done. Results show a status table plus a metric-by-setup comparison table.
 - **Export Results (CSV)**: auto-fills a timestamped filename (editable) and downloads the status + full comparison table via `dcc.Download`.
+- **Render Figure**: one on-demand background render per setup (leadfield-mode only), independent pattern-matched controls/result per row — see **Render Figure (`viz_discovery.py`)** under Phase 3 above.
 
 ### Phase 5: Config Generation
 
@@ -106,20 +131,20 @@ Two pages, both under a dedicated **Settings** nav category since they're not a 
 
 ## Requirements
 
-The GUI needs everything `code/pipeline/create_masks.py` needs (SimNIBS, nibabel, scipy) **plus** `dash` and `plotly`, which aren't part of the base SimNIBS install.
+The GUI needs everything `code/pipeline/create_masks.py` needs (SimNIBS, nibabel, scipy) **plus** `dash`, `plotly`, and `pyvista`, none of which are part of the base SimNIBS install.
 
-**Environment:** `D:\envs\bids_ti_gui_env` — a full clone of `~\SimNIBS-4.6\simnibs_env` (conda) with `dash` and `plotly` pip-installed on top. The base SimNIBS env itself was left untouched.
+**Environment:** `D:\envs\bids_ti_gui_env` — a full clone of `~\SimNIBS-4.6\simnibs_env` (conda) with `dash`, `plotly`, and `pyvista` pip-installed on top. The base SimNIBS env itself was left untouched.
 
 To create this environment:
 
 ```bash
 conda create -p <target_path> --clone <path_to_simnibs_env>
-<target_path>/python.exe -m pip install dash plotly
+<target_path>/python.exe -m pip install dash plotly pyvista
 ```
 
 **NOTE:** You can usually find your simnibs environment locally in wherever you downloaded your SimNIBS (e.g., \home\USER\SimNIBS-4.6\simnibs_env)
 
-Minimal package list beyond the SimNIBS env: `dash`, `plotly` (pulls in `flask`, `werkzeug`, `pydantic`, etc. as transitive deps — no manual install needed).
+Minimal package list beyond the SimNIBS env: `dash`, `plotly` (pulls in `flask`, `werkzeug`, `pydantic`, etc. as transitive deps), `pyvista` (pulls in `vtk` — used only by `viz_discovery.py`'s figure rendering; verified via `pip install --dry-run` to touch neither `numpy` nor `matplotlib`, since the SimNIBS env's own versions already satisfy it) — no manual sub-dependency install needed for any of them.
 
 Python version: 3.11 (matches the SimNIBS 4.6 env).
 
@@ -161,11 +186,17 @@ code/gui/
 ├── run_discovery.py            # Phase 6 (run pipeline) data/logic layer, no Dash import,
 │                               #   runs run_pipeline.py locally (subprocess, path overrides) or
 │                               #   on SCITAS (run_pipeline_on_scitas,upload + submit + poll).
+├── viz_discovery.py            # Render Figure data/logic layer, no Dash import — extract_figure_
+│                               #   cache()/render_figure() (in-process, called directly) plus
+│                               #   build_figure_subprocess(), the one pages actually call (VTK's
+│                               #   off-screen Plotter() hangs on a background thread — see its
+│                               #   own module docstring). Imports compare_ti_montages.py directly.
 └── pages/
     ├── head_modeling.py       # Phase 0 page — layout + Dash callbacks (path "/", the landing page)
     ├── mask_generation.py     # Phase 1 page — layout + Dash callbacks (path "/masks")
     ├── cap_registration.py    # Phase 2 page — layout + Dash callbacks
     ├── fem_validation.py      # Phase 3 page — layout + Dash callbacks
+    ├── leadfield_generation.py # Leadfield Generation page — layout + Dash callbacks (path "/leadfield")
     ├── comparison.py          # Phase 4 page — layout + Dash callbacks
     ├── config_generation.py   # Phase 5 page — layout + Dash callbacks (path "/config-generation")
     ├── run_optimization.py    # Phase 6 page — layout + Dash callbacks (path "/run-pipeline")
