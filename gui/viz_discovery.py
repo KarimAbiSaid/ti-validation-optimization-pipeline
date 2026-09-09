@@ -854,5 +854,311 @@ def _cli_main():
         json.dump(result, f)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Slice Viewer — 2D orthogonal (axial/coronal/sagittal) slices through the
+# T1, scrubbable interactively, field amplitude as a color wash + ROI
+# outline(s) on top. A different tool from Render Figure above (2D voxel
+# slices vs. 3D mesh surfaces) for a different question ("where exactly,
+# slice by slice" vs. "what does the whole structure look like").
+#
+# No VTK here at all, so none of Render Figure's thread/subprocess concerns
+# apply — this is plain numpy + SimNIBS's own mesh-to-volume tool, safe to
+# call directly from a job_runner background thread.
+#
+# The field is resampled onto the subject's own T1 grid via SimNIBS's
+# built-in simnibs.transformations.interpolate_to_volume() (same tool the
+# msh2nii CLI command wraps) — not custom voxelization. This project's own
+# ROI mask files, however, live on a DIFFERENT, standardized 256^3 1mm grid
+# (create_masks.py's own convention, verified empirically against a real
+# mask — NOT the same grid as m2m_{id}/T1.nii.gz, which keeps the subject's
+# native, usually-anisotropic acquisition resolution), so each requested
+# mask is resampled onto the T1 grid (nearest-neighbor, to keep it binary)
+# before use. Everything is then downsampled together to SLICE_VOXEL_MM —
+# full T1 resolution is unnecessarily heavy for a "scroll through and get
+# oriented" viewer; the static 3-view Render Figure above stays full detail
+# for anything that needs to hold up as a real figure.
+# ═════════════════════════════════════════════════════════════════════════════
+
+SLICE_VOXEL_MM = 1.5  # downsample target -- still coarse (this view is for
+# orientation/scrubbing, not a publication crop), but not the bottleneck it
+# looks like: interpolate_to_volume() always runs at full T1 resolution
+# regardless of this value (~20s fixed, dominates the whole build either
+# way) -- only the downsample-and-composite step scales with it, and that's
+# cheap even at this resolution (measured: same ~20s total as 3.0mm gave).
+# The real cost is payload size (~13MB base64 at 1.5mm vs ~2MB at 3.0mm for
+# a full head) -- fine for a local app with no real network to cross, but
+# worth knowing if this ever needs to go lower for a slower machine/browser.
+
+# One label + one bright, high-contrast outline color per highlighted
+# region, cycled if more are picked than colors listed. The "plasma"
+# colormap's own palette runs dark purple -> red/orange -> yellow, so it has
+# no green or blue in it at all — leading with green/cyan/blue keeps the
+# outline readable against the field colormap at every intensity, unlike a
+# red/orange/yellow outline (this page's original choice), which visually
+# blends into the colormap's own high end.
+SLICE_ROI_COLORS = [(0, 230, 118), (0, 176, 255), (255, 214, 0), (255, 82, 82), (186, 104, 200)]
+
+
+def _resample_mask_to_grid(mask_path: str, target_shape, target_affine):
+    """Nearest-neighbor-resamples a binary mask onto a different grid —
+    needed because this project's ROI masks live on a standardized 256^3
+    1mm grid, not the T1's own native grid interpolate_to_volume() targets
+    (see this section's module-level comment). order=0 (nearest) keeps the
+    result strictly binary, no fractional voxels at the boundary."""
+    import nibabel as nib
+    import nibabel.processing as nibproc
+
+    img = nib.load(mask_path)
+    target = nib.Nifti1Image(np.zeros(target_shape, dtype=np.uint8), target_affine)
+    resampled = nibproc.resample_from_to(img, target, order=0)
+    return np.asarray(resampled.dataobj) > 0
+
+
+def build_slice_volumes(
+    subject_id: str, field_mesh_path: str, highlight_labels: list[str],
+    project_dir: str = PROJECT_DIR, voxel_mm: float = SLICE_VOXEL_MM,
+) -> dict:
+    """Resamples max_TI onto the subject's own T1 grid, aligns each
+    requested ROI mask onto that same grid, downsamples everything together
+    to voxel_mm. Returns {"t1", "field": (nx,ny,nz) float32 arrays,
+    "roi_masks": {label: (nx,ny,nz) bool}, "voxel_mm": [x,y,z],
+    "field_range": {"min","max"}} — every array shares one grid/shape, so
+    slicing any of them at the same index gives you the same anatomical
+    plane. Raises on missing inputs (T1, the field itself) rather than
+    returning a soft failure — meant to run inside a job_runner background
+    job, which catches any exception generically."""
+    import gc
+    import shutil
+    import tempfile
+
+    import nibabel as nib
+    from scipy.ndimage import zoom as ndi_zoom
+    from simnibs import transformations
+    from simnibs.mesh_tools import mesh_io
+
+    import comparison_discovery as cx
+
+    m2m_path = get_m2m_path(subject_id, project_dir)
+    t1_path = os.path.join(m2m_path, "T1.nii.gz")
+    if not os.path.isfile(t1_path):
+        raise FileNotFoundError(f"T1 not found: {t1_path}")
+
+    tmp_dir = tempfile.mkdtemp(prefix="slice_vol_")
+    try:
+        mesh = mesh_io.read_msh(field_mesh_path)
+        mesh.elmdata = [ed for ed in mesh.elmdata if ed.field_name == FIELD_NAME]
+        if not mesh.elmdata:
+            raise ValueError(f"{FIELD_NAME} not in {field_mesh_path}")
+        out_prefix = os.path.join(tmp_dir, "vol")
+        # keep_tissues=[1, 2]: WM+GM only, matching Render Figure's own
+        # "whole brain" scope — skull/scalp/CSF field values aren't
+        # anatomically meaningful here and would just wash out the colormap.
+        transformations.interpolate_to_volume(mesh, m2m_path, out_prefix, keep_tissues=[1, 2])
+        del mesh
+        gc.collect()
+
+        field_img = nib.load(f"{out_prefix}_{FIELD_NAME}.nii.gz")
+        t1_img = nib.load(t1_path)
+        # Canonicalize to (closest-to-)RAS voxel-array axis order/direction —
+        # NOT optional. nibabel doesn't guarantee a NIfTI's raw array axis
+        # order matches any anatomical convention; it depends on how that
+        # subject's own scanner/reconstruction wrote the file. Confirmed
+        # this varies subject to subject here: a per-subject dynamic axis
+        # lookup (aff2axcodes(), no canonicalization) correctly labeled each
+        # plane for one subject but produced a visibly rotated ("sideways")
+        # image for a second real subject whose native storage order
+        # differed. Canonicalizing first makes axis 0/1/2 reliably track
+        # L->R / P->A / I->S for every subject, so PLANE_AXES below and the
+        # slice-orientation transform in build_slice_frames() can both be
+        # fixed constants instead of derived per subject.
+        field_img = nib.as_closest_canonical(field_img)
+        t1_img = nib.as_closest_canonical(t1_img)
+        field_data = np.asarray(field_img.dataobj, dtype=np.float32)
+        t1_data = np.asarray(t1_img.dataobj, dtype=np.float32)
+
+        roi_masks = {}
+        for label in highlight_labels:
+            mask_path = cx.resolve_mask(subject_id, label, project_dir)
+            if mask_path:
+                roi_masks[label] = _resample_mask_to_grid(mask_path, field_data.shape, field_img.affine)
+
+        zooms = field_img.header.get_zooms()[:3]
+        factors = [float(z) / voxel_mm for z in zooms]
+
+        t1_small = ndi_zoom(t1_data, factors, order=1, mode="nearest")
+        field_small = ndi_zoom(field_data, factors, order=1, mode="nearest")
+        roi_small = {label: ndi_zoom(mask.astype(np.float32), factors, order=0, mode="nearest") > 0.5
+                    for label, mask in roi_masks.items()}
+
+        nonzero = field_data[field_data > 0]
+        return {
+            "t1": t1_small, "field": field_small, "roi_masks": roi_small,
+            "voxel_mm": [voxel_mm, voxel_mm, voxel_mm], "affine": field_img.affine,
+            "field_range": {"min": float(nonzero.min()) if nonzero.size else 0.0,
+                            "max": float(field_data.max())},
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _composite_slice(t1_slice, field_slice, roi_slices: dict, vmax: float, cmap: str = "plasma",
+                     roi_only: bool = False):
+    """One 2D slice -> an RGB uint8 image: grayscale T1 background, field
+    amplitude as a colormap wash (alpha ramped by field magnitude — near
+    zero is fully transparent, so T1 shows through where the field barely
+    reaches), and each ROI's boundary drawn as a solid-color outline (a
+    1px-eroded ring, not a filled region — so the T1/field underneath stays
+    visible inside the ROI too, not just around it).
+
+    roi_only: restrict the colored wash to inside the selected region(s)
+    only — everywhere else stays plain grayscale T1, even where the field
+    is nonzero there too. Off by default (whole brain colored, original
+    behavior); the whole-brain view is still one click away either way,
+    this never removes it."""
+    import matplotlib
+    from scipy.ndimage import binary_erosion
+
+    t1 = t1_slice.astype(np.float32)
+    lo, hi = np.percentile(t1, [1, 99]) if t1.size else (0.0, 1.0)
+    if hi <= lo:
+        hi = lo + 1.0
+    t1_norm = np.clip((t1 - lo) / (hi - lo), 0, 1)
+    rgb = np.stack([t1_norm] * 3, axis=-1)
+
+    if vmax > 0:
+        field_norm = np.clip(field_slice / vmax, 0, 1)
+        if roi_only and roi_slices:
+            roi_union = np.zeros_like(field_norm, dtype=bool)
+            for mask in roi_slices.values():
+                roi_union |= mask
+            field_norm = np.where(roi_union, field_norm, 0.0)
+        colored = matplotlib.colormaps[cmap](field_norm)[..., :3]
+        alpha = field_norm[..., None]
+        rgb = rgb * (1 - alpha) + colored * alpha
+
+    img = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+    for i, (label, mask) in enumerate(roi_slices.items()):
+        if not mask.any():
+            continue
+        outline = mask & ~binary_erosion(mask, iterations=1, border_value=0)
+        color = SLICE_ROI_COLORS[i % len(SLICE_ROI_COLORS)]
+        img[outline] = color
+
+    return img
+
+
+def _encode_png_b64(rgb: np.ndarray) -> str:
+    import base64
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# Which array axis to slice along for each anatomical plane. ONLY valid
+# because build_slice_volumes() canonicalizes both volumes to (closest-to-)
+# RAS order first (nibabel.as_closest_canonical()) — axis 0 tracks L->R,
+# axis 1 tracks P->A, axis 2 tracks I->S, for every subject, so this can be
+# a fixed mapping instead of derived per subject. It used to be derived
+# dynamically from each volume's own affine (nibabel.aff2axcodes()) without
+# canonicalizing first — that got WHICH axis to slice right, but not how to
+# orient the resulting 2D slice for display, so a subject whose native
+# storage axis order/direction differed from the first one tested still
+# came out visibly rotated ("sideways"). Canonicalizing first fixes both at
+# once — see _oriented_slice() for the display-orientation half.
+PLANE_AXES = {"Sagittal": 0, "Coronal": 1, "Axial": 2}
+
+
+def _oriented_slice(volume: np.ndarray, axis: int, index: int) -> np.ndarray:
+    """One 2D slice, reoriented for display. volume must already be
+    canonicalized (RAS order — see build_slice_volumes()): slicing leaves
+    the two remaining axes in their original (lower-index-first) order,
+    which is never the right image layout — this transposes so the
+    higher-index remaining axis becomes the row (vertical) and flips it so
+    its anatomically "up" end (Superior for the two axial-adjacent planes,
+    Anterior for Axial itself) ends up at the top of the image, then leaves
+    the lower-index remaining axis as columns (horizontal). Same transpose
+    + flip for all three planes once canonicalized — verified against real
+    axial/coronal/sagittal renders for two different subjects."""
+    sl = [slice(None)] * 3
+    sl[axis] = index
+    return volume[tuple(sl)].T[::-1, :]
+
+
+def _build_colorbar_png(vmax: float, cmap: str = "plasma", vmin: float = 0.0) -> str:
+    """A small standalone colorbar (base64 PNG) mapping the field colormap
+    to V/m — the per-slice composites bake the colormap straight into
+    pixels with no numeric legend of their own, so this is shown once,
+    alongside the viewer, as the scale."""
+    import base64
+    import io
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    fig, ax = plt.subplots(figsize=(4.2, 0.55))
+    fig.subplots_adjust(bottom=0.45, top=0.92, left=0.03, right=0.97)
+    cbar = fig.colorbar(ScalarMappable(norm=Normalize(vmin, vmax), cmap=cmap), cax=ax, orientation="horizontal")
+    cbar.set_label("V/m", fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, transparent=True)
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def build_slice_frames(
+    subject_id: str, field_mesh_path: str, highlight_labels: list[str],
+    project_dir: str = PROJECT_DIR, voxel_mm: float = SLICE_VOXEL_MM,
+    vmax: float | None = None, cmap: str = "plasma", roi_only: bool = False,
+) -> dict:
+    """Full pipeline: build_slice_volumes() + one composited PNG (base64)
+    per slice, for all three planes. vmax defaults to the 99th percentile
+    of nonzero field values in this subject's own volume (a fixed 0-1
+    scale, as Render Figure uses, doesn't suit every montage's actual
+    range) — pass one explicitly to match a specific comparison. roi_only:
+    see _composite_slice()'s own docstring — restricts the color wash to
+    inside the selected region(s), off (whole brain colored) by default.
+
+    Returns {"success", "frames": {"Axial": [b64 PNG, ...], "Coronal":
+    [...], "Sagittal": [...]}, "n_slices": {"Axial": int, ...},
+    "mid_slice": {"Axial": int, ...}, "voxel_mm", "field_range",
+    "colorbar_png" (b64, maps the field colormap to V/m — the slices
+    themselves carry no numeric legend), "regions_drawn"} or
+    {"success": False, "error"}."""
+    vols = build_slice_volumes(subject_id, field_mesh_path, highlight_labels, project_dir, voxel_mm)
+    t1, field, roi_masks = vols["t1"], vols["field"], vols["roi_masks"]
+
+    if vmax is None:
+        nonzero = field[field > 0]
+        vmax = float(np.percentile(nonzero, 99)) if nonzero.size else 1.0
+
+    frames, n_slices, mid_slice = {}, {}, {}
+    for plane, axis in PLANE_AXES.items():
+        n = t1.shape[axis]
+        n_slices[plane] = n
+        mid_slice[plane] = n // 2
+        plane_frames = []
+        for i in range(n):
+            t1_slice = _oriented_slice(t1, axis, i)
+            field_slice = _oriented_slice(field, axis, i)
+            roi_slices = {label: _oriented_slice(mask, axis, i) for label, mask in roi_masks.items()}
+            rgb = _composite_slice(t1_slice, field_slice, roi_slices, vmax, cmap, roi_only)
+            plane_frames.append(_encode_png_b64(rgb))
+        frames[plane] = plane_frames
+
+    return {"success": True, "frames": frames, "n_slices": n_slices, "mid_slice": mid_slice,
+           "voxel_mm": vols["voxel_mm"], "field_range": vols["field_range"],
+           "colorbar_png": _build_colorbar_png(vmax, cmap),
+           "regions_drawn": list(roi_masks.keys()), "vmax_used": vmax}
+
+
 if __name__ == "__main__":
     _cli_main()

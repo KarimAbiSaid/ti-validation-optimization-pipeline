@@ -203,6 +203,56 @@ layout = html.Div([
         dcc.Download(id="fv-viz-download"),
     ], style={"marginTop": "1rem", "padding": "0.75rem", "border": "1px solid #ccc", "borderRadius": "4px"}),
 
+    html.Div([
+        html.H4("Slice Viewer", style={"marginTop": "0"}),
+        html.P("Scroll through T1 slices (axial/coronal/sagittal, each its own slider) with the "
+               "TI field amplitude overlaid and the region outlined — a different view from Render "
+               "Figure above (2D voxel slices, not a 3D surface). Downsampled for a fast, fully "
+               "interactive scrubber — dragging a slider never touches the server.",
+               style={"fontSize": "13px", "color": "#666"}),
+        html.Div([
+            html.Div([
+                html.Label("Highlight region(s) (outlined)"),
+                dcc.Dropdown(id="fv-slice-highlight-dropdown", multi=True,
+                            placeholder="Select region(s)...", style={"minWidth": "300px"}),
+            ], style={"marginRight": "1.5rem"}),
+        ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "flex-end", "marginBottom": "0.5rem"}),
+        dcc.Checklist(
+            id="fv-slice-roi-only",
+            options=[{"label": " Color only inside the region(s) — rest stays grayscale "
+                              "(off = whole brain colored)", "value": "roi_only"}],
+            value=[], style={"marginBottom": "0.75rem"},
+        ),
+        html.Button("Build Slice Viewer", id="fv-slice-build-button", n_clicks=0, disabled=True),
+        dcc.Store(id="fv-slice-job-store"),
+        dcc.Interval(id="fv-slice-interval", interval=2000, disabled=True),
+        html.Div(id="fv-slice-status", style={"marginTop": "0.5rem", "fontSize": "13px"}),
+        html.Img(id="fv-slice-colorbar-img", style={"marginTop": "0.5rem", "maxWidth": "320px"}),
+        html.Div(id="fv-slice-legend-row", style={"marginTop": "0.35rem", "fontSize": "13px"}),
+
+        html.Div([
+            html.Div([
+                html.H5("Axial"),
+                html.Img(id="fv-slice-axial-img", style={"width": "100%"}),
+                dcc.Slider(id="fv-slice-axial-slider", min=0, max=0, step=1, value=0),
+            ], style={"flex": "1", "marginRight": "0.75rem", "minWidth": "200px"}),
+            html.Div([
+                html.H5("Coronal"),
+                html.Img(id="fv-slice-coronal-img", style={"width": "100%"}),
+                dcc.Slider(id="fv-slice-coronal-slider", min=0, max=0, step=1, value=0),
+            ], style={"flex": "1", "marginRight": "0.75rem", "minWidth": "200px"}),
+            html.Div([
+                html.H5("Sagittal"),
+                html.Img(id="fv-slice-sagittal-img", style={"width": "100%"}),
+                dcc.Slider(id="fv-slice-sagittal-slider", min=0, max=0, step=1, value=0),
+            ], style={"flex": "1", "minWidth": "200px"}),
+        ], id="fv-slice-viewer-container", style={"display": "none", "flexWrap": "wrap", "marginTop": "1rem"}),
+
+        dcc.Store(id="fv-slice-axial-frames"),
+        dcc.Store(id="fv-slice-coronal-frames"),
+        dcc.Store(id="fv-slice-sagittal-frames"),
+    ], style={"marginTop": "1rem", "padding": "0.75rem", "border": "1px solid #ccc", "borderRadius": "4px"}),
+
     html.Hr(style={"marginTop": "2.5rem"}),
     html.H3("Alternative Leadfield Sources"),
     html.P("For when no precomputed leadfield exists yet for this subject/cap above.",
@@ -651,6 +701,140 @@ def _on_download_click(_n_clicks, out_path):
     if not out_path:
         return dash.no_update
     return dcc.send_file(out_path)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Slice Viewer (background job — build_slice_frames() is plain numpy/nibabel/
+# simnibs.transformations, no VTK, so unlike Render Figure it's safe to call
+# directly from job_runner's background thread, no subprocess needed).
+# Scrubbing itself is a clientside callback below — once the frames are on
+# the browser, moving a slider never touches the server.
+# ═════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("fv-slice-highlight-dropdown", "options"),
+    Output("fv-slice-build-button", "disabled"),
+    Input("fv-render-context", "data"),
+)
+def _load_slice_regions(render_context):
+    if not render_context:
+        return [], True
+    options = [{"label": r, "value": r} for r in vz.available_regions(render_context["subject_id"])]
+    return options, False
+
+
+@callback(
+    Output("fv-slice-job-store", "data"),
+    Output("fv-slice-interval", "disabled"),
+    Output("fv-slice-status", "children"),
+    Input("fv-slice-build-button", "n_clicks"),
+    State("fv-render-context", "data"),
+    State("fv-slice-highlight-dropdown", "value"),
+    State("fv-slice-roi-only", "value"),
+    prevent_initial_call=True,
+)
+def _on_build_slices_click(_n_clicks, render_context, highlight_labels, roi_only_value):
+    if not render_context:
+        return None, True, html.Div("Compute TI (or load an existing simulation) above first.",
+                                    style={"color": "#a00"})
+
+    subject_id = render_context["subject_id"]
+    base_dir = os.path.join(fd.PROJECT_DIR, "derivatives", "SimNIBS", f"sub-{subject_id}",
+                            "comparison", "figures", "_jobs")
+    _job_id, job_dir = jr.new_job_dir(base_dir)
+    jr.start_local_job(
+        job_dir, vz.build_slice_frames, subject_id, render_context["msh_path"], highlight_labels or [],
+        roi_only=("roi_only" in (roi_only_value or [])),
+    )
+    return job_dir, False, html.Div("Building — polling every 2s (interpolating the field onto the "
+                                    "T1 grid takes ~20-30s)...", style={"color": "#666"})
+
+
+@callback(
+    Output("fv-slice-job-store", "data", allow_duplicate=True),
+    Output("fv-slice-interval", "disabled", allow_duplicate=True),
+    Output("fv-slice-status", "children", allow_duplicate=True),
+    Output("fv-slice-viewer-container", "style"),
+    Output("fv-slice-colorbar-img", "src"),
+    Output("fv-slice-legend-row", "children"),
+    Output("fv-slice-axial-frames", "data"), Output("fv-slice-coronal-frames", "data"),
+    Output("fv-slice-sagittal-frames", "data"),
+    Output("fv-slice-axial-slider", "max"), Output("fv-slice-axial-slider", "value"),
+    Output("fv-slice-coronal-slider", "max"), Output("fv-slice-coronal-slider", "value"),
+    Output("fv-slice-sagittal-slider", "max"), Output("fv-slice-sagittal-slider", "value"),
+    Input("fv-slice-interval", "n_intervals"),
+    State("fv-slice-job-store", "data"),
+    prevent_initial_call=True,
+)
+def _poll_slice_job(_n_intervals, job_dir):
+    no_viewer_change = (dash.no_update,) * 11
+    if not job_dir:
+        return (job_dir, True, dash.no_update, {"display": "none"}) + no_viewer_change
+    status = jr.read_status(job_dir)
+    if not status or status["state"] == "running":
+        return (job_dir, False, html.Div("… building", style={"color": "#666"}),
+               dash.no_update) + no_viewer_change
+    if status["state"] == "error":
+        return (job_dir, True, html.Div(f"✗ {status['error']}", style={"color": "#a00"}),
+               dash.no_update) + no_viewer_change
+
+    result = status["result"] or {}
+    if not result.get("success"):
+        return (job_dir, True, html.Div(f"✗ {result.get('error')}", style={"color": "#a00"}),
+               dash.no_update) + no_viewer_change
+
+    fr = result.get("field_range") or {}
+    regions_drawn = result.get("regions_drawn") or []
+    regions = ", ".join(regions_drawn) or "(none — no mask matched for this subject)"
+    note = html.Div(
+        f"✓ outlined: {regions}  —  whole-mesh {fr.get('min', 0):.3f}-{fr.get('max', 0):.3f} V/m, "
+        f"color scale to {result.get('vmax_used', 0):.3f} V/m (99th percentile) — see the scale below",
+        style={"color": "#060"})
+
+    # Which outline color is which region — same order vz._composite_slice()
+    # cycled through SLICE_ROI_COLORS in, so this is just re-reading that
+    # order back, not recomputing anything. Matters most for bilateral
+    # regions picked as separate L/R masks, where color is the only way to
+    # tell which outline is which without this.
+    legend = html.Div([
+        html.Span([
+            html.Span(style={"display": "inline-block", "width": "11px", "height": "11px",
+                            "backgroundColor": f"rgb{vz.SLICE_ROI_COLORS[i % len(vz.SLICE_ROI_COLORS)]}",
+                            "marginRight": "4px", "verticalAlign": "middle", "borderRadius": "2px"}),
+            label,
+        ], style={"marginRight": "1.25rem", "whiteSpace": "nowrap"})
+        for i, label in enumerate(regions_drawn)
+    ], style={"display": "flex", "flexWrap": "wrap"}) if regions_drawn else ""
+
+    frames = result["frames"]
+    n = result["n_slices"]
+    mid = result["mid_slice"]
+    return (
+        job_dir, True, note, {"display": "flex", "flexWrap": "wrap", "marginTop": "1rem"},
+        f"data:image/png;base64,{result['colorbar_png']}", legend,
+        frames["Axial"], frames["Coronal"], frames["Sagittal"],
+        n["Axial"] - 1, mid["Axial"], n["Coronal"] - 1, mid["Coronal"], n["Sagittal"] - 1, mid["Sagittal"],
+    )
+
+
+# Clientside: swap the shown slice image when a slider moves, reading from
+# the already-downloaded frame list — no server round-trip, so scrubbing
+# stays smooth even on a slow connection.
+_SLICE_CLIENTSIDE_JS = """
+function(idx, frames) {
+    if (!frames || idx === undefined || idx === null || !frames[idx]) {
+        return window.dash_clientside.no_update;
+    }
+    return "data:image/png;base64," + frames[idx];
+}
+"""
+for _plane in ("axial", "coronal", "sagittal"):
+    dash.clientside_callback(
+        _SLICE_CLIENTSIDE_JS,
+        Output(f"fv-slice-{_plane}-img", "src"),
+        Input(f"fv-slice-{_plane}-slider", "value"),
+        State(f"fv-slice-{_plane}-frames", "data"),
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
