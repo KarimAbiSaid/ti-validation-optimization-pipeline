@@ -34,15 +34,17 @@ def is_stimulation_electrode(name: str) -> bool:
     return (name or "").strip().lower() not in NON_ELECTRODE_NAMES
 
 
-# Canonical, repo-level electrode tier reference (Fiducials/Tier 0-4),
-# analogous to BNA_subregions.xlsx — one file at the project root, reused by
-# any subject/run rather than something each config re-specifies. Format
-# (see run_pipeline.py's sub-73T14 pilot csv for the source of truth this
-# was built from): two columns "Electrode,Tier" — Tier is either the literal
-# string "Fiducials" or a digit "0".."4". A name may list two 10-20/10-10
-# aliases separated by "/" (e.g. "T7/T3") — both aliases get the same tier,
-# since a given cap CSV may use either naming convention.
+# Canonical electrode tier reference (Fiducials/Tier 0-4) — lives right next
+# to this file (code/pipeline/), NOT under project_dir, so it travels with
+# the code repo itself (sharing just code/ still includes it, unlike a
+# project-root data file such as BNA_subregions.xlsx). Format: two columns
+# "Electrode,Tier" — Tier is either the literal string "Fiducials" or a
+# digit "0".."4". A name may list two 10-20/10-10 aliases separated by "/"
+# (e.g. "T7/T3") — both aliases get the same tier, since a given cap CSV may
+# use either naming convention.
 DEFAULT_ELECTRODE_TIERS_CSV = "electrode_tiers_acceptable_vs_nogo.csv"
+DEFAULT_ELECTRODE_TIERS_CSV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), DEFAULT_ELECTRODE_TIERS_CSV)
 
 
 def load_electrode_tiers_csv(csv_path: str) -> tuple[dict, set]:
@@ -476,9 +478,10 @@ class PipelineConfig:
 
     @property
     def electrode_tiers_csv_path(self) -> str:
-        """Canonical repo-level tiers reference (see DEFAULT_ELECTRODE_TIERS_CSV) —
-        one file at the project root, same convention as BNA_subregions.xlsx."""
-        return f"{self.project_dir}/{DEFAULT_ELECTRODE_TIERS_CSV}"
+        """Canonical tiers reference (see DEFAULT_ELECTRODE_TIERS_CSV_PATH) —
+        lives next to config.py in code/pipeline/, not under project_dir, so
+        it's included whenever just the code/ repo is shared."""
+        return DEFAULT_ELECTRODE_TIERS_CSV_PATH
 
     def mask_path(self, label: str) -> str:
         """BIDS-compliant mask path: sub-{id}_label-{label}_mask.nii.gz"""
