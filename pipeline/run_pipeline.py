@@ -35,7 +35,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 # ── Config import ─────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
-from config import PipelineConfig, ROIConfig, load_config, save_config, leadfield_tag, is_stimulation_electrode
+from config import (PipelineConfig, ROIConfig, load_config, save_config, leadfield_tag,
+                    is_stimulation_electrode, load_electrode_tiers_csv)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +62,26 @@ def _vol_mean_capped(values: np.ndarray, volumes: np.ndarray, pct: int = 99) -> 
     cap = float(np.percentile(values, pct))
     v   = np.minimum(values, cap)
     return float((v * volumes).sum() / volumes.sum())
+
+
+def _tier_cost(electrode_names, electrode_tiers: dict, tier_weights: dict) -> float:
+    """Sum of per-electrode tier penalties for a 4-electrode montage —
+    each electrode in electrode_names that falls in a penalized tier adds
+    its own weight (NOT a max/"weakest link" rule: two Tier-2 electrodes
+    cost 2x the Tier-2 weight). Electrodes absent from electrode_tiers, or
+    mapped to Tier 0, contribute nothing (Tier 0 is always free, not
+    configurable). electrode_tiers keys are matched case-insensitively.
+    Tier 3 is deliberately NOT priced here even if tier_weights has a "3"
+    entry — it's gated by the two-pass search fallback instead (see
+    run_exhaustive_cap_optimization), not a fixed score penalty."""
+    lower_tiers = {k.lower(): v for k, v in electrode_tiers.items()}
+    cost = 0.0
+    for name in electrode_names:
+        tier = lower_tiers.get(name.lower())
+        if tier is None or tier == 0 or tier == 3:
+            continue
+        cost += tier_weights.get(str(tier), 0.0)
+    return cost
 
 
 def header(title: str) -> None:
@@ -839,6 +860,32 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     print(f"  Electrodes: {n_elec}  ({', '.join(all_elec_names)})")
     print(f"  Leadfield shape: {leadfield.shape}")
 
+    # Electrode tiers (opt-in) — auto-load from the tiers CSV when enabled
+    # and the config didn't already hand-populate electrode_tiers itself.
+    # Tier "4"/Fiducials (Nz/Iz/A1/A2 etc.) are excluded from all_elec_names
+    # right here, before anything downstream (adjacency, hierarchical
+    # search, Tier-3 pool split) ever sees them — same treatment on every
+    # search pass, no exceptions. The leadfield itself is left untouched
+    # (still built from the full base cap); only the SEARCH never evaluates
+    # these electrodes, per the explicit choice not to pre-filter the cap.
+    if cfg.optimizer.use_electrode_scoring_tiers and not cfg.optimizer.electrode_tiers:
+        _tiers_csv_path = cfg.optimizer.electrode_tiers_csv or cfg.electrode_tiers_csv_path
+        if not os.path.isfile(_tiers_csv_path):
+            print(f"  WARNING: electrode tiers CSV not found ({_tiers_csv_path}) "
+                  f"— use_electrode_scoring_tiers has nothing to apply this run")
+        else:
+            _auto_tiers, _auto_excluded = load_electrode_tiers_csv(_tiers_csv_path)
+            cfg.optimizer.electrode_tiers = _auto_tiers
+            _before = len(all_elec_names)
+            all_elec_names = [n for n in all_elec_names if n.lower() not in _auto_excluded]
+            _n_excluded = _before - len(all_elec_names)
+            if _n_excluded:
+                print(f"  Electrode tiers: loaded {len(_auto_tiers)} tier assignment(s) "
+                      f"from {_tiers_csv_path}")
+                print(f"  Electrode tiers: {_n_excluded} Tier-4/Fiducial electrode(s) "
+                      f"excluded from the search entirely (not just this pass)")
+                n_elec = len(all_elec_names)   # reflects the post-exclusion searchable set
+
     # Map our NIfTI ROI mask onto mesh elements
     roi_mask_path = cfg.mask_path(cfg.roi.name)
     if not os.path.isfile(roi_mask_path):
@@ -927,6 +974,65 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                 lf_non_roi = leadfield[:, non_roi_indices, :]
                 non_roi_vols     = elm_vols[non_roi_indices]
                 non_roi_vols_sum = float(non_roi_vols.sum())
+
+    # ── Background region (opt-in, for use_composite_location_score) ────
+    # A broad "everywhere except the ROI" region for softly discouraging
+    # off-target field strength (including directly under the electrodes)
+    # — distinct from non_roi/non_roi_hard_constraint_groups, which are
+    # hard pass/fail ceilings on specific curated regions. Subsampled
+    # (uniform random, same mechanism as non-ROI above) since this can
+    # easily be 1M+ GM+WM elements and is evaluated on every candidate
+    # montage in the hot loop.
+    lf_background      = None
+    background_vols     = None
+    background_vols_sum = None
+    if cfg.optimizer.minimize_background_field:
+        bg_elm_mask = None
+        if cfg.optimizer.background_mask_name is None:
+            # Genuinely whole-brain: the full GM+WM element set straight from
+            # mesh tissue tags, no NIfTI file needed (same set already used
+            # to restrict ROI/non-ROI above).
+            bg_elm_mask = gm_wm_mask.copy()
+            print(f"  Background region: whole-brain GM+WM (no mask file)")
+        else:
+            bg_mask_path = cfg.mask_path(cfg.optimizer.background_mask_name)
+            if not os.path.isfile(bg_mask_path):
+                print(f"  WARNING: background mask not found ({bg_mask_path}) "
+                      f"— disabling background-field minimization for this run")
+            else:
+                bg_img   = nib.load(bg_mask_path)
+                bg_data  = np.asarray(bg_img.dataobj) > 0
+                bg_inv   = np.linalg.inv(bg_img.affine)
+                bg_vox   = (bg_inv @ np.hstack([centroids, ones]).T).T[:, :3]
+                bg_idx   = np.round(bg_vox).astype(int)
+                bg_sh    = bg_data.shape
+                bg_bounds = ((bg_idx[:, 0] >= 0) & (bg_idx[:, 0] < bg_sh[0]) &
+                             (bg_idx[:, 1] >= 0) & (bg_idx[:, 1] < bg_sh[1]) &
+                             (bg_idx[:, 2] >= 0) & (bg_idx[:, 2] < bg_sh[2]))
+                bg_elm_mask = np.zeros(len(centroids), dtype=bool)
+                bg_elm_mask[bg_bounds] = bg_data[bg_idx[bg_bounds, 0],
+                                                 bg_idx[bg_bounds, 1],
+                                                 bg_idx[bg_bounds, 2]]
+
+        if bg_elm_mask is not None:
+            bg_elm_mask &= gm_wm_mask       # restrict to GM+WM
+            bg_elm_mask[roi_indices] = False  # "minus the ROI"
+            background_indices = np.flatnonzero(bg_elm_mask)
+            if len(background_indices) == 0:
+                print(f"  WARNING: background mask maps to 0 elements (after "
+                      f"excluding ROI) — disabling background-field minimization")
+            else:
+                n_bg_total = len(background_indices)
+                bg_cap = cfg.optimizer.max_background_elements
+                if bg_cap > 0 and n_bg_total > bg_cap:
+                    bg_rng = np.random.default_rng(seed=43)   # different seed from non-ROI's 42
+                    background_indices = bg_rng.choice(background_indices, bg_cap, replace=False)
+                    print(f"  Background elements in mesh: {n_bg_total} (subsampled to {bg_cap})")
+                else:
+                    print(f"  Background elements in mesh: {n_bg_total}")
+                lf_background = leadfield[:, background_indices, :]
+                background_vols     = elm_vols[background_indices]
+                background_vols_sum = float(background_vols.sum())
 
     score_label = "ROC focality" if use_focality else "mean TI"
     hard_constraint = use_focality and cfg.optimizer.hard_roi_constraint
@@ -1042,27 +1148,40 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                   f"(BioSemi32 hardcoded topology)")
         else:
             # Distance threshold: adjacent = Euclidean distance <= 1.95x the
-            # cap's own minimum inter-electrode spacing (matches this flag's
-            # documented definition just above, in OptimizerConfig). The
-            # previous ConvexHull+2D-Delaunay approach was a topological
-            # "shares a triangulation face" notion, not a proximity one, and
-            # silently missed genuinely close pairs that don't happen to
-            # share a triangle edge (verified on a real cap: FT10-T10 at
-            # 32mm and T8-TP8 at 30mm both slipped through undetected, well
-            # under the intended ~38mm threshold for that cap).
+            # LOCAL (per-electrode) nearest-neighbour spacing, using the
+            # conservative combination rule — for a pair (A, B), the pair's
+            # own threshold is 1.95x min(nn_dist(A), nn_dist(B)), where
+            # nn_dist(X) is X's own distance to its single closest neighbour
+            # on the cap. This replaced an earlier single GLOBAL threshold
+            # (1.95x the cap-wide minimum spacing, applied uniformly to every
+            # pair) — verified too narrow on a real, non-uniformly-spaced cap:
+            # F8-FT10 (sub-41Y10) and F8-F10 (sub-41Y11) are both genuinely
+            # adjacent but sit just outside the global threshold, since dense
+            # cap regions pull the global minimum spacing down so far that
+            # sparser regions' real neighbours no longer qualify. Going local
+            # instead of global still catches both cases while (unlike simply
+            # raising the global threshold further) not over-excluding pairs
+            # in the cap's densest regions. The previous ConvexHull+2D-
+            # Delaunay approach before that was a topological "shares a
+            # triangulation face" notion, not a proximity one, and silently
+            # missed genuinely close pairs that don't happen to share a
+            # triangle edge (verified on a real cap: FT10-T10 at 32mm and
+            # T8-TP8 at 30mm both slipped through undetected).
             _lf_elecs = [n for n in all_elec_names if n in _cap_pos]
             if len(_lf_elecs) >= 2:
                 from scipy.spatial.distance import pdist, squareform
                 _pos_arr = np.array([_cap_pos[n] for n in _lf_elecs])
                 _dist = squareform(pdist(_pos_arr))
                 np.fill_diagonal(_dist, np.inf)
-                _min_spacing = float(_dist.min())
-                _threshold   = 1.95 * _min_spacing
-                _ia_idx, _ib_idx = np.where(np.triu(_dist <= _threshold, k=1))
-                for _ia, _ib in zip(_ia_idx.tolist(), _ib_idx.tolist()):
+                _nn_dist = _dist.min(axis=1)  # each electrode's own nearest-neighbour distance
+                _ia_idx, _ib_idx = np.triu_indices(len(_lf_elecs), k=1)
+                _pair_threshold = 1.95 * np.minimum(_nn_dist[_ia_idx], _nn_dist[_ib_idx])
+                _is_adj = _dist[_ia_idx, _ib_idx] <= _pair_threshold
+                for _ia, _ib in zip(_ia_idx[_is_adj].tolist(), _ib_idx[_is_adj].tolist()):
                     adj_elec_pairs.add(frozenset([_lf_elecs[_ia], _lf_elecs[_ib]]))
                 print(f"  Adjacent-electrode filter: {len(adj_elec_pairs)} pairs excluded "
-                      f"(distance <= 1.95x min spacing = {_threshold:.1f}mm, {len(_lf_elecs)} electrodes)")
+                      f"(distance <= 1.95x local nearest-neighbour spacing, "
+                      f"{len(_lf_elecs)} electrodes)")
 
     # ════════════════════════════════════════════════════════════════════════
     # STEP 3 — Exhaustive search over all electrode pair combinations
@@ -1157,6 +1276,15 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         top_heap: list = []
         _tiebreak = 0
 
+        # Composite location scoring (opt-in) — see OptimizerConfig's
+        # use_composite_location_score docstring for the full explanation.
+        # Resolved to local variables once, outside the hot loop, so every
+        # candidate's cost is just a couple of cheap boolean checks.
+        use_composite  = cfg.optimizer.use_composite_location_score
+        use_background = use_composite and cfg.optimizer.minimize_background_field and lf_background is not None
+        use_tiers      = use_composite and cfg.optimizer.use_electrode_scoring_tiers
+        loc_weights    = cfg.optimizer.location_score_weights if use_composite else None
+
         for i, (ep1, em1) in enumerate(valid_pairs):
             ef1_roi    = get_ef(lf_roi, ep1, em1)
             # ef1_nr only depends on ep1/em1 (fixed for the whole inner loop
@@ -1165,6 +1293,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             # (previously recomputed once per inner-loop pass for no reason;
             # pure hoisting, same values, no behaviour change).
             ef1_nr     = get_ef(lf_non_roi, ep1, em1) if use_focality else None
+            ef1_bg     = get_ef(lf_background, ep1, em1) if use_background else None
             ef1_cgrps  = [get_ef(cg['lf'], ep1, em1) for cg in nr_constraint_groups]
             ef1_rgrps  = [get_ef(cg['lf'], ep1, em1) for cg in roi_constraint_groups]
             # Forbidden inner-pair electrodes: shared electrode or cross-channel adjacent
@@ -1186,14 +1315,16 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                 _mkey = frozenset((frozenset((ep1, em1)), frozenset((ep2, em2))))
                 _cached = montage_cache.get(_mkey)
                 if _cached is not None:
-                    _violated, _roi_mean, _score = _cached
+                    _violated, _roi_mean, _score, _bg_mean, _bg_hot_mean = _cached
                 else:
                     ef2_roi = get_ef(lf_roi, ep2, em2)
                     ti_roi  = TI.get_maxTI(ef1_roi, ef2_roi)
 
-                    _violated = False
-                    _roi_mean = None
-                    _score    = None
+                    _violated    = False
+                    _roi_mean    = None
+                    _score       = None
+                    _bg_mean     = None
+                    _bg_hot_mean = None
 
                     if use_focality:
                         ef2_nr  = get_ef(lf_non_roi, ep2, em2)
@@ -1227,11 +1358,24 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                             # better (consistent with the mean-goal case).
                             _score = -ROC(ti_roi, ti_nr,
                                          cfg.optimizer.focality_threshold, focal=True)
+                            if use_background:
+                                ef2_bg = get_ef(lf_background, ep2, em2)
+                                ti_bg  = TI.get_maxTI(ef1_bg, ef2_bg)
+                                _bg_mean = _vol_mean(ti_bg, background_vols, background_vols_sum)
+                                # Hotspot term: volume-weighted mean of just
+                                # the top (100 - percentile)% of this same
+                                # background sample — see
+                                # background_hotspot_percentile's docstring
+                                # in config.py for why plain _bg_mean alone
+                                # washes out a concentrated hotspot.
+                                _hot_cut  = np.percentile(ti_bg, cfg.optimizer.background_hotspot_percentile)
+                                _hot_mask = ti_bg >= _hot_cut
+                                _bg_hot_mean = _vol_mean(ti_bg[_hot_mask], background_vols[_hot_mask])
                     else:
                         _score = _vol_mean(ti_roi, roi_vols, roi_vols_sum)
                         _roi_mean = _score
 
-                    montage_cache[_mkey] = (_violated, _roi_mean, _score)
+                    montage_cache[_mkey] = (_violated, _roi_mean, _score, _bg_mean, _bg_hot_mean)
 
                 if _violated:
                     continue
@@ -1245,7 +1389,28 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                         continue   # hard constraint: below minimum dose, skip
                     n_feasible += 1
 
+                # Composite location scoring (opt-in — see
+                # use_composite_location_score's docstring in config.py).
+                # When disabled, `score` is exactly `_score`, unchanged
+                # from before this feature existed. Tier penalty is cheap
+                # (pure name lookup) so it's computed fresh here regardless
+                # of cache hit/miss, rather than being part of the cached
+                # tuple above — only the background-field term needs
+                # caching, since it's the one requiring an expensive field
+                # computation.
                 score = _score
+                if use_composite:
+                    score = loc_weights.get("main", 1.0) * _score
+                    if use_background and _bg_mean is not None:
+                        score -= loc_weights.get("background", 0.0) * _bg_mean
+                        if _bg_hot_mean is not None:
+                            score -= loc_weights.get("background_hotspot", 0.0) * _bg_hot_mean
+                    if use_tiers:
+                        _tcost = _tier_cost((ep1, em1, ep2, em2),
+                                            cfg.optimizer.electrode_tiers,
+                                            cfg.optimizer.electrode_tier_weights)
+                        score -= loc_weights.get("tier_penalty", 0.0) * _tcost
+
                 if score > best_score:
                     best_score = score
                     best_ch1   = (ep1, em1)
@@ -1292,79 +1457,115 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         }
 
     # ── Coarse-to-fine (hierarchical) vs flat exhaustive search ────────────
-    history = None
-    if cfg.optimizer.use_hierarchical_search:
-        n_total  = len(all_elec_names)
-        # coarse_k = max(round(0.5 * n_total), min(n_total, 32))
-        coarse_k =  min(n_total, 32) #take all the electrodes up to 32, then start sampling
-        missing  = [nm for nm in all_elec_names if nm not in _cap_pos]
-        if missing:
-            abort(f"Hierarchical search needs electrode positions for every cap "
-                  f"electrode — missing from {cfg.eeg_csv_path}: {missing}")
+    def _run_location_search(electrode_pool: list) -> tuple:
+        """Runs the full coarse-to-fine (or flat) location search restricted
+        to electrode_pool. Returns (final_result_dict, history_or_None) —
+        parameterized by which electrodes are eligible so it can be called
+        once with the full pool (today's behaviour, unchanged) or twice
+        (Tier 0/1/2 first, then Tier 0-3 as a fallback — see the two-pass
+        mechanism right after this function)."""
+        _history = None
+        if cfg.optimizer.use_hierarchical_search:
+            n_total  = len(electrode_pool)
+            coarse_k = min(n_total, 32)   # take all electrodes up to 32, then start sampling
+            missing  = [nm for nm in electrode_pool if nm not in _cap_pos]
+            if missing:
+                abort(f"Hierarchical search needs electrode positions for every cap "
+                      f"electrode — missing from {cfg.eeg_csv_path}: {missing}")
 
-        n_fine = cfg.optimizer.num_fine_iterations
-        neighbours_per_iter = cfg.optimizer.neighbours_per_iteration
-        if n_fine and len(neighbours_per_iter) != n_fine:
-            abort(f"optimizer.neighbours_per_iteration must have exactly {n_fine} "
-                  f"entries (num_fine_iterations), got {len(neighbours_per_iter)}")
+            n_fine = cfg.optimizer.num_fine_iterations
+            neighbours_per_iter = cfg.optimizer.neighbours_per_iteration
+            if n_fine and len(neighbours_per_iter) != n_fine:
+                abort(f"optimizer.neighbours_per_iteration must have exactly {n_fine} "
+                      f"entries (num_fine_iterations), got {len(neighbours_per_iter)}")
 
-        print(f"\n  Hierarchical (coarse-to-fine) search — {n_fine} fine iteration(s) configured")
-        print(f"  Coarse round: {coarse_k}/{n_total} electrodes (farthest-point spatial sampling)")
-        def _montage_dict(best_ch1, best_ch2):
-            return {"ch1_plus": best_ch1[0], "ch1_minus": best_ch1[1],
-                    "ch2_plus": best_ch2[0], "ch2_minus": best_ch2[1]}
+            print(f"\n  Hierarchical (coarse-to-fine) search — {n_fine} fine iteration(s) configured")
+            print(f"  Coarse round: {coarse_k}/{n_total} electrodes (farthest-point spatial sampling)")
+            def _montage_dict(best_ch1, best_ch2):
+                return {"ch1_plus": best_ch1[0], "ch1_minus": best_ch1[1],
+                        "ch2_plus": best_ch2[0], "ch2_minus": best_ch2[1]}
 
-        coarse_names = _farthest_point_sample(all_elec_names, _cap_pos, coarse_k)
-        round_result = _search(coarse_names)
-        history = [{"round": "coarse", "n_electrodes": len(coarse_names),
-                    "montage": _montage_dict(round_result["best_ch1"], round_result["best_ch2"]),
-                    **{k: v for k, v in round_result.items()
-                       if k not in ("best_ch1", "best_ch2", "top_candidates")}}]
+            coarse_names = _farthest_point_sample(electrode_pool, _cap_pos, coarse_k)
+            round_result = _search(coarse_names)
+            _history = [{"round": "coarse", "n_electrodes": len(coarse_names),
+                        "montage": _montage_dict(round_result["best_ch1"], round_result["best_ch2"]),
+                        **{k: v for k, v in round_result.items()
+                           if k not in ("best_ch1", "best_ch2", "top_candidates")}}]
 
-        candidate_set = set(coarse_names)
-        for it in range(n_fine):
-            n_nb    = neighbours_per_iter[it]
-            winners = [round_result["best_ch1"][0], round_result["best_ch1"][1],
-                       round_result["best_ch2"][0], round_result["best_ch2"][1]]
-            # Freshly rebuilt from just this round's 4 winners each time — NOT
-            # unioned with the previous round's candidate set, so the search
-            # space actually narrows around the current best montage each
-            # iteration (e.g. 4 winners x 8 neighbours = up to 32+4=36
-            # electrodes), rather than growing without bound.
-            new_candidates = set()
-            for w in winners:
-                new_candidates.add(w)
-                new_candidates.update(_nearest_neighbours(w, all_elec_names, _cap_pos, n_nb))
+            candidate_set = set(coarse_names)
+            for it in range(n_fine):
+                n_nb    = neighbours_per_iter[it]
+                winners = [round_result["best_ch1"][0], round_result["best_ch1"][1],
+                           round_result["best_ch2"][0], round_result["best_ch2"][1]]
+                # Freshly rebuilt from just this round's 4 winners each time —
+                # NOT unioned with the previous round's candidate set, so the
+                # search space actually narrows around the current best
+                # montage each iteration (e.g. 4 winners x 8 neighbours = up
+                # to 32+4=36 electrodes), rather than growing without bound.
+                new_candidates = set()
+                for w in winners:
+                    new_candidates.add(w)
+                    new_candidates.update(_nearest_neighbours(w, electrode_pool, _cap_pos, n_nb))
 
-            if new_candidates == candidate_set:
-                print(f"\n  Fine iteration {it + 1}/{n_fine}: neighbour expansion added no "
-                      f"new electrodes to the candidate set — stopping early.")
-                break
+                if new_candidates == candidate_set:
+                    print(f"\n  Fine iteration {it + 1}/{n_fine}: neighbour expansion added no "
+                          f"new electrodes to the candidate set — stopping early.")
+                    break
 
-            candidate_set = new_candidates
-            print(f"\n  Fine iteration {it + 1}/{n_fine}: {len(candidate_set)} electrodes "
-                  f"(4 winners x {n_nb} nearest neighbours, deduplicated)")
-            new_result  = _search(sorted(candidate_set, key=all_elec_names.index))
-            prev_score  = round_result["best_score"]
-            improvement = ((new_result["best_score"] - prev_score) / abs(prev_score)
-                            if prev_score != 0 else float("inf"))
-            history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
-                             "montage": _montage_dict(new_result["best_ch1"], new_result["best_ch2"]),
-                             "improvement_vs_prev_round": improvement,
-                             **{k: v for k, v in new_result.items()
-                                if k not in ("best_ch1", "best_ch2", "top_candidates")}})
+                candidate_set = new_candidates
+                print(f"\n  Fine iteration {it + 1}/{n_fine}: {len(candidate_set)} electrodes "
+                      f"(4 winners x {n_nb} nearest neighbours, deduplicated)")
+                new_result  = _search(sorted(candidate_set, key=electrode_pool.index))
+                prev_score  = round_result["best_score"]
+                improvement = ((new_result["best_score"] - prev_score) / abs(prev_score)
+                                if prev_score != 0 else float("inf"))
+                _history.append({"round": f"fine_{it + 1}", "n_electrodes": len(candidate_set),
+                                 "montage": _montage_dict(new_result["best_ch1"], new_result["best_ch2"]),
+                                 "improvement_vs_prev_round": improvement,
+                                 **{k: v for k, v in new_result.items()
+                                    if k not in ("best_ch1", "best_ch2", "top_candidates")}})
 
-            round_result = new_result
-            print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
+                round_result = new_result
+                print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
 
-            if improvement < cfg.optimizer.early_stop_threshold:
-                print(f"  Improvement below the {cfg.optimizer.early_stop_threshold * 100:.0f}% "
-                      f"threshold — stopping early.")
-                break
+                if improvement < cfg.optimizer.early_stop_threshold:
+                    print(f"  Improvement below the {cfg.optimizer.early_stop_threshold * 100:.0f}% "
+                          f"threshold — stopping early.")
+                    break
 
-        final = round_result
-    else:
-        final = _search(all_elec_names)
+            _final = round_result
+        else:
+            _final = _search(electrode_pool)
+        return _final, _history
+
+    # Tier-3 two-pass: search Tier 0/1/2 electrodes first; only fall back to
+    # including Tier 3 if that pass doesn't meet the configured hard
+    # constraint (OptimizerConfig.use_electrode_scoring_tiers). Without any
+    # hard constraint configured, used_fallback can never be True (see
+    # _search()'s "used_fallback = hard_constraint and best_ch1 is None"),
+    # so the Tier 0/1/2-only pass always trivially "succeeds" and Tier 3 is
+    # simply never reached in that case — no separate heavy-penalty
+    # fallback needed, this falls out of the existing mechanism for free.
+    search_pool = all_elec_names
+    tier3_names: set = set()
+    used_tier3 = False
+    if cfg.optimizer.use_electrode_scoring_tiers:
+        _tiers_lower = {k.lower(): v for k, v in cfg.optimizer.electrode_tiers.items()}
+        tier3_names = {n for n in all_elec_names if _tiers_lower.get(n.lower()) == 3}
+        if tier3_names:
+            search_pool = [n for n in all_elec_names if n not in tier3_names]
+            print(f"\n  Electrode tiers: {len(tier3_names)} Tier-3 electrode(s) excluded from "
+                  f"the initial search — {sorted(tier3_names)}")
+
+    final, history = _run_location_search(search_pool)
+
+    if tier3_names and final.get("used_fallback"):
+        print(f"\n  WARNING: no Tier 0/1/2 montage met the hard constraint — "
+              f"re-running with Tier 3 electrodes included.")
+        final, history = _run_location_search(all_elec_names)
+        used_tier3 = True
+    elif tier3_names:
+        print(f"\n  Tier 0/1/2-only search met the hard constraint — Tier 3 electrodes not needed.")
 
     best_ch1, best_ch2, best_score = final["best_ch1"], final["best_ch2"], final["best_score"]
     n_eval     = sum(h["n_eval"] for h in history) if history else final["n_eval"]
@@ -1620,12 +1821,33 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             "rounds": [{k: v for k, v in h.items() if k != "used_fallback"} for h in history],
         }
     if use_focality:
-        results["focality_roc_score"]       = round(best_score, 6)
+        # best_score holds the COMPOSITE score when use_composite_location_score
+        # is on (background/tier penalties applied) — not the same number as
+        # the raw ROC distance anymore. Recompute the true raw ROC score for
+        # the winning montage specifically (from the already-computed
+        # full-mesh ti_full — no new leadfield work needed) so
+        # focality_roc_score always means what its name says; the composite
+        # value (what actually drove ranking) is reported separately.
+        _final_roc = -ROC(ti_full[roi_indices], ti_full[non_roi_indices],
+                          cfg.optimizer.focality_threshold, focal=True)
+        results["focality_roc_score"]       = round(_final_roc, 6)
         results["focality_threshold"]       = cfg.optimizer.focality_threshold
         results["hard_roi_constraint"]      = hard_constraint
         if hard_constraint:
             results["n_feasible_montages"]  = n_feasible
             results["roi_threshold_met"]    = roi_mean_V_m >= cfg.optimizer.focality_threshold[1]
+        if cfg.optimizer.use_composite_location_score:
+            results["composite_location_score"] = {
+                "value": round(best_score, 6),
+                "weights": cfg.optimizer.location_score_weights,
+                "background_minimized": cfg.optimizer.minimize_background_field,
+                "tiers_applied": cfg.optimizer.use_electrode_scoring_tiers,
+            }
+    if cfg.optimizer.use_electrode_scoring_tiers:
+        results["electrode_tiers"] = {
+            "tier3_electrodes_excluded_initially": sorted(tier3_names),
+            "tier3_electrodes_used_in_final_montage": used_tier3,
+        }
     res_path = f"{out_dir}/exhaustive_results.json"
     with open(res_path, "w") as f:
         json.dump(results, f, indent=2)

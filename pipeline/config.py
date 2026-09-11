@@ -34,6 +34,62 @@ def is_stimulation_electrode(name: str) -> bool:
     return (name or "").strip().lower() not in NON_ELECTRODE_NAMES
 
 
+# Canonical, repo-level electrode tier reference (Fiducials/Tier 0-4),
+# analogous to BNA_subregions.xlsx — one file at the project root, reused by
+# any subject/run rather than something each config re-specifies. Format
+# (see run_pipeline.py's sub-73T14 pilot csv for the source of truth this
+# was built from): two columns "Electrode,Tier" — Tier is either the literal
+# string "Fiducials" or a digit "0".."4". A name may list two 10-20/10-10
+# aliases separated by "/" (e.g. "T7/T3") — both aliases get the same tier,
+# since a given cap CSV may use either naming convention.
+DEFAULT_ELECTRODE_TIERS_CSV = "electrode_tiers_acceptable_vs_nogo.csv"
+
+
+def load_electrode_tiers_csv(csv_path: str) -> tuple[dict, set]:
+    """Parse an "Electrode,Tier" CSV into (tiers, excluded):
+      - tiers: {electrode_name_lower: 0|1|2|3} — same shape OptimizerConfig.
+        electrode_tiers already expects, ready to merge/assign directly.
+      - excluded: set of electrode_name_lower tagged "Fiducials" or "4" —
+        these never enter the search pool at all (same treatment as Tier 4
+        always intended: "should not be searched nor have their leadfield
+        created" — here it's the former only; the leadfield is still built
+        from whatever the base cap CSV contains, per the user's explicit
+        choice not to filter before leadfield generation, since a pre-built
+        leadfield already includes them and re-filtering costs nothing at
+        search time).
+    Column order is resolved by header name (case-insensitive "electrode"/
+    "tier"), not position, to survive a reordered or extended CSV.
+    """
+    import csv as _csv
+
+    tiers: dict = {}
+    excluded: set = set()
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        reader = _csv.DictReader(f)
+        if not reader.fieldnames:
+            return tiers, excluded
+        _cols = {c.strip().lower(): c for c in reader.fieldnames}
+        _name_col = _cols.get("electrode") or reader.fieldnames[0]
+        _tier_col = _cols.get("tier") or reader.fieldnames[1]
+        for row in reader:
+            raw_name = (row.get(_name_col) or "").strip()
+            raw_tier = (row.get(_tier_col) or "").strip()
+            if not raw_name or not raw_tier:
+                continue
+            names = [n.strip().lower() for n in raw_name.split("/") if n.strip()]
+            if raw_tier.lower() == "fiducials":
+                excluded.update(names)
+            elif raw_tier == "4":
+                excluded.update(names)
+            elif raw_tier in ("0", "1", "2", "3"):
+                for n in names:
+                    tiers[n] = int(raw_tier)
+            # unrecognized tier values are silently skipped — same
+            # "don't guess" spirit as the rest of this file; a malformed
+            # row just doesn't contribute a tier, it doesn't abort the run.
+    return tiers, excluded
+
+
 # ── Sub-configs ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -228,6 +284,118 @@ class OptimizerConfig:
         "roc": 0.7, "roi_mean": 0.1, "non_roi_mean": 0.1, "focality_ratio": 0.1,
     })
 
+    # ── Composite scoring for the main location search (opt-in) ─────────
+    # When False (default) the search's per-montage score is exactly what
+    # it always was — -ROC(...) for goal="focality", plain vol_mean for
+    # goal="mean" — completely unchanged, fully backward compatible. When
+    # True, that raw score becomes one term in a weighted composite that
+    # can also penalize background (off-target) field strength and/or
+    # electrode "tier" (safety/preference) — see location_score_weights.
+    #
+    # Deliberately NOT pool-relative-normalized like amplitude_sweep_weights
+    # above: the main search streams through up to hundreds of thousands of
+    # candidates in O(1) memory (track a running best, never collect a
+    # pool), so there's no pool to normalize against without a real
+    # architecture change. Weights here are plain absolute coefficients in
+    # a linear combination instead (score = w_main*raw_score -
+    # w_background*background_mean - w_tier_penalty*tier_cost) — this also
+    # means a weight calibrated on one subject/ROI means the same physical
+    # thing on another, unlike a pool-relative weight whose effective
+    # strength would silently depend on each run's own candidate spread.
+    use_composite_location_score: bool = False
+
+    # Minimize field strength across a broad "background" region (e.g.
+    # whole-brain GM+WM minus the ROI) — distinct from non_roi/
+    # non_roi_hard_constraint_groups, which are hard pass/fail ceilings on
+    # specific curated regions. This is a soft, continuous "lower is
+    # better" pressure over a much broader area, meant to discourage
+    # montages that produce strong off-target field (including directly
+    # under the electrodes) even when nothing they hit is explicitly
+    # constrained. Only takes effect when use_composite_location_score=True.
+    minimize_background_field: bool = False
+    # None (default) = genuinely whole-brain: use the full GM+WM element set
+    # straight from mesh tissue tags (no NIfTI file needed), minus the ROI.
+    # A real name (same mask_path() convention as ROI/non-ROI/constraint
+    # groups) opts into a narrower curated region instead of the whole brain.
+    background_mask_name: str | None = None
+
+    # Background elements are subsampled (uniform random, same mechanism as
+    # max_non_roi_elements) — a whole-brain-minus-ROI mask can easily be
+    # 1M+ GM+WM elements, and this term is evaluated on EVERY candidate
+    # montage in the search's hot loop, so left at full resolution it would
+    # dominate runtime. Kept smaller than max_non_roi_elements by default
+    # since it's now a third region evaluated per candidate on top of
+    # ROI+non-ROI+any constraint groups.
+    max_background_elements: int = 50_000
+
+    # A plain volume-weighted mean over the whole background region washes
+    # out a spatially concentrated hotspot (e.g. strong field dumped into
+    # frontal cortex) — a small-volume hot region barely moves an average
+    # dominated by the much larger rest-of-brain sitting near baseline. This
+    # term instead scores "how strong is the field within the hottest
+    # (100 - background_hotspot_percentile)% of the sampled background
+    # region" — the volume-weighted mean of just the elements at/above that
+    # percentile cutoff, evaluated on the same per-candidate background
+    # sample as background_mean (cheap: one np.percentile call + a masked
+    # weighted mean, same cost class as the existing mean). Default 80.0 =
+    # top 20% counted as "the hotspot" (user's explicit choice — a single
+    # extreme percentile like p95/p99 was considered too narrow/noisy; top
+    # 20-25% better captures a hotspot big enough to actually matter).
+    background_hotspot_percentile: float = 80.0
+
+    # ── Electrode scoring tiers (opt-in) ─────────────────────────────────
+    # Per-electrode safety/preference ranking, 0 (always available, no
+    # penalty) to 3 (only used if no Tier 0/1/2 combination can meet the
+    # configured hard constraint — see run_exhaustive_cap_optimization's
+    # two-pass search for the exact mechanism). Tier "4" and Fiducials
+    # (Nz/Iz/A1/A2 etc.) are excluded from the search pool entirely, every
+    # pass, no exceptions — see load_electrode_tiers_csv()/
+    # DEFAULT_ELECTRODE_TIERS_CSV above. This is driven by the tiers CSV's
+    # own tags, NOT by curating a separate cap CSV (the earlier approach) —
+    # the leadfield is still built from whatever the base cap contains
+    # (cheap enough not to bother pre-filtering; explicit user choice), only
+    # the SEARCH never evaluates these electrodes.
+    use_electrode_scoring_tiers: bool = False
+
+    # {electrode_name: 0|1|2|3}, matched by name (case-insensitive).
+    # Electrodes not present in this dict are treated as Tier 0 (no
+    # penalty) — this dict only needs entries for electrodes you actually
+    # want to penalize or gate behind the Tier-3 fallback. Left empty (the
+    # default) while use_electrode_scoring_tiers=True, this is
+    # auto-populated at run time from electrode_tiers_csv (or the canonical
+    # electrode_tiers_csv_path if that's also unset) — set this dict
+    # explicitly yourself only to override/bypass the CSV.
+    electrode_tiers: dict = field(default_factory=dict)
+
+    # Explicit override path for the CSV auto-load described above. None
+    # (default) falls back to BIDSConfig.electrode_tiers_csv_path — the
+    # canonical repo-root reference file, same convention as
+    # BNA_subregions.xlsx (one shared file, not something each config
+    # re-specifies).
+    electrode_tiers_csv: str | None = None
+
+    # Per-tier-point penalty weight, applied PER ELECTRODE in the montage
+    # (summed across all 4 — e.g. two Tier-2 electrodes cost 2x this
+    # weight, not the max of the two). Tier 0 is always 0, not
+    # configurable. Tier 3 has no weight here at all — it's governed
+    # entirely by the two-pass fallback mechanism (included in the search
+    # only if Tier 0/1/2 alone can't meet the hard constraint), not by a
+    # fixed score penalty.
+    electrode_tier_weights: dict = field(default_factory=lambda: {"1": 0.02, "2": 0.05})
+
+    # Composite weights (absolute, not pool-normalized — see
+    # use_composite_location_score's docstring above). "main" scales the
+    # existing raw score; "background"/"background_hotspot"/"tier_penalty"
+    # only contribute when minimize_background_field / use_electrode_
+    # scoring_tiers are themselves also enabled. "background_hotspot" is a
+    # placeholder pending the same pilot-run calibration as the others (see
+    # TODO_electrode_scoring_tiers.md) — set lower than "background" for now
+    # since it's a narrower, more surgical term on top of the broad one, not
+    # a replacement for it.
+    location_score_weights: dict = field(default_factory=lambda: {
+        "main": 1.0, "background": 0.2, "background_hotspot": 0.1, "tier_penalty": 0.1,
+    })
+
 
 @dataclass
 class SimulationConfig:
@@ -305,6 +473,12 @@ class PipelineConfig:
     @property
     def ti_opt_dir(self) -> str:
         return f"{self.sim_sub_dir}/TIoptimization"
+
+    @property
+    def electrode_tiers_csv_path(self) -> str:
+        """Canonical repo-level tiers reference (see DEFAULT_ELECTRODE_TIERS_CSV) —
+        one file at the project root, same convention as BNA_subregions.xlsx."""
+        return f"{self.project_dir}/{DEFAULT_ELECTRODE_TIERS_CSV}"
 
     def mask_path(self, label: str) -> str:
         """BIDS-compliant mask path: sub-{id}_label-{label}_mask.nii.gz"""
