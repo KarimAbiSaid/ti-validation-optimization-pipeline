@@ -20,6 +20,9 @@ from pathlib import Path
 import discovery      # atlas registry, region lut, path/readiness checks
 import cap_discovery  # cap listing + registered-cap path resolution
 from common import discover_subjects, get_m2m_path, PROJECT_DIR  # noqa: F401 (re-exported)
+import config as pipeline_config  # code/pipeline/config.py — electrode tiers CSV importer
+                                   # (common.py already puts code/pipeline/ on sys.path;
+                                   # no name collision, this module is config_discovery)
 
 # The project path INSIDE the SimNIBS Apptainer container on SCITAS, where
 # run_pipeline.py actually runs — always this path regardless of the local
@@ -56,6 +59,19 @@ OPTIMIZER_DEFAULTS = {
     "amplitude_sweep_step_mA":        0.02,
     "amplitude_sweep_max_per_pair_mA": 2.0,
     "amplitude_sweep_weights": {"roc": 0.7, "roi_mean": 0.1, "non_roi_mean": 0.1, "focality_ratio": 0.1},
+    # Composite location scoring — see GUI_WIRING_NOTES.md sections 1-4.
+    # Matches code/pipeline/config.py's OptimizerConfig defaults exactly.
+    "use_composite_location_score":  False,
+    "minimize_background_field":     False,
+    "background_mask_name":          None,
+    "max_background_elements":       50_000,
+    "background_hotspot_percentile": 80.0,
+    "use_electrode_scoring_tiers":   False,
+    "electrode_tiers":               {},
+    "electrode_tiers_csv":           None,
+    "electrode_tier_weights":        {"1": 0.02, "2": 0.05},
+    "location_score_weights":        {"main": 1.0, "background": 0.2,
+                                       "background_hotspot": 0.1, "tier_penalty": 0.1},
 }
 ELECTRODE_DEFAULTS = {
     "shape":             "ellipse",
@@ -108,6 +124,22 @@ def build_roi_dict(name: str, atlas_name: str, label_ids: dict) -> dict:
     if uses_allen(atlas_name):
         return {"name": name, "labels": {}}
     return {"name": name, "labels": label_ids}
+
+
+def electrode_tiers_preview(csv_path: str | None = None) -> dict:
+    """Read-only preview of an electrode-tiers CSV for the Config Generation
+    page (see GUI_WIRING_NOTES.md section 3) — "view what got auto-loaded",
+    not a picker. csv_path=None reads the canonical repo file
+    (pipeline_config.DEFAULT_ELECTRODE_TIERS_CSV_PATH), same fallback
+    run_pipeline.py itself uses when OptimizerConfig.electrode_tiers_csv is
+    unset. Never raises — a missing/unreadable CSV is reported via "error"
+    instead of crashing the page."""
+    path = csv_path or pipeline_config.DEFAULT_ELECTRODE_TIERS_CSV_PATH
+    try:
+        tiers, excluded = pipeline_config.load_electrode_tiers_csv(path)
+    except OSError as e:
+        return {"tiers": {}, "excluded": [], "csv_path": path, "error": str(e)}
+    return {"tiers": tiers, "excluded": sorted(excluded), "csv_path": path, "error": None}
 
 
 def roi_mask_exists(subject_id: str, name: str, mask_type: str,

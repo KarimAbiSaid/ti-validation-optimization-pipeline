@@ -412,6 +412,111 @@ layout = html.Div([
               "border": "1px solid #ccc", "borderRadius": "4px"}),
 
     html.Div([
+        dcc.Checklist(
+            id="cg-opt-loc-enable",
+            options=[{"label": " use_composite_location_score (advanced location scoring — "
+                      "combine the raw ROC/mean-TI score with the background-field and "
+                      "electrode-tier terms below; leave off to keep the existing raw score)",
+                      "value": "use_composite_location_score"}],
+            value=[k for k in ("use_composite_location_score",) if cd.OPTIMIZER_DEFAULTS[k]],
+        ),
+
+        html.Div([
+            dcc.Checklist(
+                id="cg-opt-bg-enable",
+                options=[{"label": " minimize_background_field (penalize strong field anywhere "
+                          "outside the ROI, including under the electrodes — requires "
+                          "use_composite_location_score above)",
+                          "value": "minimize_background_field"}],
+                value=[k for k in ("minimize_background_field",) if cd.OPTIMIZER_DEFAULTS[k]],
+            ),
+            html.Div([
+                html.Div([
+                    html.Label("background region (blank = whole brain GM+WM, minus ROI)"),
+                    dcc.Dropdown(id="cg-opt-bg-mask-dropdown", placeholder="Whole brain",
+                                 clearable=True),
+                ], style={"minWidth": "260px", "marginRight": "1rem", "flex": "1 1 260px"}),
+                html.Div([
+                    html.Label("max_background_elements (subsample cap)"),
+                    dcc.Input(id="cg-opt-bg-max-elements", type="number", min=1000, step=1000,
+                              value=cd.OPTIMIZER_DEFAULTS["max_background_elements"],
+                              style={"width": "100%"}),
+                ], style={"minWidth": "180px", "marginRight": "1rem"}),
+                html.Div([
+                    html.Label("background_hotspot_percentile"),
+                    dcc.Input(id="cg-opt-bg-hotspot-pct", type="number", min=0, max=100, step=1,
+                              value=cd.OPTIMIZER_DEFAULTS["background_hotspot_percentile"],
+                              style={"width": "100%"}),
+                ], style={"minWidth": "180px", "marginRight": "1rem"}),
+            ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                  "borderRadius": "4px"}),
+
+        html.Div([
+            dcc.Checklist(
+                id="cg-opt-tiers-enable",
+                options=[{"label": " use_electrode_scoring_tiers (penalize/exclude electrodes "
+                          "per the tier assignments below — requires use_composite_location_score "
+                          "above; Fiducials/Tier-4 are always excluded regardless)",
+                          "value": "use_electrode_scoring_tiers"}],
+                value=[k for k in ("use_electrode_scoring_tiers",) if cd.OPTIMIZER_DEFAULTS[k]],
+            ),
+            html.Div([
+                html.Div([
+                    html.Label("override CSV path (blank = canonical "
+                               "code/pipeline/electrode_tiers_acceptable_vs_nogo.csv)"),
+                    dcc.Input(id="cg-opt-tiers-csv-path", type="text", value="",
+                              placeholder="", style={"width": "100%"}),
+                ], style={"minWidth": "320px", "marginRight": "1rem", "flex": "1 1 320px"}),
+                html.Div([
+                    html.Label("Tier 1 weight"),
+                    dcc.Input(id="cg-opt-tiers-weight-1", type="number", step=0.01,
+                              value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["1"],
+                              style={"width": "100%"}),
+                ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                html.Div([
+                    html.Label("Tier 2 weight"),
+                    dcc.Input(id="cg-opt-tiers-weight-2", type="number", step=0.01,
+                              value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["2"],
+                              style={"width": "100%"}),
+                ], style={"minWidth": "100px", "marginRight": "1rem"}),
+            ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+            html.P("Read-only preview of what the pipeline will auto-load at run time "
+                   "(electrode_tiers itself is left for the CSV importer to populate — "
+                   "edit the CSV to change assignments, or point at a different one above).",
+                   style={"fontSize": "12px", "color": "#666", "marginTop": "0.5rem"}),
+            html.Div(id="cg-opt-tiers-preview"),
+        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                  "borderRadius": "4px"}),
+
+        html.Div([
+            html.Label("Composite weights — main / background / background_hotspot / tier_penalty",
+                       style={"fontWeight": "bold"}),
+            html.P("score = main*raw_score − background*background_mean − "
+                   "background_hotspot*background_hotspot_mean − tier_penalty*tier_cost. "
+                   "Only the terms actually enabled above contribute. Defaults are "
+                   "placeholders, not yet calibrated on real data.",
+                   style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+            html.Div([
+                dcc.Input(id="cg-opt-loc-weight-main", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["main"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-loc-weight-background", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-loc-weight-background-hotspot", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background_hotspot"],
+                          style={"width": "100%"}),
+                dcc.Input(id="cg-opt-loc-weight-tier-penalty", type="number", step=0.05,
+                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["tier_penalty"],
+                          style={"width": "100%"}),
+            ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px", "marginTop": "0.5rem"}),
+        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                  "borderRadius": "4px"}),
+    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
+              "border": "1px solid #ccc", "borderRadius": "4px"}),
+
+    html.Div([
         html.Label("Non-ROI subgroup hard constraints", style={"fontWeight": "bold"}),
         html.P("Rejects a montage if mean TI in mask_name exceeds max_mean_V_m, "
                "independently for EACH row — regardless of the overall non-ROI union "
@@ -595,14 +700,16 @@ def _constraint_group_mask_names(rows: list[dict] | None) -> list[str]:
     Input("cg-cap-dropdown", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
     Input("cg-opt-roi-constraint-groups-table", "data"),
+    Input("cg-opt-bg-mask-dropdown", "value"),
 )
 def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
                             non_roi_atlas, non_roi_name, non_roi_existing_mask,
-                            cap_path, constraint_group_rows, roi_constraint_group_rows):
+                            cap_path, constraint_group_rows, roi_constraint_group_rows, bg_mask_name):
     if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask):
         return []
     constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
-                              + _constraint_group_mask_names(roi_constraint_group_rows))
+                              + _constraint_group_mask_names(roi_constraint_group_rows)
+                              + ([bg_mask_name.strip()] if bg_mask_name and bg_mask_name.strip() else []))
     matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
                                  cap_path, constraint_group_masks=constraint_group_masks,
                                  roi_uses_existing_mask=bool(roi_existing_mask),
@@ -635,16 +742,19 @@ def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
     Input("cg-goals-checklist", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
     Input("cg-opt-roi-constraint-groups-table", "data"),
+    Input("cg-opt-bg-mask-dropdown", "value"),
     State("cg-generate-table", "selected_rows"),
 )
 def _update_generate_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
                            non_roi_atlas, non_roi_name, non_roi_existing_mask,
-                           cap_path, goals, constraint_group_rows, roi_constraint_group_rows, prev_selected):
+                           cap_path, goals, constraint_group_rows, roi_constraint_group_rows,
+                           bg_mask_name, prev_selected):
     if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask) or not goals:
         return [], []
 
     constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
-                              + _constraint_group_mask_names(roi_constraint_group_rows))
+                              + _constraint_group_mask_names(roi_constraint_group_rows)
+                              + ([bg_mask_name.strip()] if bg_mask_name and bg_mask_name.strip() else []))
     matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
                                  cap_path, constraint_group_masks=constraint_group_masks,
                                  roi_uses_existing_mask=bool(roi_existing_mask),
@@ -795,6 +905,36 @@ def _update_roi_constraint_group_mask_options(subject_ids):
 
 
 @callback(
+    Output("cg-opt-bg-mask-dropdown", "options"),
+    Input("cg-subject-dropdown", "value"),
+)
+def _update_bg_mask_options(subject_ids):
+    return [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
+
+
+@callback(
+    Output("cg-opt-tiers-preview", "children"),
+    Input("cg-opt-tiers-csv-path", "value"),
+)
+def _update_tiers_preview(csv_path_override):
+    preview = cd.electrode_tiers_preview((csv_path_override or "").strip() or None)
+    if preview["error"]:
+        return html.P(f"⚠ could not read {preview['csv_path']}: {preview['error']}",
+                      style={"color": "#a00", "fontSize": "12px"})
+    rows = [{"electrode": name, "tier": str(t)} for name, t in sorted(preview["tiers"].items())]
+    rows += [{"electrode": name, "tier": "Fiducials/4 (excluded)"} for name in preview["excluded"]]
+    return html.Div([
+        html.P(f"{preview['csv_path']}  —  {len(preview['tiers'])} tier assignment(s), "
+               f"{len(preview['excluded'])} excluded (Fiducials/Tier 4)",
+               style={"fontSize": "12px", "color": "#666"}),
+        _styled_table("cg-opt-tiers-preview-table", [
+            {"name": "electrode", "id": "electrode"},
+            {"name": "tier", "id": "tier"},
+        ], data=rows),
+    ])
+
+
+@callback(
     Output("cg-generate-results", "children"),
     Input("cg-generate-button", "n_clicks"),
     State("cg-generate-table", "data"),
@@ -828,6 +968,19 @@ def _update_roi_constraint_group_mask_options(subject_ids):
     State("cg-opt-amp-weight-roi-mean", "value"),
     State("cg-opt-amp-weight-non-roi-mean", "value"),
     State("cg-opt-amp-weight-focality-ratio", "value"),
+    State("cg-opt-loc-enable", "value"),
+    State("cg-opt-bg-enable", "value"),
+    State("cg-opt-bg-mask-dropdown", "value"),
+    State("cg-opt-bg-max-elements", "value"),
+    State("cg-opt-bg-hotspot-pct", "value"),
+    State("cg-opt-tiers-enable", "value"),
+    State("cg-opt-tiers-csv-path", "value"),
+    State("cg-opt-tiers-weight-1", "value"),
+    State("cg-opt-tiers-weight-2", "value"),
+    State("cg-opt-loc-weight-main", "value"),
+    State("cg-opt-loc-weight-background", "value"),
+    State("cg-opt-loc-weight-background-hotspot", "value"),
+    State("cg-opt-loc-weight-tier-penalty", "value"),
     State("cg-elec-diameter", "value"),
     State("cg-elec-gel-thickness", "value"),
     State("cg-elec-max-current", "value"),
@@ -841,6 +994,10 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                        constraint_group_rows, roi_constraint_group_rows,
                        amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
                        amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+                       loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+                       tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
+                       loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
+                       loc_weight_tier_penalty,
                        elec_diameter, elec_gel, elec_max_current, flags_checklist):
     rows = rows or []
     selected_rows = selected_rows or []
@@ -939,6 +1096,32 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                              else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["non_roi_mean"]),
             "focality_ratio": (amp_weight_focality_ratio if amp_weight_focality_ratio is not None
                                else cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["focality_ratio"]),
+        },
+        "use_composite_location_score": "use_composite_location_score" in (loc_enable or []),
+        "minimize_background_field": "minimize_background_field" in (bg_enable or []),
+        "background_mask_name": (bg_mask_name.strip() if bg_mask_name and bg_mask_name.strip() else None),
+        "max_background_elements": (int(bg_max_elements) if bg_max_elements
+                                    else cd.OPTIMIZER_DEFAULTS["max_background_elements"]),
+        "background_hotspot_percentile": (bg_hotspot_pct if bg_hotspot_pct is not None
+                                          else cd.OPTIMIZER_DEFAULTS["background_hotspot_percentile"]),
+        "use_electrode_scoring_tiers": "use_electrode_scoring_tiers" in (tiers_enable or []),
+        # electrode_tiers itself is deliberately left at the default {} — the
+        # pipeline auto-populates it from the CSV at run time (see
+        # GUI_WIRING_NOTES.md section 3); only the CSV path/weights are
+        # GUI-editable here, not a hand-built per-electrode picker.
+        "electrode_tiers_csv": (tiers_csv_path.strip() if tiers_csv_path and tiers_csv_path.strip() else None),
+        "electrode_tier_weights": {
+            "1": tiers_weight_1 if tiers_weight_1 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["1"],
+            "2": tiers_weight_2 if tiers_weight_2 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["2"],
+        },
+        "location_score_weights": {
+            "main": loc_weight_main if loc_weight_main is not None else cd.OPTIMIZER_DEFAULTS["location_score_weights"]["main"],
+            "background": (loc_weight_background if loc_weight_background is not None
+                           else cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background"]),
+            "background_hotspot": (loc_weight_background_hotspot if loc_weight_background_hotspot is not None
+                                   else cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background_hotspot"]),
+            "tier_penalty": (loc_weight_tier_penalty if loc_weight_tier_penalty is not None
+                             else cd.OPTIMIZER_DEFAULTS["location_score_weights"]["tier_penalty"]),
         },
     }
     electrode_overrides = {

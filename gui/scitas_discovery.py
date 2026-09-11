@@ -64,6 +64,7 @@ TRACKED_PIPELINE_FILES = [
     "recon_all_scitas.sbatch",
     "generate_leadfield_cli.py",
     "generate_leadfield_scitas.sbatch",
+    "electrode_tiers_acceptable_vs_nogo.csv",
 ]
 
 # Of TRACKED_PIPELINE_FILES, the ones actually imported/executed by a
