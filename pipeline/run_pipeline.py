@@ -13,7 +13,6 @@ import sys
 import re
 import json
 import time
-import heapq
 import datetime
 import argparse
 import subprocess
@@ -71,14 +70,16 @@ def _tier_cost(electrode_names, electrode_tiers: dict, tier_weights: dict) -> fl
     cost 2x the Tier-2 weight). Electrodes absent from electrode_tiers, or
     mapped to Tier 0, contribute nothing (Tier 0 is always free, not
     configurable). electrode_tiers keys are matched case-insensitively.
-    Tier 3 is deliberately NOT priced here even if tier_weights has a "3"
-    entry — it's gated by the two-pass search fallback instead (see
-    run_exhaustive_cap_optimization), not a fixed score penalty."""
+    Every other tier (1-4) IS priced here — unlike the earlier two-pass
+    design, ALL of 1-4 now participate in the tier cascade (see
+    run_exhaustive_cap_optimization) and need a price so that, once a tier
+    is unlocked, montages using fewer/cheaper penalized electrodes are
+    still preferred over costlier ones within the same unlocked pool."""
     lower_tiers = {k.lower(): v for k, v in electrode_tiers.items()}
     cost = 0.0
     for name in electrode_names:
         tier = lower_tiers.get(name.lower())
-        if tier is None or tier == 0 or tier == 3:
+        if tier is None or tier == 0:
             continue
         cost += tier_weights.get(str(tier), 0.0)
     return cost
@@ -862,28 +863,31 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
     # Electrode tiers (opt-in) — auto-load from the tiers CSV when enabled
     # and the config didn't already hand-populate electrode_tiers itself.
-    # Tier "4"/Fiducials (Nz/Iz/A1/A2 etc.) are excluded from all_elec_names
-    # right here, before anything downstream (adjacency, hierarchical
-    # search, Tier-3 pool split) ever sees them — same treatment on every
-    # search pass, no exceptions. The leadfield itself is left untouched
-    # (still built from the full base cap); only the SEARCH never evaluates
-    # these electrodes, per the explicit choice not to pre-filter the cap.
+    # Fiducials (Nz/Iz/A1/A2 etc.) are excluded from all_elec_names right
+    # here, before anything downstream ever sees them — a PERMANENT
+    # exclusion at every tier cascade level, no exceptions (they aren't
+    # real stimulation sites at all). Tier 4 electrodes are NOT excluded
+    # here — unlike the earlier design, Tier 4 is now a real last-resort
+    # level in the cascade (see STEP 3 below), so they stay in
+    # all_elec_names and are simply gated out of the pool until/unless
+    # Level 4 is reached. The leadfield itself is left untouched either way
+    # (still built from the full base cap); only the SEARCH is restricted.
     if cfg.optimizer.use_electrode_scoring_tiers and not cfg.optimizer.electrode_tiers:
         _tiers_csv_path = cfg.optimizer.electrode_tiers_csv or cfg.electrode_tiers_csv_path
         if not os.path.isfile(_tiers_csv_path):
             print(f"  WARNING: electrode tiers CSV not found ({_tiers_csv_path}) "
                   f"— use_electrode_scoring_tiers has nothing to apply this run")
         else:
-            _auto_tiers, _auto_excluded = load_electrode_tiers_csv(_tiers_csv_path)
+            _auto_tiers, _auto_fiducials = load_electrode_tiers_csv(_tiers_csv_path)
             cfg.optimizer.electrode_tiers = _auto_tiers
             _before = len(all_elec_names)
-            all_elec_names = [n for n in all_elec_names if n.lower() not in _auto_excluded]
+            all_elec_names = [n for n in all_elec_names if n.lower() not in _auto_fiducials]
             _n_excluded = _before - len(all_elec_names)
             if _n_excluded:
                 print(f"  Electrode tiers: loaded {len(_auto_tiers)} tier assignment(s) "
                       f"from {_tiers_csv_path}")
-                print(f"  Electrode tiers: {_n_excluded} Tier-4/Fiducial electrode(s) "
-                      f"excluded from the search entirely (not just this pass)")
+                print(f"  Electrode tiers: {_n_excluded} Fiducial electrode(s) "
+                      f"permanently excluded from the search (every cascade level)")
                 n_elec = len(all_elec_names)   # reflects the post-exclusion searchable set
 
     # Map our NIfTI ROI mask onto mesh elements
@@ -1233,6 +1237,17 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     # behaviour, not an approximation.
     montage_cache: dict = {}
 
+    # Composite location scoring (opt-in) — see OptimizerConfig's
+    # use_composite_location_score docstring for the full explanation.
+    # Resolved once here (not inside _search()) so both the location search
+    # AND the amplitude sweep (STEP 3.5, which needs to recompute the true
+    # composite at whichever currents it settles on) share the same
+    # resolved flags/weights.
+    use_composite  = cfg.optimizer.use_composite_location_score
+    use_background = use_composite and cfg.optimizer.minimize_background_field and lf_background is not None
+    use_tiers      = use_composite and cfg.optimizer.use_electrode_scoring_tiers
+    loc_weights    = cfg.optimizer.location_score_weights if use_composite else None
+
     def _count_combos(valid_pairs: list) -> int:
         """Number of valid montages (pairs-of-pairs with no shared/adjacent electrode)."""
         n = 0
@@ -1266,24 +1281,6 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         n_feasible = 0
         n_eval     = 0
         t_start    = time.time()
-
-        # Top-N tracking for the amplitude sweep (STEP 3.5) — a small
-        # min-heap of (score, tiebreak, ch1, ch2), tiebreak avoids ever
-        # comparing tuples of electrode-name pairs when scores are equal.
-        # Only paid for when the sweep is actually enabled — negligible
-        # overhead either way (heap of size top_n, not the full candidate count).
-        top_n = cfg.optimizer.amplitude_sweep_top_n if cfg.optimizer.use_amplitude_sweep else 0
-        top_heap: list = []
-        _tiebreak = 0
-
-        # Composite location scoring (opt-in) — see OptimizerConfig's
-        # use_composite_location_score docstring for the full explanation.
-        # Resolved to local variables once, outside the hot loop, so every
-        # candidate's cost is just a couple of cheap boolean checks.
-        use_composite  = cfg.optimizer.use_composite_location_score
-        use_background = use_composite and cfg.optimizer.minimize_background_field and lf_background is not None
-        use_tiers      = use_composite and cfg.optimizer.use_electrode_scoring_tiers
-        loc_weights    = cfg.optimizer.location_score_weights if use_composite else None
 
         for i, (ep1, em1) in enumerate(valid_pairs):
             ef1_roi    = get_ef(lf_roi, ep1, em1)
@@ -1416,14 +1413,6 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                     best_ch1   = (ep1, em1)
                     best_ch2   = (ep2, em2)
 
-                if top_n > 0:
-                    _tiebreak += 1
-                    entry = (score, _tiebreak, (ep1, em1), (ep2, em2))
-                    if len(top_heap) < top_n:
-                        heapq.heappush(top_heap, entry)
-                    elif score > top_heap[0][0]:
-                        heapq.heapreplace(top_heap, entry)
-
         elapsed = time.time() - t_start
 
         used_fallback = hard_constraint and best_ch1 is None
@@ -1441,17 +1430,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         if hard_constraint:
             print(f"  Feasible montages (ROI >= {roi_min_threshold} V/m): {n_feasible}")
 
-        # Highest score first. Note: if used_fallback fired, top_candidates
-        # may be empty — nothing reached the scoring step at all when no
-        # montage cleared the ROI-floor threshold (the amplitude sweep
-        # falls back to a single-current evaluation of best_ch1/best_ch2 in
-        # that case; see STEP 3.5 below).
-        top_candidates = [{"ch1": c[2], "ch2": c[3], "score": c[0]}
-                          for c in sorted(top_heap, key=lambda c: c[0], reverse=True)]
-
         return {
             "best_ch1": best_ch1, "best_ch2": best_ch2, "best_score": best_score,
-            "top_candidates": top_candidates,
             "n_feasible": n_feasible, "n_eval": n_eval, "elapsed": elapsed,
             "n_valid_pairs": n_valid, "n_combos": n_combos, "used_fallback": used_fallback,
         }
@@ -1490,7 +1470,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             _history = [{"round": "coarse", "n_electrodes": len(coarse_names),
                         "montage": _montage_dict(round_result["best_ch1"], round_result["best_ch2"]),
                         **{k: v for k, v in round_result.items()
-                           if k not in ("best_ch1", "best_ch2", "top_candidates")}}]
+                           if k not in ("best_ch1", "best_ch2")}}]
 
             candidate_set = set(coarse_names)
             for it in range(n_fine):
@@ -1523,7 +1503,7 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                                  "montage": _montage_dict(new_result["best_ch1"], new_result["best_ch2"]),
                                  "improvement_vs_prev_round": improvement,
                                  **{k: v for k, v in new_result.items()
-                                    if k not in ("best_ch1", "best_ch2", "top_candidates")}})
+                                    if k not in ("best_ch1", "best_ch2")}})
 
                 round_result = new_result
                 print(f"  Round score: {round_result['best_score']:.4f} ({improvement * 100:+.1f}% vs previous round)")
@@ -1538,39 +1518,68 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             _final = _search(electrode_pool)
         return _final, _history
 
-    # Tier-3 two-pass: search Tier 0/1/2 electrodes first; only fall back to
-    # including Tier 3 if that pass doesn't meet the configured hard
-    # constraint (OptimizerConfig.use_electrode_scoring_tiers). Without any
-    # hard constraint configured, used_fallback can never be True (see
+    # Electrode tier cascade (opt-in, OptimizerConfig.use_electrode_scoring_
+    # tiers): a 4-level CUMULATIVE pool — Level 1 = Tier 0+1, Level 2 =
+    # Level 1 + Tier 2, Level 3 = Level 2 + Tier 3, Level 4 = Level 3 +
+    # Tier 4 — escalating one level only when the current level finds
+    # nothing meeting the configured hard constraint. Without any hard
+    # constraint configured, used_fallback can never be True (see
     # _search()'s "used_fallback = hard_constraint and best_ch1 is None"),
-    # so the Tier 0/1/2-only pass always trivially "succeeds" and Tier 3 is
-    # simply never reached in that case — no separate heavy-penalty
-    # fallback needed, this falls out of the existing mechanism for free.
-    search_pool = all_elec_names
-    tier3_names: set = set()
-    used_tier3 = False
+    # so Level 1 always trivially "succeeds" and nothing beyond it is ever
+    # reached in that case — no separate heavy-penalty fallback needed,
+    # this falls out of the existing mechanism for free. A level whose
+    # pool is identical to the previous one (this cap has zero electrodes
+    # at that tier) is skipped rather than re-searched for no reason —
+    # montage_cache would make the repeat cheap, but there's still no
+    # point re-running an identical search.
+    tier_pools: list = [all_elec_names]          # tier_pools[0] = "Level 1"
+    tier_counts: list = [0, 0, 0, 0]              # electrodes newly added at levels 2/3/4 (index 1-3 used)
     if cfg.optimizer.use_electrode_scoring_tiers:
         _tiers_lower = {k.lower(): v for k, v in cfg.optimizer.electrode_tiers.items()}
-        tier3_names = {n for n in all_elec_names if _tiers_lower.get(n.lower()) == 3}
-        if tier3_names:
-            search_pool = [n for n in all_elec_names if n not in tier3_names]
-            print(f"\n  Electrode tiers: {len(tier3_names)} Tier-3 electrode(s) excluded from "
-                  f"the initial search — {sorted(tier3_names)}")
+        _by_tier = {2: [], 3: [], 4: []}
+        for n in all_elec_names:
+            t = _tiers_lower.get(n.lower())
+            if t in _by_tier:
+                _by_tier[t].append(n)
+        _level1 = [n for n in all_elec_names if _tiers_lower.get(n.lower()) not in (2, 3, 4)]
+        tier_pools = [_level1,
+                      _level1 + _by_tier[2],
+                      _level1 + _by_tier[2] + _by_tier[3],
+                      _level1 + _by_tier[2] + _by_tier[3] + _by_tier[4]]
+        tier_counts = [0, len(_by_tier[2]), len(_by_tier[3]), len(_by_tier[4])]
+        if any(_by_tier.values()):
+            print(f"\n  Electrode tiers: Level 1 pool = {len(_level1)} electrodes (Tier 0/1) — "
+                  f"held back unless needed: Tier 2 (+{tier_counts[1]}), "
+                  f"Tier 3 (+{tier_counts[2]}), Tier 4 (+{tier_counts[3]})")
 
-    final, history = _run_location_search(search_pool)
+    final = history = None
+    tier_level_used = 1
+    n_eval = elapsed = n_feasible = 0
+    _prev_pool = None
+    for _level, _pool in enumerate(tier_pools, start=1):
+        if _pool == _prev_pool:
+            continue   # this tier is empty on this cap — nothing new to search
+        if _level > 1:
+            print(f"\n  WARNING: no Level {tier_level_used} montage met the hard constraint "
+                  f"— escalating to Level {_level} (adds {tier_counts[_level - 1]} "
+                  f"Tier-{_level} electrode(s)).")
+        final, history = _run_location_search(_pool)
+        tier_level_used = _level
+        n_eval     += sum(h["n_eval"] for h in history) if history else final["n_eval"]
+        elapsed    += sum(h["elapsed"] for h in history) if history else final["elapsed"]
+        n_feasible += sum(h["n_feasible"] for h in history) if history else final["n_feasible"]
+        _prev_pool = _pool
+        if not final.get("used_fallback"):
+            break
 
-    if tier3_names and final.get("used_fallback"):
-        print(f"\n  WARNING: no Tier 0/1/2 montage met the hard constraint — "
-              f"re-running with Tier 3 electrodes included.")
-        final, history = _run_location_search(all_elec_names)
-        used_tier3 = True
-    elif tier3_names:
-        print(f"\n  Tier 0/1/2-only search met the hard constraint — Tier 3 electrodes not needed.")
+    if cfg.optimizer.use_electrode_scoring_tiers and len(tier_pools) > 1 and any(tier_counts[1:]):
+        if tier_level_used == 1:
+            print(f"\n  Level 1 (Tier 0/1 only) search met the hard constraint — "
+                  f"higher tiers not needed.")
+        else:
+            print(f"\n  Level {tier_level_used} search met the hard constraint.")
 
     best_ch1, best_ch2, best_score = final["best_ch1"], final["best_ch2"], final["best_score"]
-    n_eval     = sum(h["n_eval"] for h in history) if history else final["n_eval"]
-    elapsed    = sum(h["elapsed"] for h in history) if history else final["elapsed"]
-    n_feasible = sum(h["n_feasible"] for h in history) if history else final["n_feasible"]
 
     print(f"\n  ══ Best montage (electrode locations) ══")
     print(f"  Ch1: {best_ch1[0]}+ / {best_ch1[1]}-  @ {cfg.electrode.current_mA} mA")
@@ -1596,14 +1605,18 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             print("\n  WARNING: use_amplitude_sweep is set but goal != 'focality' "
                   "(no non-ROI/ROC to sweep against) — skipping amplitude sweep.")
         else:
-            top_candidates = final.get("top_candidates") or []
-            if not top_candidates:
-                print("\n  WARNING: no top-N candidates recorded for the amplitude "
-                      "sweep (likely because the hard-constraint fallback fired, so "
-                      "nothing reached the scoring step) — skipping amplitude sweep.")
+            # Fixed to the location search's own single winning montage —
+            # see use_amplitude_sweep's docstring in config.py for why this
+            # no longer considers multiple candidate montages.
+            fixed_montage = ([{"ch1": best_ch1, "ch2": best_ch2}] if best_ch1 is not None else [])
+            if not fixed_montage:
+                print("\n  WARNING: no winning montage to sweep (likely because the "
+                      "hard-constraint fallback fired, so nothing reached the "
+                      "scoring step) — skipping amplitude sweep.")
             else:
                 print(f"\n  ══════════════════════════════════════════════════════")
-                print(f"  Amplitude sweep — {len(top_candidates)} montage(s)")
+                print(f"  Amplitude sweep — {best_ch1[0]}+/{best_ch1[1]}- x "
+                      f"{best_ch2[0]}+/{best_ch2[1]}- (montage fixed, currents only)")
                 print(f"  ══════════════════════════════════════════════════════")
                 amps_mA = np.round(np.arange(
                     cfg.optimizer.amplitude_sweep_min_mA,
@@ -1616,8 +1629,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                       f"total cap {max_total_mA} mA")
 
                 _sweep_t0 = time.time()
-                pool = []   # every constraint-surviving (montage, I1, I2) combo, raw metrics
-                for cand in top_candidates:
+                pool = []   # every constraint-surviving (I1, I2) combo for the fixed montage, raw metrics
+                for cand in fixed_montage:
                     ep1, em1 = cand["ch1"]
                     ep2, em2 = cand["ch2"]
                     for I1_mA in amps_mA:
@@ -1668,16 +1681,16 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                                 "non_roi_mean": nonroi_mean_i, "focality_ratio": float(focality_ratio),
                             })
                 _sweep_elapsed = time.time() - _sweep_t0
-                sweep_stats = {"n_montages": len(top_candidates), "grid_size_mA": len(amps_mA),
-                              "n_combinations_evaluated": len(top_candidates) * len(amps_mA) * len(amps_mA),
+                sweep_stats = {"n_montages": len(fixed_montage), "grid_size_mA": len(amps_mA),
+                              "n_combinations_evaluated": len(fixed_montage) * len(amps_mA) * len(amps_mA),
                               "n_surviving": len(pool), "elapsed_s": round(_sweep_elapsed, 2)}
                 print(f"  Evaluated in {_sweep_elapsed:.1f}s — {len(pool)} combination(s) "
                       f"satisfied every hard constraint")
 
                 if not pool:
-                    print("  WARNING: no (montage, current) combination in the sweep "
-                          "satisfied every hard constraint — keeping the location "
-                          f"search's original pick at {cfg.electrode.current_mA} mA per channel.")
+                    print("  WARNING: no current combination in the sweep satisfied "
+                          "every hard constraint — keeping the location search's "
+                          f"original pick at {cfg.electrode.current_mA} mA per channel.")
                 else:
                     def _minmax_norm(vals, invert):
                         lo, hi = min(vals), max(vals)
@@ -1698,16 +1711,50 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
 
                     pool.sort(key=lambda c: c["composite_score"], reverse=True)
                     winner = pool[0]
-                    best_ch1, best_ch2 = winner["ch1"], winner["ch2"]
+                    best_ch1, best_ch2 = winner["ch1"], winner["ch2"]   # unchanged — montage is fixed
                     ch1_current_mA, ch2_current_mA = winner["I1_mA"], winner["I2_mA"]
-                    best_score = -winner["roc_dist"]   # keep "higher = better" convention used elsewhere
                     sweep_pool = pool
+
+                    # Recompute the TRUE use_composite_location_score composite
+                    # (not just the sweep's own narrower roc/roi_mean/non_roi_
+                    # mean/focality_ratio criterion above) at the winning
+                    # currents, so composite_location_score.value in results.json
+                    # actually reflects background/hotspot/tier at the amplitudes
+                    # that got reported — see use_amplitude_sweep's docstring in
+                    # config.py for why this replaced a flat "best_score =
+                    # -winner['roc_dist']" overwrite that discarded those terms
+                    # entirely. tier_cost doesn't depend on current, only on
+                    # which electrodes are used, so it's unaffected either way.
+                    best_score = -winner["roc_dist"]
+                    if use_composite:
+                        I1_A_w = winner["I1_mA"] * 1e-3
+                        I2_A_w = winner["I2_mA"] * 1e-3
+                        composite = loc_weights.get("main", 1.0) * best_score
+                        if use_background:
+                            ef1_bg_w = get_ef(lf_background, best_ch1[0], best_ch1[1], I1_A_w)
+                            ef2_bg_w = get_ef(lf_background, best_ch2[0], best_ch2[1], I2_A_w)
+                            ti_bg_w  = TI.get_maxTI(ef1_bg_w, ef2_bg_w)
+                            composite -= loc_weights.get("background", 0.0) * _vol_mean(
+                                ti_bg_w, background_vols, background_vols_sum)
+                            _cut_w  = np.percentile(ti_bg_w, cfg.optimizer.background_hotspot_percentile)
+                            _hot_w  = ti_bg_w >= _cut_w
+                            composite -= loc_weights.get("background_hotspot", 0.0) * _vol_mean(
+                                ti_bg_w[_hot_w], background_vols[_hot_w])
+                        if use_tiers:
+                            _tcost_w = _tier_cost((best_ch1[0], best_ch1[1], best_ch2[0], best_ch2[1]),
+                                                  cfg.optimizer.electrode_tiers,
+                                                  cfg.optimizer.electrode_tier_weights)
+                            composite -= loc_weights.get("tier_penalty", 0.0) * _tcost_w
+                        best_score = composite
 
                     print(f"\n  ══ Best montage (after amplitude sweep) ══")
                     print(f"  Ch1: {best_ch1[0]}+ / {best_ch1[1]}-  @ {ch1_current_mA:.2f} mA")
                     print(f"  Ch2: {best_ch2[0]}+ / {best_ch2[1]}-  @ {ch2_current_mA:.2f} mA")
-                    print(f"  Composite score: {winner['composite_score']:.4f}  "
-                          f"(from {len(pool)} surviving combinations)")
+                    print(f"  Amplitude-sweep current-selection score: {winner['composite_score']:.4f}  "
+                          f"(from {len(pool)} surviving current combinations)")
+                    if use_composite:
+                        print(f"  True composite score (background/hotspot/tier re-applied "
+                              f"at these currents): {best_score:.4f}")
 
     # ════════════════════════════════════════════════════════════════════════
     # STEP 4 — Save the best TI field on the full head mesh
@@ -1845,8 +1892,10 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
             }
     if cfg.optimizer.use_electrode_scoring_tiers:
         results["electrode_tiers"] = {
-            "tier3_electrodes_excluded_initially": sorted(tier3_names),
-            "tier3_electrodes_used_in_final_montage": used_tier3,
+            "cascade_level_used": tier_level_used,   # 1=Tier 0/1 only, 2=+Tier2, 3=+Tier3, 4=+Tier4
+            "tier2_electrodes_available": tier_counts[1],
+            "tier3_electrodes_available": tier_counts[2],
+            "tier4_electrodes_available": tier_counts[3],
         }
     res_path = f"{out_dir}/exhaustive_results.json"
     with open(res_path, "w") as f:

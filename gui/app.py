@@ -15,7 +15,7 @@ from dash import Dash, html, dcc
 
 app = Dash(__name__, use_pages=True, suppress_callback_exceptions=True)
 
-CATEGORY_ORDER = ["Preprocessing", "Simulation", "Optimization", "Settings"]
+CATEGORY_ORDER = ["Preprocessing", "Simulation", "Optimization", "Analysis", "Settings"]
 
 
 def _build_nav():

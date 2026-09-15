@@ -21,6 +21,7 @@ import cap_discovery as cd
 import discovery
 import fem_discovery as fd
 import job_runner as jr
+import slice_viewer_ui as sv
 import viz_discovery as vz
 
 dash.register_page(__name__, path="/fem", name="FEM Validation", category="Simulation", order=1)
@@ -208,7 +209,9 @@ layout = html.Div([
         html.P("Scroll through T1 slices (axial/coronal/sagittal, each its own slider) with the "
                "TI field amplitude overlaid and the region outlined — a different view from Render "
                "Figure above (2D voxel slices, not a 3D surface). Downsampled for a fast, fully "
-               "interactive scrubber — dragging a slider never touches the server.",
+               "interactive scrubber — dragging a slider never touches the server. Click or "
+               "drag on any of the three images to move the crosshair — the other two views jump "
+               "to that point, same as a standard MRI viewer.",
                style={"fontSize": "13px", "color": "#666"}),
         html.Div([
             html.Div([
@@ -230,27 +233,7 @@ layout = html.Div([
         html.Img(id="fv-slice-colorbar-img", style={"marginTop": "0.5rem", "maxWidth": "320px"}),
         html.Div(id="fv-slice-legend-row", style={"marginTop": "0.35rem", "fontSize": "13px"}),
 
-        html.Div([
-            html.Div([
-                html.H5("Axial"),
-                html.Img(id="fv-slice-axial-img", style={"width": "100%"}),
-                dcc.Slider(id="fv-slice-axial-slider", min=0, max=0, step=1, value=0),
-            ], style={"flex": "1", "marginRight": "0.75rem", "minWidth": "200px"}),
-            html.Div([
-                html.H5("Coronal"),
-                html.Img(id="fv-slice-coronal-img", style={"width": "100%"}),
-                dcc.Slider(id="fv-slice-coronal-slider", min=0, max=0, step=1, value=0),
-            ], style={"flex": "1", "marginRight": "0.75rem", "minWidth": "200px"}),
-            html.Div([
-                html.H5("Sagittal"),
-                html.Img(id="fv-slice-sagittal-img", style={"width": "100%"}),
-                dcc.Slider(id="fv-slice-sagittal-slider", min=0, max=0, step=1, value=0),
-            ], style={"flex": "1", "minWidth": "200px"}),
-        ], id="fv-slice-viewer-container", style={"display": "none", "flexWrap": "wrap", "marginTop": "1rem"}),
-
-        dcc.Store(id="fv-slice-axial-frames"),
-        dcc.Store(id="fv-slice-coronal-frames"),
-        dcc.Store(id="fv-slice-sagittal-frames"),
+        sv.viewer_container("fv-slice"),
     ], style={"marginTop": "1rem", "padding": "0.75rem", "border": "1px solid #ccc", "borderRadius": "4px"}),
 
     html.Hr(style={"marginTop": "2.5rem"}),
@@ -808,33 +791,25 @@ def _poll_slice_job(_n_intervals, job_dir):
 
     frames = result["frames"]
     n = result["n_slices"]
-    mid = result["mid_slice"]
+    # roi_slice centers the initial view on the selected region(s) instead
+    # of the whole volume's geometric middle (falls back to mid_slice
+    # automatically when nothing matched) — a subcortical ROI is often
+    # nowhere near dead-center along one or more axes.
+    start = result.get("roi_slice", result["mid_slice"])
     return (
         job_dir, True, note, {"display": "flex", "flexWrap": "wrap", "marginTop": "1rem"},
         f"data:image/png;base64,{result['colorbar_png']}", legend,
         frames["Axial"], frames["Coronal"], frames["Sagittal"],
-        n["Axial"] - 1, mid["Axial"], n["Coronal"] - 1, mid["Coronal"], n["Sagittal"] - 1, mid["Sagittal"],
+        n["Axial"] - 1, start["Axial"], n["Coronal"] - 1, start["Coronal"],
+        n["Sagittal"] - 1, start["Sagittal"],
     )
 
 
-# Clientside: swap the shown slice image when a slider moves, reading from
-# the already-downloaded frame list — no server round-trip, so scrubbing
-# stays smooth even on a slow connection.
-_SLICE_CLIENTSIDE_JS = """
-function(idx, frames) {
-    if (!frames || idx === undefined || idx === null || !frames[idx]) {
-        return window.dash_clientside.no_update;
-    }
-    return "data:image/png;base64," + frames[idx];
-}
-"""
-for _plane in ("axial", "coronal", "sagittal"):
-    dash.clientside_callback(
-        _SLICE_CLIENTSIDE_JS,
-        Output(f"fv-slice-{_plane}-img", "src"),
-        Input(f"fv-slice-{_plane}-slider", "value"),
-        State(f"fv-slice-{_plane}-frames", "data"),
-    )
+# Slice-scrubbing, crosshair redraw, and click/drag crosshair navigation —
+# all of it lives in slice_viewer_ui.py now (shared with the Analysis
+# page's ROI Preview, which hosts its own "an-preview-slice"-prefixed
+# instance of the exact same component).
+sv.register_clientside_callbacks("fv-slice")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

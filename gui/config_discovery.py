@@ -65,13 +65,23 @@ OPTIMIZER_DEFAULTS = {
     "minimize_background_field":     False,
     "background_mask_name":          None,
     "max_background_elements":       50_000,
-    "background_hotspot_percentile": 80.0,
+    "background_hotspot_percentile": 85.0,
     "use_electrode_scoring_tiers":   False,
     "electrode_tiers":               {},
     "electrode_tiers_csv":           None,
-    "electrode_tier_weights":        {"1": 0.02, "2": 0.05},
+    # 4-level cascade (Tier 4 is now a real, searchable last-resort tier, not
+    # a permanent exclusion — only Fiducials are permanently excluded). "3"
+    # and "4" keys added when config.py's OptimizerConfig was redesigned from
+    # the earlier 2-level version — see GUI_WIRING_NOTES.md section 3.
+    "electrode_tier_weights":        {"1": 0.02, "2": 0.05, "3": 0.15, "4": 0.40},
+    # background_hotspot/tier_penalty raised from initial 0.1/0.1 placeholders
+    # to 0.5/1.0 after real pilot-montage calibration on sub-41Y01 — see the
+    # "pilot" comments on OptimizerConfig.location_score_weights in
+    # code/pipeline/config.py for the exact reasoning. Still provisional
+    # (user intends to test further combinations) but no longer a blind
+    # placeholder, so the GUI default now matches it rather than 0.1/0.1.
     "location_score_weights":        {"main": 1.0, "background": 0.2,
-                                       "background_hotspot": 0.1, "tier_penalty": 0.1},
+                                       "background_hotspot": 0.5, "tier_penalty": 1.0},
 }
 ELECTRODE_DEFAULTS = {
     "shape":             "ellipse",

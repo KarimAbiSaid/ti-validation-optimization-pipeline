@@ -257,9 +257,19 @@ def run_pipeline_on_scitas(config_path: str, force_sections: list[str] | None = 
         if not up["success"]:
             return {"success": False, "job_id": None, "error": f"config upload failed: {up['stderr']}"}
 
-    # m2m_ — required; upload from local if SCITAS doesn't have it yet
-    remote_m2m = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
-    if not sd.remote_path_exists(remote_m2m):
+    # m2m_ — required; upload from local if SCITAS doesn't have it yet.
+    # Checked via the actual head mesh FILE, not just the m2m_ folder's own
+    # existence — a folder can exist without ever having been populated
+    # (e.g. cap registration's remote_mkdir() creates m2m_{id}/eeg_positions/
+    # as a side effect, with no mesh/segmentation ever uploaded), and a
+    # folder-only check wrongly treats that as "already there", skipping the
+    # real upload and leaving a run to fail deep inside SimNIBS with
+    # "Cannot locate head mesh file" instead of a clear message here.
+    # Re-uploading over a partially-populated remote folder is safe — scp -r
+    # merges into an existing directory rather than nesting/duplicating it.
+    remote_m2m  = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
+    remote_mesh = f"{remote_m2m}/{subject_id}.msh"
+    if not sd.remote_path_exists(remote_mesh):
         local_m2m = get_m2m_path(subject_id)
         if not os.path.isdir(local_m2m):
             return {"success": False, "job_id": None,
@@ -478,10 +488,15 @@ def batch_submit(config_paths: list[str], force_sections: list[str] | None = Non
     #    missing, still falls back to an individual scp per subject (rare,
     #    and large enough that folding it into the small-file tar batch
     #    above isn't worth the risk of one huge fragile transfer).
+    #    Checked via the actual head mesh FILE, not just the m2m_ folder's
+    #    own existence — see run_pipeline_on_scitas()'s matching check for
+    #    why a folder-only test is wrong (cap registration's remote_mkdir()
+    #    can create m2m_{id}/eeg_positions/ with no mesh ever uploaded,
+    #    which a folder-exists check wrongly treats as "already there").
     check_paths = set()
     for cfg in configs.values():
         subject_id = cfg["subject_id"]
-        check_paths.add(f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}")
+        check_paths.add(f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}/{subject_id}.msh")
         if cfg.get("bna_atlas_path"):
             container_root = cfg["project_dir"]
             check_paths.add(scratch + cfg["bna_atlas_path"][len(container_root):])
@@ -496,8 +511,9 @@ def batch_submit(config_paths: list[str], force_sections: list[str] | None = Non
         if out[path]["error"]:
             continue
         subject_id = cfg["subject_id"]
-        remote_m2m = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
-        if not existence.get(remote_m2m, False):
+        remote_m2m  = f"{scratch}/derivatives/SimNIBS/sub-{subject_id}/m2m_{subject_id}"
+        remote_mesh = f"{remote_m2m}/{subject_id}.msh"
+        if not existence.get(remote_mesh, False):
             local_m2m = get_m2m_path(subject_id)
             if not os.path.isdir(local_m2m):
                 out[path]["error"] = f"m2m_{subject_id}/ not found locally or on SCITAS — run Head Modeling first."

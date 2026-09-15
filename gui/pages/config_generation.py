@@ -76,6 +76,27 @@ dash.register_page(__name__, path="/config-generation", name="Config Generation"
 ATLAS_NAMES = list(discovery.ATLAS_REGISTRY.keys())
 
 
+def _details(title, children, level=0, open_=False):
+    """Native <details>/<summary> collapsible, closed by default — declutters
+    the Optimizer section's advanced blocks (hierarchical search, amplitude
+    sweep, advanced location scoring, subgroup constraints) without any
+    callback overhead; the browser handles expand/collapse for free. level=0
+    is the outer "Advanced optimizer settings" wrapper (light gray card),
+    level=1 is one of the individual sub-features nested inside it."""
+    return html.Details([
+        html.Summary(title, style={"fontWeight": "600", "cursor": "pointer",
+                                   "padding": "0.3rem 0", "userSelect": "none"}),
+        html.Div(children, style={"padding": "0.25rem 0 0.25rem 0.75rem"}),
+    ], open=open_, style={
+        "marginTop": "0.6rem" if level == 0 else "0.5rem",
+        "marginBottom": "0.6rem" if level == 0 else "0.5rem",
+        "padding": "0.5rem 0.75rem",
+        "border": "1px solid #ccc" if level == 0 else "1px solid #ddd",
+        "borderRadius": "6px",
+        "background": "#f7f7f7" if level == 0 else "#fff",
+    })
+
+
 def _styled_table(id_, columns, data=None, **kwargs):
     return dash_table.DataTable(
         id=id_,
@@ -327,237 +348,247 @@ layout = html.Div([
         inline=True,
     ),
 
-    html.Div([
-        dcc.Checklist(
-            id="cg-opt-hier-enable",
-            options=[{"label": " use_hierarchical_search (coarse-to-fine electrode search)",
-                      "value": "use_hierarchical_search"}],
-            value=[k for k in ("use_hierarchical_search",) if cd.OPTIMIZER_DEFAULTS[k]],
-        ),
-        html.Div([
-            html.Div([
-                html.Label("num_fine_iterations"),
-                _stepper_row("cg-opt-hier-num-iter", cd.OPTIMIZER_DEFAULTS["num_fine_iterations"], 1, 0),
-            ], style={"minWidth": "160px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("neighbours per iteration (comma-separated, one value per fine iteration)"),
-                dcc.Input(id="cg-opt-hier-neighbours", type="text", placeholder="e.g. 8,6,4",
-                          value="", style={"width": "100%"}),
-            ], style={"minWidth": "280px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("early_stop_threshold (%)"),
-                _stepper_row("cg-opt-hier-early-stop", cd.OPTIMIZER_DEFAULTS["early_stop_threshold"] * 100,
-                            0.5, 0),
-            ], style={"minWidth": "160px", "marginRight": "1rem"}),
-        ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
-    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
-              "border": "1px solid #ccc", "borderRadius": "4px"}),
-
-    html.Div([
-        dcc.Checklist(
-            id="cg-opt-amp-enable",
-            options=[{"label": " use_amplitude_sweep (re-rank the location search's top montages "
-                      "over a per-channel current grid)", "value": "use_amplitude_sweep"}],
-            value=[k for k in ("use_amplitude_sweep",) if cd.OPTIMIZER_DEFAULTS[k]],
-        ),
-        html.Div([
-            html.Div([
-                html.Label("amplitude_sweep_top_n"),
-                _stepper_row("cg-opt-amp-top-n", cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"], 1, 1),
-            ], style={"minWidth": "160px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("min mA"),
-                dcc.Input(id="cg-opt-amp-min-ma", type="number", step=0.01,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_min_mA"], style={"width": "100%"}),
-            ], style={"minWidth": "110px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("max mA"),
-                dcc.Input(id="cg-opt-amp-max-ma", type="number", step=0.01,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_mA"], style={"width": "100%"}),
-            ], style={"minWidth": "110px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("step mA"),
-                dcc.Input(id="cg-opt-amp-step-ma", type="number", step=0.01,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_step_mA"], style={"width": "100%"}),
-            ], style={"minWidth": "110px", "marginRight": "1rem"}),
-            html.Div([
-                html.Label("max per-pair mA (single-channel ceiling)"),
-                dcc.Input(id="cg-opt-amp-max-per-pair-ma", type="number", step=0.1,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_per_pair_mA"],
-                          style={"width": "100%"}),
-            ], style={"minWidth": "220px", "marginRight": "1rem"}),
-        ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
-        html.Div([
-            html.Label("Ranking weights — roc / roi_mean / non_roi_mean / focality_ratio "
-                       "(should sum to ~1.0; not enforced)",
-                       style={"display": "block", "marginTop": "0.5rem"}),
-            html.Div([
-                dcc.Input(id="cg-opt-amp-weight-roc", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roc"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-amp-weight-roi-mean", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roi_mean"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-amp-weight-non-roi-mean", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["non_roi_mean"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-amp-weight-focality-ratio", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["focality_ratio"],
-                          style={"width": "100%"}),
-            ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px"}),
-            html.Div(id="cg-opt-amp-weight-sum-note", style={"fontSize": "12px", "color": "#666",
-                                                             "marginTop": "0.25rem"}),
-        ]),
-    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
-              "border": "1px solid #ccc", "borderRadius": "4px"}),
-
-    html.Div([
-        dcc.Checklist(
-            id="cg-opt-loc-enable",
-            options=[{"label": " use_composite_location_score (advanced location scoring — "
-                      "combine the raw ROC/mean-TI score with the background-field and "
-                      "electrode-tier terms below; leave off to keep the existing raw score)",
-                      "value": "use_composite_location_score"}],
-            value=[k for k in ("use_composite_location_score",) if cd.OPTIMIZER_DEFAULTS[k]],
-        ),
-
-        html.Div([
+    _details("Advanced optimizer settings", [
+        _details("Hierarchical search (coarse-to-fine electrode search)", [
             dcc.Checklist(
-                id="cg-opt-bg-enable",
-                options=[{"label": " minimize_background_field (penalize strong field anywhere "
-                          "outside the ROI, including under the electrodes — requires "
-                          "use_composite_location_score above)",
-                          "value": "minimize_background_field"}],
-                value=[k for k in ("minimize_background_field",) if cd.OPTIMIZER_DEFAULTS[k]],
+                id="cg-opt-hier-enable",
+                options=[{"label": " use_hierarchical_search", "value": "use_hierarchical_search"}],
+                value=[k for k in ("use_hierarchical_search",) if cd.OPTIMIZER_DEFAULTS[k]],
             ),
             html.Div([
                 html.Div([
-                    html.Label("background region (blank = whole brain GM+WM, minus ROI)"),
-                    dcc.Dropdown(id="cg-opt-bg-mask-dropdown", placeholder="Whole brain",
-                                 clearable=True),
-                ], style={"minWidth": "260px", "marginRight": "1rem", "flex": "1 1 260px"}),
+                    html.Label("num_fine_iterations"),
+                    _stepper_row("cg-opt-hier-num-iter", cd.OPTIMIZER_DEFAULTS["num_fine_iterations"], 1, 0),
+                ], style={"minWidth": "160px", "marginRight": "1rem"}),
                 html.Div([
-                    html.Label("max_background_elements (subsample cap)"),
-                    dcc.Input(id="cg-opt-bg-max-elements", type="number", min=1000, step=1000,
-                              value=cd.OPTIMIZER_DEFAULTS["max_background_elements"],
-                              style={"width": "100%"}),
-                ], style={"minWidth": "180px", "marginRight": "1rem"}),
+                    html.Label("neighbours per iteration (comma-separated, one value per fine iteration)"),
+                    dcc.Input(id="cg-opt-hier-neighbours", type="text", placeholder="e.g. 8,6,4",
+                              value="", style={"width": "100%"}),
+                ], style={"minWidth": "280px", "marginRight": "1rem"}),
                 html.Div([
-                    html.Label("background_hotspot_percentile"),
-                    dcc.Input(id="cg-opt-bg-hotspot-pct", type="number", min=0, max=100, step=1,
-                              value=cd.OPTIMIZER_DEFAULTS["background_hotspot_percentile"],
-                              style={"width": "100%"}),
-                ], style={"minWidth": "180px", "marginRight": "1rem"}),
+                    html.Label("early_stop_threshold (%)"),
+                    _stepper_row("cg-opt-hier-early-stop", cd.OPTIMIZER_DEFAULTS["early_stop_threshold"] * 100,
+                                0.5, 0),
+                ], style={"minWidth": "160px", "marginRight": "1rem"}),
             ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
-        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
-                  "borderRadius": "4px"}),
+        ], level=1),
 
-        html.Div([
+        _details("Amplitude sweep (re-rank top montages over a per-channel current grid)", [
             dcc.Checklist(
-                id="cg-opt-tiers-enable",
-                options=[{"label": " use_electrode_scoring_tiers (penalize/exclude electrodes "
-                          "per the tier assignments below — requires use_composite_location_score "
-                          "above; Fiducials/Tier-4 are always excluded regardless)",
-                          "value": "use_electrode_scoring_tiers"}],
-                value=[k for k in ("use_electrode_scoring_tiers",) if cd.OPTIMIZER_DEFAULTS[k]],
+                id="cg-opt-amp-enable",
+                options=[{"label": " use_amplitude_sweep", "value": "use_amplitude_sweep"}],
+                value=[k for k in ("use_amplitude_sweep",) if cd.OPTIMIZER_DEFAULTS[k]],
             ),
             html.Div([
                 html.Div([
-                    html.Label("override CSV path (blank = canonical "
-                               "code/pipeline/electrode_tiers_acceptable_vs_nogo.csv)"),
-                    dcc.Input(id="cg-opt-tiers-csv-path", type="text", value="",
-                              placeholder="", style={"width": "100%"}),
-                ], style={"minWidth": "320px", "marginRight": "1rem", "flex": "1 1 320px"}),
+                    html.Label("amplitude_sweep_top_n"),
+                    _stepper_row("cg-opt-amp-top-n", cd.OPTIMIZER_DEFAULTS["amplitude_sweep_top_n"], 1, 1),
+                ], style={"minWidth": "160px", "marginRight": "1rem"}),
                 html.Div([
-                    html.Label("Tier 1 weight"),
-                    dcc.Input(id="cg-opt-tiers-weight-1", type="number", step=0.01,
-                              value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["1"],
-                              style={"width": "100%"}),
-                ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                    html.Label("min mA"),
+                    dcc.Input(id="cg-opt-amp-min-ma", type="number", step=0.01,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_min_mA"], style={"width": "100%"}),
+                ], style={"minWidth": "110px", "marginRight": "1rem"}),
                 html.Div([
-                    html.Label("Tier 2 weight"),
-                    dcc.Input(id="cg-opt-tiers-weight-2", type="number", step=0.01,
-                              value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["2"],
+                    html.Label("max mA"),
+                    dcc.Input(id="cg-opt-amp-max-ma", type="number", step=0.01,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_mA"], style={"width": "100%"}),
+                ], style={"minWidth": "110px", "marginRight": "1rem"}),
+                html.Div([
+                    html.Label("step mA"),
+                    dcc.Input(id="cg-opt-amp-step-ma", type="number", step=0.01,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_step_mA"], style={"width": "100%"}),
+                ], style={"minWidth": "110px", "marginRight": "1rem"}),
+                html.Div([
+                    html.Label("max per-pair mA (single-channel ceiling)"),
+                    dcc.Input(id="cg-opt-amp-max-per-pair-ma", type="number", step=0.1,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_max_per_pair_mA"],
                               style={"width": "100%"}),
-                ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                ], style={"minWidth": "220px", "marginRight": "1rem"}),
             ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
-            html.P("Read-only preview of what the pipeline will auto-load at run time "
-                   "(electrode_tiers itself is left for the CSV importer to populate — "
-                   "edit the CSV to change assignments, or point at a different one above).",
-                   style={"fontSize": "12px", "color": "#666", "marginTop": "0.5rem"}),
-            html.Div(id="cg-opt-tiers-preview"),
-        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
-                  "borderRadius": "4px"}),
+            html.Div([
+                html.Label("Ranking weights — roc / roi_mean / non_roi_mean / focality_ratio "
+                           "(should sum to ~1.0; not enforced)",
+                           style={"display": "block", "marginTop": "0.5rem"}),
+                html.Div([
+                    dcc.Input(id="cg-opt-amp-weight-roc", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roc"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-amp-weight-roi-mean", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["roi_mean"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-amp-weight-non-roi-mean", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["non_roi_mean"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-amp-weight-focality-ratio", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["amplitude_sweep_weights"]["focality_ratio"],
+                              style={"width": "100%"}),
+                ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px"}),
+                html.Div(id="cg-opt-amp-weight-sum-note", style={"fontSize": "12px", "color": "#666",
+                                                                 "marginTop": "0.25rem"}),
+            ]),
+        ], level=1),
 
-        html.Div([
-            html.Label("Composite weights — main / background / background_hotspot / tier_penalty",
-                       style={"fontWeight": "bold"}),
-            html.P("score = main*raw_score − background*background_mean − "
-                   "background_hotspot*background_hotspot_mean − tier_penalty*tier_cost. "
-                   "Only the terms actually enabled above contribute. Defaults are "
-                   "placeholders, not yet calibrated on real data.",
+        _details("Advanced location scoring (background field + electrode tiers)", [
+            dcc.Checklist(
+                id="cg-opt-loc-enable",
+                options=[{"label": " use_composite_location_score — combine the raw ROC/mean-TI "
+                          "score with the background-field and electrode-tier terms below "
+                          "(leave off to keep the existing raw score)",
+                          "value": "use_composite_location_score"}],
+                value=[k for k in ("use_composite_location_score",) if cd.OPTIMIZER_DEFAULTS[k]],
+            ),
+
+            html.Div([
+                dcc.Checklist(
+                    id="cg-opt-bg-enable",
+                    options=[{"label": " minimize_background_field (penalize strong field anywhere "
+                              "outside the ROI, including under the electrodes — requires "
+                              "use_composite_location_score above)",
+                              "value": "minimize_background_field"}],
+                    value=[k for k in ("minimize_background_field",) if cd.OPTIMIZER_DEFAULTS[k]],
+                ),
+                html.Div([
+                    html.Div([
+                        html.Label("background region (blank = whole brain GM+WM, minus ROI)"),
+                        dcc.Dropdown(id="cg-opt-bg-mask-dropdown", placeholder="Whole brain",
+                                     clearable=True),
+                    ], style={"minWidth": "260px", "marginRight": "1rem", "flex": "1 1 260px"}),
+                    html.Div([
+                        html.Label("max_background_elements (subsample cap)"),
+                        dcc.Input(id="cg-opt-bg-max-elements", type="number", min=1000, step=1000,
+                                  value=cd.OPTIMIZER_DEFAULTS["max_background_elements"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "180px", "marginRight": "1rem"}),
+                    html.Div([
+                        html.Label("background_hotspot_percentile"),
+                        dcc.Input(id="cg-opt-bg-hotspot-pct", type="number", min=0, max=100, step=1,
+                                  value=cd.OPTIMIZER_DEFAULTS["background_hotspot_percentile"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "180px", "marginRight": "1rem"}),
+                ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+            ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                      "borderRadius": "4px"}),
+
+            html.Div([
+                dcc.Checklist(
+                    id="cg-opt-tiers-enable",
+                    options=[{"label": " use_electrode_scoring_tiers — penalize electrodes per the "
+                              "tier assignments below, in a 4-level cascade that only unlocks a "
+                              "higher tier once every lower tier fails to meet the hard constraint "
+                              "(requires use_composite_location_score above). Fiducials (Nz/Iz/A1/"
+                              "A2 etc.) are always permanently excluded; Tier 4 is a searchable "
+                              "last resort, not excluded.",
+                              "value": "use_electrode_scoring_tiers"}],
+                    value=[k for k in ("use_electrode_scoring_tiers",) if cd.OPTIMIZER_DEFAULTS[k]],
+                ),
+                html.Div([
+                    html.Div([
+                        html.Label("override CSV path (blank = canonical "
+                                   "code/pipeline/electrode_tiers_acceptable_vs_nogo.csv)"),
+                        dcc.Input(id="cg-opt-tiers-csv-path", type="text", value="",
+                                  placeholder="", style={"width": "100%"}),
+                    ], style={"minWidth": "320px", "marginRight": "1rem", "flex": "1 1 320px"}),
+                    html.Div([
+                        html.Label("Tier 1 weight"),
+                        dcc.Input(id="cg-opt-tiers-weight-1", type="number", step=0.01,
+                                  value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["1"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                    html.Div([
+                        html.Label("Tier 2 weight"),
+                        dcc.Input(id="cg-opt-tiers-weight-2", type="number", step=0.01,
+                                  value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["2"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                    html.Div([
+                        html.Label("Tier 3 weight"),
+                        dcc.Input(id="cg-opt-tiers-weight-3", type="number", step=0.01,
+                                  value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["3"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                    html.Div([
+                        html.Label("Tier 4 weight"),
+                        dcc.Input(id="cg-opt-tiers-weight-4", type="number", step=0.01,
+                                  value=cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["4"],
+                                  style={"width": "100%"}),
+                    ], style={"minWidth": "100px", "marginRight": "1rem"}),
+                ], style={"display": "flex", "flexWrap": "wrap", "marginTop": "0.5rem"}),
+                html.P("Read-only preview of what the pipeline will auto-load at run time "
+                       "(electrode_tiers itself is left for the CSV importer to populate — "
+                       "edit the CSV to change assignments, or point at a different one above).",
+                       style={"fontSize": "12px", "color": "#666", "marginTop": "0.5rem"}),
+                html.Div(id="cg-opt-tiers-preview"),
+            ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                      "borderRadius": "4px"}),
+
+            html.Div([
+                html.Label("Composite weights — main / background / background_hotspot / tier_penalty",
+                           style={"fontWeight": "bold"}),
+                html.P("score = main*raw_score − background*background_mean − "
+                       "background_hotspot*background_hotspot_mean − tier_penalty*tier_cost. "
+                       "Only the terms actually enabled above contribute. main/background are "
+                       "still un-calibrated placeholders; background_hotspot/tier_penalty have "
+                       "been through a real pilot comparison (see code/pipeline/config.py) but "
+                       "are still provisional.",
+                       style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+                html.Div([
+                    dcc.Input(id="cg-opt-loc-weight-main", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["main"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-loc-weight-background", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-loc-weight-background-hotspot", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background_hotspot"],
+                              style={"width": "100%"}),
+                    dcc.Input(id="cg-opt-loc-weight-tier-penalty", type="number", step=0.05,
+                              value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["tier_penalty"],
+                              style={"width": "100%"}),
+                ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px", "marginTop": "0.5rem"}),
+            ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
+                      "borderRadius": "4px"}),
+        ], level=1),
+
+        _details("Non-ROI subgroup hard constraints", [
+            html.P("Rejects a montage if mean TI in mask_name exceeds max_mean_V_m, "
+                   "independently for EACH row — regardless of the overall non-ROI union "
+                   "above. mask_name must match an already-generated mask (Mask Generation page).",
                    style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
-            html.Div([
-                dcc.Input(id="cg-opt-loc-weight-main", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["main"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-loc-weight-background", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-loc-weight-background-hotspot", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["background_hotspot"],
-                          style={"width": "100%"}),
-                dcc.Input(id="cg-opt-loc-weight-tier-penalty", type="number", step=0.05,
-                          value=cd.OPTIMIZER_DEFAULTS["location_score_weights"]["tier_penalty"],
-                          style={"width": "100%"}),
-            ], style={"display": "flex", "gap": "0.5rem", "maxWidth": "480px", "marginTop": "0.5rem"}),
-        ], style={"marginTop": "0.75rem", "padding": "0.5rem", "border": "1px solid #ddd",
-                  "borderRadius": "4px"}),
-    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
-              "border": "1px solid #ccc", "borderRadius": "4px"}),
+            _styled_table(
+                "cg-opt-constraint-groups-table",
+                [
+                    {"name": "name", "id": "name"},
+                    {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
+                    {"name": "max_mean_V_m", "id": "max_mean_V_m"},
+                ],
+                editable=True, row_deletable=True,
+            ),
+            html.Button("Add constraint group", id="cg-opt-constraint-groups-add-btn",
+                        n_clicks=0, style={"marginTop": "0.5rem"}),
+        ], level=1),
 
-    html.Div([
-        html.Label("Non-ROI subgroup hard constraints", style={"fontWeight": "bold"}),
-        html.P("Rejects a montage if mean TI in mask_name exceeds max_mean_V_m, "
-               "independently for EACH row — regardless of the overall non-ROI union "
-               "above. mask_name must match an already-generated mask (Mask Generation page).",
-               style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
-        _styled_table(
-            "cg-opt-constraint-groups-table",
-            [
-                {"name": "name", "id": "name"},
-                {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
-                {"name": "max_mean_V_m", "id": "max_mean_V_m"},
-            ],
-            editable=True, row_deletable=True,
-        ),
-        html.Button("Add constraint group", id="cg-opt-constraint-groups-add-btn",
-                    n_clicks=0, style={"marginTop": "0.5rem"}),
-    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
-              "border": "1px solid #ccc", "borderRadius": "4px"}),
-
-    html.Div([
-        html.Label("ROI subgroup hard constraints", style={"fontWeight": "bold"}),
-        html.P("Rejects a montage if mean TI in mask_name falls BELOW min_mean_V_m, "
-               "independently for EACH row — regardless of the overall ROI mean above. "
-               "Useful when the ROI is a union of several distinct subregions (e.g. "
-               "hippocampus + entorhinal cortex) and a montage could otherwise clear the "
-               "combined-ROI floor while barely touching one of them. mask_name must match "
-               "an already-generated mask (Mask Generation page).",
-               style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
-        _styled_table(
-            "cg-opt-roi-constraint-groups-table",
-            [
-                {"name": "name", "id": "name"},
-                {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
-                {"name": "min_mean_V_m", "id": "min_mean_V_m"},
-            ],
-            editable=True, row_deletable=True,
-        ),
-        html.Button("Add constraint group", id="cg-opt-roi-constraint-groups-add-btn",
-                    n_clicks=0, style={"marginTop": "0.5rem"}),
-    ], style={"marginTop": "0.75rem", "marginBottom": "0.75rem", "padding": "0.5rem",
-              "border": "1px solid #ccc", "borderRadius": "4px"}),
+        _details("ROI subgroup hard constraints", [
+            html.P("Rejects a montage if mean TI in mask_name falls BELOW min_mean_V_m, "
+                   "independently for EACH row — regardless of the overall ROI mean above. "
+                   "Useful when the ROI is a union of several distinct subregions (e.g. "
+                   "hippocampus + entorhinal cortex) and a montage could otherwise clear the "
+                   "combined-ROI floor while barely touching one of them. mask_name must match "
+                   "an already-generated mask (Mask Generation page).",
+                   style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+            _styled_table(
+                "cg-opt-roi-constraint-groups-table",
+                [
+                    {"name": "name", "id": "name"},
+                    {"name": "mask_name", "id": "mask_name", "presentation": "dropdown"},
+                    {"name": "min_mean_V_m", "id": "min_mean_V_m"},
+                ],
+                editable=True, row_deletable=True,
+            ),
+            html.Button("Add constraint group", id="cg-opt-roi-constraint-groups-add-btn",
+                        n_clicks=0, style={"marginTop": "0.5rem"}),
+        ], level=1),
+    ]),
 
     html.H3("Electrode", style={"marginTop": "1.5rem"}),
     html.Div([
@@ -922,10 +953,11 @@ def _update_tiers_preview(csv_path_override):
         return html.P(f"⚠ could not read {preview['csv_path']}: {preview['error']}",
                       style={"color": "#a00", "fontSize": "12px"})
     rows = [{"electrode": name, "tier": str(t)} for name, t in sorted(preview["tiers"].items())]
-    rows += [{"electrode": name, "tier": "Fiducials/4 (excluded)"} for name in preview["excluded"]]
+    rows += [{"electrode": name, "tier": "Fiducials (excluded)"} for name in preview["excluded"]]
     return html.Div([
         html.P(f"{preview['csv_path']}  —  {len(preview['tiers'])} tier assignment(s), "
-               f"{len(preview['excluded'])} excluded (Fiducials/Tier 4)",
+               f"{len(preview['excluded'])} Fiducials permanently excluded (Tier 4 is a "
+               f"searchable last resort, not excluded)",
                style={"fontSize": "12px", "color": "#666"}),
         _styled_table("cg-opt-tiers-preview-table", [
             {"name": "electrode", "id": "electrode"},
@@ -977,6 +1009,8 @@ def _update_tiers_preview(csv_path_override):
     State("cg-opt-tiers-csv-path", "value"),
     State("cg-opt-tiers-weight-1", "value"),
     State("cg-opt-tiers-weight-2", "value"),
+    State("cg-opt-tiers-weight-3", "value"),
+    State("cg-opt-tiers-weight-4", "value"),
     State("cg-opt-loc-weight-main", "value"),
     State("cg-opt-loc-weight-background", "value"),
     State("cg-opt-loc-weight-background-hotspot", "value"),
@@ -996,6 +1030,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
                        amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
                        loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
                        tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
+                       tiers_weight_3, tiers_weight_4,
                        loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
                        loc_weight_tier_penalty,
                        elec_diameter, elec_gel, elec_max_current, flags_checklist):
@@ -1113,6 +1148,8 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         "electrode_tier_weights": {
             "1": tiers_weight_1 if tiers_weight_1 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["1"],
             "2": tiers_weight_2 if tiers_weight_2 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["2"],
+            "3": tiers_weight_3 if tiers_weight_3 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["3"],
+            "4": tiers_weight_4 if tiers_weight_4 is not None else cd.OPTIMIZER_DEFAULTS["electrode_tier_weights"]["4"],
         },
         "location_score_weights": {
             "main": loc_weight_main if loc_weight_main is not None else cd.OPTIMIZER_DEFAULTS["location_score_weights"]["main"],

@@ -48,28 +48,34 @@ DEFAULT_ELECTRODE_TIERS_CSV_PATH = os.path.join(
 
 
 def load_electrode_tiers_csv(csv_path: str) -> tuple[dict, set]:
-    """Parse an "Electrode,Tier" CSV into (tiers, excluded):
-      - tiers: {electrode_name_lower: 0|1|2|3} — same shape OptimizerConfig.
-        electrode_tiers already expects, ready to merge/assign directly.
-      - excluded: set of electrode_name_lower tagged "Fiducials" or "4" —
-        these never enter the search pool at all (same treatment as Tier 4
-        always intended: "should not be searched nor have their leadfield
-        created" — here it's the former only; the leadfield is still built
-        from whatever the base cap CSV contains, per the user's explicit
-        choice not to filter before leadfield generation, since a pre-built
-        leadfield already includes them and re-filtering costs nothing at
-        search time).
+    """Parse an "Electrode,Tier" CSV into (tiers, fiducials):
+      - tiers: {electrode_name_lower: 0|1|2|3|4} — same shape OptimizerConfig.
+        electrode_tiers already expects, ready to merge/assign directly. Tier
+        4 IS included here (unlike the earlier single-exclusion-set design) —
+        it's a real, searchable last-resort tier now (see
+        run_exhaustive_cap_optimization's tier cascade), not a permanent
+        exclusion.
+      - fiducials: set of electrode_name_lower tagged "Fiducials" (Nz/Iz/A1/
+        A2 etc.) — these are NOT real stimulation sites at all (landmark/
+        reference points, not scalp positions meant to carry current) and
+        are excluded from the search pool unconditionally, at every tier
+        cascade level, no exceptions — explicit user decision, distinct from
+        Tier 4 (a real, merely-unacceptable scalp position that IS allowed
+        as an absolute last resort). The leadfield is still built from
+        whatever the base cap CSV contains either way (no pre-filtering
+        before the FEM solve — cheap enough, and a pre-built leadfield
+        already includes them; only the search itself is restricted).
     Column order is resolved by header name (case-insensitive "electrode"/
     "tier"), not position, to survive a reordered or extended CSV.
     """
     import csv as _csv
 
     tiers: dict = {}
-    excluded: set = set()
+    fiducials: set = set()
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
         reader = _csv.DictReader(f)
         if not reader.fieldnames:
-            return tiers, excluded
+            return tiers, fiducials
         _cols = {c.strip().lower(): c for c in reader.fieldnames}
         _name_col = _cols.get("electrode") or reader.fieldnames[0]
         _tier_col = _cols.get("tier") or reader.fieldnames[1]
@@ -80,16 +86,14 @@ def load_electrode_tiers_csv(csv_path: str) -> tuple[dict, set]:
                 continue
             names = [n.strip().lower() for n in raw_name.split("/") if n.strip()]
             if raw_tier.lower() == "fiducials":
-                excluded.update(names)
-            elif raw_tier == "4":
-                excluded.update(names)
-            elif raw_tier in ("0", "1", "2", "3"):
+                fiducials.update(names)
+            elif raw_tier in ("0", "1", "2", "3", "4"):
                 for n in names:
                     tiers[n] = int(raw_tier)
             # unrecognized tier values are silently skipped — same
             # "don't guess" spirit as the rest of this file; a malformed
             # row just doesn't contribute a tier, it doesn't abort the run.
-    return tiers, excluded
+    return tiers, fiducials
 
 
 # ── Sub-configs ────────────────────────────────────────────────────────────────
@@ -247,15 +251,39 @@ class OptimizerConfig:
 
     # ── Amplitude sweep (opt-in) ─────────────────────────────────────────
     # After the electrode-location search (flat or hierarchical) finishes,
-    # take its top N montages and sweep per-channel current amplitudes over
-    # a small grid, re-scoring every (montage, I_ch1, I_ch2) combination
-    # with a weighted, normalized multi-criteria score. Cheap to run — TI
-    # fields scale linearly with current (E(I) = I * E(1A)), so each
-    # combination is a re-scale + get_maxTI() + mean/ROC pass, not a new
-    # FEM/leadfield lookup.
+    # take its single winning montage and sweep per-channel current
+    # amplitudes over a small grid, re-scoring every (I_ch1, I_ch2)
+    # combination with a weighted, normalized multi-criteria score to pick
+    # the best current allocation. Cheap to run — TI fields scale linearly
+    # with current (E(I) = I * E(1A)), so each combination is a re-scale +
+    # get_maxTI() + mean/ROC pass, not a new FEM/leadfield lookup.
+    #
+    # The montage itself is NEVER changed by the sweep — it was originally
+    # designed to also pick among the top-N montages (not just currents),
+    # but that silently discarded use_composite_location_score's background/
+    # hotspot/tier terms: it re-ranked candidates using this sweep's own
+    # narrower weight scheme (amplitude_sweep_weights below — plain ROC/
+    # ROI-mean/non-ROI-mean/focality-ratio, no background/hotspot/tier at
+    # all) and could switch to a montage the outer composite search had NOT
+    # actually preferred. Confirmed happening on every run in a real 24-
+    # subject batch (sub-41Y01 cohort, 2026-09-14) — composite_location_
+    # score.value came out byte-identical to the raw ROC score in 100% of
+    # them, meaning background/hotspot/tier weighting had zero effect on
+    # the final reported montage in every single case it was enabled
+    # alongside the sweep. Fixed by locking the montage to the location
+    # search's own composite winner; the sweep now only ever refines ITS
+    # currents, never overrides which montage was chosen.
     use_amplitude_sweep: bool = False
 
-    # How many of the location-search's best montages to carry into the sweep.
+    # VESTIGIAL as of the amplitude-sweep rewrite below — kept only so
+    # existing config JSON files that still set it don't error out. The
+    # sweep used to carry this many of the location-search's top montages
+    # forward and could switch to a different one entirely; it now always
+    # fixes the location search's own single winning montage and only
+    # varies its per-channel current (see use_amplitude_sweep's docstring
+    # for why — it was silently discarding the composite location score's
+    # background/hotspot/tier terms by re-ranking with a different, narrower
+    # weight scheme and picking whichever montage that preferred).
     amplitude_sweep_top_n: int = 5
 
     # Per-channel current sweep range (mA) — both channels swept
@@ -339,34 +367,46 @@ class OptimizerConfig:
     # region" — the volume-weighted mean of just the elements at/above that
     # percentile cutoff, evaluated on the same per-candidate background
     # sample as background_mean (cheap: one np.percentile call + a masked
-    # weighted mean, same cost class as the existing mean). Default 80.0 =
-    # top 20% counted as "the hotspot" (user's explicit choice — a single
-    # extreme percentile like p95/p99 was considered too narrow/noisy; top
-    # 20-25% better captures a hotspot big enough to actually matter).
-    background_hotspot_percentile: float = 80.0
+    # weighted mean, same cost class as the existing mean). Default 85.0 =
+    # top 15% counted as "the hotspot" — narrowed from an initial 80.0/top-20%
+    # after a real two-montage pilot comparison (sub-41Y01 "PL" vs "ML" test
+    # montages) showed PL's off-target field problem was concentrated in a
+    # genuinely extreme tail (p95->max jumped from 0.59 to 12.9 V/m, a real
+    # cliff, not a gradual rise) that a broader top-20% band diluted with
+    # only-moderately-elevated elements. Still user's explicit choice not to
+    # go as narrow as p95/p99 — see location_score_weights below, calibrated
+    # together with this cutoff from the same pilot comparison.
+    background_hotspot_percentile: float = 85.0
 
     # ── Electrode scoring tiers (opt-in) ─────────────────────────────────
-    # Per-electrode safety/preference ranking, 0 (always available, no
-    # penalty) to 3 (only used if no Tier 0/1/2 combination can meet the
-    # configured hard constraint — see run_exhaustive_cap_optimization's
-    # two-pass search for the exact mechanism). Tier "4" and Fiducials
-    # (Nz/Iz/A1/A2 etc.) are excluded from the search pool entirely, every
-    # pass, no exceptions — see load_electrode_tiers_csv()/
-    # DEFAULT_ELECTRODE_TIERS_CSV above. This is driven by the tiers CSV's
-    # own tags, NOT by curating a separate cap CSV (the earlier approach) —
-    # the leadfield is still built from whatever the base cap contains
-    # (cheap enough not to bother pre-filtering; explicit user choice), only
-    # the SEARCH never evaluates these electrodes.
+    # Per-electrode safety/preference ranking via a 4-LEVEL CUMULATIVE
+    # CASCADE (see run_exhaustive_cap_optimization's tier cascade for the
+    # exact mechanism):
+    #   Level 1 pool = Tier 0 + Tier 1  (Tier 1 soft-penalized, always tried first)
+    #   Level 2 pool = Level 1 + Tier 2 (only tried if Level 1 finds nothing
+    #                  meeting the configured hard constraint)
+    #   Level 3 pool = Level 2 + Tier 3 (only tried if Level 2 also fails)
+    #   Level 4 pool = Level 3 + Tier 4 (only tried if Level 3 also fails —
+    #                  absolute last resort)
+    # Every unlocked tier (1-4) is soft-penalized via electrode_tier_weights
+    # below, summed per electrode in the montage — gating decides WHETHER a
+    # tier is searched at all; the weight decides which montage wins among
+    # those found once it is. Fiducials (Nz/Iz/A1/A2 etc.) are a SEPARATE,
+    # permanent exclusion — never enter the pool at any level, no exceptions
+    # — see load_electrode_tiers_csv()/DEFAULT_ELECTRODE_TIERS_CSV above.
+    # This is all driven by the tiers CSV's own tags, NOT by curating a
+    # separate cap CSV (the earlier approach) — the leadfield is still built
+    # from whatever the base cap contains (cheap enough not to bother
+    # pre-filtering; explicit user choice), only the SEARCH is restricted.
     use_electrode_scoring_tiers: bool = False
 
-    # {electrode_name: 0|1|2|3}, matched by name (case-insensitive).
+    # {electrode_name: 0|1|2|3|4}, matched by name (case-insensitive).
     # Electrodes not present in this dict are treated as Tier 0 (no
-    # penalty) — this dict only needs entries for electrodes you actually
-    # want to penalize or gate behind the Tier-3 fallback. Left empty (the
-    # default) while use_electrode_scoring_tiers=True, this is
-    # auto-populated at run time from electrode_tiers_csv (or the canonical
-    # electrode_tiers_csv_path if that's also unset) — set this dict
-    # explicitly yourself only to override/bypass the CSV.
+    # penalty, always in Level 1's pool). Left empty (the default) while
+    # use_electrode_scoring_tiers=True, this is auto-populated at run time
+    # from electrode_tiers_csv (or the canonical electrode_tiers_csv_path if
+    # that's also unset) — set this dict explicitly yourself only to
+    # override/bypass the CSV.
     electrode_tiers: dict = field(default_factory=dict)
 
     # Explicit override path for the CSV auto-load described above. None
@@ -379,23 +419,59 @@ class OptimizerConfig:
     # Per-tier-point penalty weight, applied PER ELECTRODE in the montage
     # (summed across all 4 — e.g. two Tier-2 electrodes cost 2x this
     # weight, not the max of the two). Tier 0 is always 0, not
-    # configurable. Tier 3 has no weight here at all — it's governed
-    # entirely by the two-pass fallback mechanism (included in the search
-    # only if Tier 0/1/2 alone can't meet the hard constraint), not by a
-    # fixed score penalty.
-    electrode_tier_weights: dict = field(default_factory=lambda: {"1": 0.02, "2": 0.05})
+    # configurable. Unlike the earlier design, Tier 3 (and now Tier 4) DO
+    # have a weight here — needed so that, once a tier is unlocked by the
+    # cascade, montages using fewer/cheaper penalized electrodes are still
+    # preferred over ones using more/costlier ones (e.g. "3 Tier-0 + 1
+    # Tier-2" should beat "2 Tier-0 + 2 Tier-2"). Values chosen to keep a
+    # single higher-tier substitution's cost below several lower-tier
+    # substitutions' combined cost as a calibration sanity check (e.g.
+    # "3" < 4x"2": 0.15 < 0.20) — explicit user-confirmed defaults, still
+    # provisional pending further pilot combinations (see
+    # TODO_electrode_scoring_tiers.md).
+    electrode_tier_weights: dict = field(default_factory=lambda: {
+        "1": 0.02, "2": 0.05, "3": 0.15, "4": 0.40,
+    })
 
     # Composite weights (absolute, not pool-normalized — see
     # use_composite_location_score's docstring above). "main" scales the
     # existing raw score; "background"/"background_hotspot"/"tier_penalty"
     # only contribute when minimize_background_field / use_electrode_
-    # scoring_tiers are themselves also enabled. "background_hotspot" is a
-    # placeholder pending the same pilot-run calibration as the others (see
-    # TODO_electrode_scoring_tiers.md) — set lower than "background" for now
-    # since it's a narrower, more surgical term on top of the broad one, not
-    # a replacement for it.
+    # scoring_tiers are themselves also enabled.
+    #
+    # "background_hotspot" raised from an initial placeholder of 0.1 to 0.5
+    # (4.5x) after a real two-montage pilot comparison (sub-41Y01 "PL" vs
+    # "ML"): at 0.1, PL's composite score beat ML's despite PL having a
+    # dramatically worse off-target peak (12.9 vs 3.7 V/m) and a
+    # consistently worse background tail from p75 up through the max — the
+    # main-score term (weight 1.0) simply dominated too easily. At the
+    # paired background_hotspot_percentile=85.0, the exact crossover weight
+    # (where ML would overtake PL) is ~0.50 — 0.5 is a deliberate, explicit
+    # user choice just below that line, so PL still wins this particular
+    # comparison under these settings (not every pilot combination needs to
+    # flip the outcome). Still provisional — the user explicitly wants to
+    # test more candidate weight/percentile combinations before treating
+    # this as final (see TODO_electrode_scoring_tiers.md).
+    #
+    # "tier_penalty" raised from an initial placeholder of 0.1 to 1.0 (10x)
+    # after a 3-pair real-montage pilot (sub-41Y01: two Tier-0 baselines
+    # each swapped to the closest available Tier-1/Tier-2/both electrode —
+    # see run_pipeline.py's _tier_cost() for how electrode_tier_weights
+    # combine into a montage's tier_cost). At 0.1, the tier term
+    # (0.1*tier_cost, max observed 0.1*0.07=0.007) was consistently smaller
+    # than the INCIDENTAL field-geometry change from the swap itself (up to
+    # +0.10) — meaning tier never mattered even for a single marginal
+    # improvement, let alone a real one. User's explicit intent: only let a
+    # worse-tier montage win if the underlying improvement is genuinely
+    # substantial, not marginal. tier_penalty=1.0 threads the 3 pilot
+    # examples: it blocks both marginal swaps observed (field delta
+    # +0.018 and +0.004) while still letting the one substantial swap
+    # through (field delta +0.094, net still positive after the penalty).
+    # Caveat: the smaller-swap margin at this value is razor-thin (-0.002)
+    # — calibrated off one data point, not yet a robust fit. Still
+    # provisional, same as background_hotspot above.
     location_score_weights: dict = field(default_factory=lambda: {
-        "main": 1.0, "background": 0.2, "background_hotspot": 0.1, "tier_penalty": 0.1,
+        "main": 1.0, "background": 0.2, "background_hotspot": 0.5, "tier_penalty": 1.0,
     })
 
 

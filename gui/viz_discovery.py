@@ -1129,10 +1129,18 @@ def build_slice_frames(
 
     Returns {"success", "frames": {"Axial": [b64 PNG, ...], "Coronal":
     [...], "Sagittal": [...]}, "n_slices": {"Axial": int, ...},
-    "mid_slice": {"Axial": int, ...}, "voxel_mm", "field_range",
-    "colorbar_png" (b64, maps the field colormap to V/m — the slices
-    themselves carry no numeric legend), "regions_drawn"} or
-    {"success": False, "error"}."""
+    "mid_slice": {"Axial": int, ...} (whole-volume geometric middle),
+    "roi_slice": {"Axial": int, ...} (the index along each axis with the
+    MOST selected-region voxels — not a mean/centroid, which fails for a
+    bilateral ROI: along its own left-right axis, a combined L+R mask's
+    mean position lands in the midline GAP between the two lobes, a slice
+    that shows almost none of the region — same as mid_slice when no
+    region matched. A subcortical ROI is often nowhere near the volume's
+    own geometric middle along one or more axes, so a caller wanting to
+    default the view TO the region should prefer this over mid_slice),
+    "voxel_mm", "field_range", "colorbar_png" (b64,
+    maps the field colormap to V/m — the slices themselves carry no
+    numeric legend), "regions_drawn"} or {"success": False, "error"}."""
     vols = build_slice_volumes(subject_id, field_mesh_path, highlight_labels, project_dir, voxel_mm)
     t1, field, roi_masks = vols["t1"], vols["field"], vols["roi_masks"]
 
@@ -1140,11 +1148,31 @@ def build_slice_frames(
         nonzero = field[field > 0]
         vmax = float(np.percentile(nonzero, 99)) if nonzero.size else 1.0
 
-    frames, n_slices, mid_slice = {}, {}, {}
+    roi_union = None
+    if roi_masks:
+        roi_union = np.zeros_like(t1, dtype=bool)
+        for mask in roi_masks.values():
+            roi_union |= mask
+        if not roi_union.any():
+            roi_union = None
+
+    frames, n_slices, mid_slice, roi_slice = {}, {}, {}, {}
     for plane, axis in PLANE_AXES.items():
         n = t1.shape[axis]
         n_slices[plane] = n
         mid_slice[plane] = n // 2
+        if roi_union is not None:
+            other_axes = tuple(a for a in range(3) if a != axis)
+            # argmax of per-index voxel COUNT, not the mean position of any
+            # hit — a simple mean fails for a bilateral ROI (e.g. a combined
+            # L+R striatum mask): along the L-R axis itself, the two lobes'
+            # mean lands in the midline GAP between them, a slice that
+            # barely shows any of the region at all. Picking the index with
+            # the most ROI voxels instead always lands inside one lobe.
+            counts = roi_union.sum(axis=other_axes)
+            roi_slice[plane] = int(np.argmax(counts)) if counts.any() else mid_slice[plane]
+        else:
+            roi_slice[plane] = mid_slice[plane]
         plane_frames = []
         for i in range(n):
             t1_slice = _oriented_slice(t1, axis, i)
@@ -1155,7 +1183,7 @@ def build_slice_frames(
         frames[plane] = plane_frames
 
     return {"success": True, "frames": frames, "n_slices": n_slices, "mid_slice": mid_slice,
-           "voxel_mm": vols["voxel_mm"], "field_range": vols["field_range"],
+           "roi_slice": roi_slice, "voxel_mm": vols["voxel_mm"], "field_range": vols["field_range"],
            "colorbar_png": _build_colorbar_png(vmax, cmap),
            "regions_drawn": list(roi_masks.keys()), "vmax_used": vmax}
 
