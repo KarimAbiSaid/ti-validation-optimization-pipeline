@@ -856,22 +856,54 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     # idx_lf:    dict { electrode_name -> index_in_leadfield }
     #            (reference electrode has index None)
 
-    all_elec_names = list(idx_lf.keys())   # includes reference electrode
+    all_elec_names_raw = list(idx_lf.keys())   # includes reference electrode
+    # Drop the reference electrode and any ground/fiducial-landmark rows
+    # before anything downstream ever sees them as search candidates:
+    #   - idx_lf[n] is None <=> n is the reference (SimNIBS's own marker —
+    #     see TI_utils.get_field's docstring — robust regardless of what
+    #     that row happens to be named in this cap's CSV). The reference is
+    #     still fully used for leadfield construction (every other
+    #     electrode's field is implicitly relative to it, cancelling out
+    #     correctly when two real electrodes are paired) — it's just never
+    #     itself a valid choice of search electrode.
+    #   - is_stimulation_electrode(n) drops ground/fiducial-NAMED rows
+    #     (NON_ELECTRODE_NAMES) — SimNIBS has no structural marker for
+    #     these (they're only excluded from the leadfield if the cap CSV's
+    #     own Type column tags them as something other than "Electrode"/
+    #     "ReferenceElectrode", which many real cap files don't bother to
+    #     do), so name matching is the only signal available, same
+    #     convention _load_cap_positions() already uses below.
+    # Without this, hierarchical search's electrode_pool (STEP 3) could
+    # contain the reference electrode, which _cap_pos never has a position
+    # for — a loud abort there. The flat search wouldn't even crash: SimNIBS's
+    # TI.get_field() treats idx_lf[name] is None as a legitimate monopolar-
+    # vs-reference field rather than an error, so the reference could
+    # silently be selected as a real montage electrode instead.
+    all_elec_names = [n for n in all_elec_names_raw
+                      if idx_lf[n] is not None and is_stimulation_electrode(n)]
     n_elec = len(all_elec_names)
-    print(f"  Electrodes: {n_elec}  ({', '.join(all_elec_names)})")
+    _n_dropped = len(all_elec_names_raw) - n_elec
+    if _n_dropped:
+        print(f"  Electrodes: {n_elec} searchable ({_n_dropped} reference/ground/fiducial "
+              f"row(s) excluded)  ({', '.join(all_elec_names)})")
+    else:
+        print(f"  Electrodes: {n_elec}  ({', '.join(all_elec_names)})")
     print(f"  Leadfield shape: {leadfield.shape}")
 
     # Electrode tiers (opt-in) — auto-load from the tiers CSV when enabled
     # and the config didn't already hand-populate electrode_tiers itself.
-    # Fiducials (Nz/Iz/A1/A2 etc.) are excluded from all_elec_names right
-    # here, before anything downstream ever sees them — a PERMANENT
-    # exclusion at every tier cascade level, no exceptions (they aren't
-    # real stimulation sites at all). Tier 4 electrodes are NOT excluded
-    # here — unlike the earlier design, Tier 4 is now a real last-resort
-    # level in the cascade (see STEP 3 below), so they stay in
-    # all_elec_names and are simply gated out of the pool until/unless
-    # Level 4 is reached. The leadfield itself is left untouched either way
-    # (still built from the full base cap); only the SEARCH is restricted.
+    # NON_ELECTRODE_NAMES (above) already dropped the handful of hardcoded
+    # ground/fiducial names it knows about; this additionally excludes
+    # whatever THIS cap's own tiers CSV tags "Fiducials" — a broader,
+    # per-run-configurable list, since a real digitized cap's fiducial
+    # names vary (Nz/Iz/A1/A2 and friends) — a PERMANENT exclusion at every
+    # tier cascade level, no exceptions (they aren't real stimulation sites
+    # at all). Tier 4 electrodes are NOT excluded here — unlike the earlier
+    # design, Tier 4 is now a real last-resort level in the cascade (see
+    # STEP 3 below), so they stay in all_elec_names and are simply gated
+    # out of the pool until/unless Level 4 is reached. The leadfield itself
+    # is left untouched either way (still built from the full base cap);
+    # only the SEARCH is restricted.
     if cfg.optimizer.use_electrode_scoring_tiers and not cfg.optimizer.electrode_tiers:
         _tiers_csv_path = cfg.optimizer.electrode_tiers_csv or cfg.electrode_tiers_csv_path
         if not os.path.isfile(_tiers_csv_path):
