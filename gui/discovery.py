@@ -164,21 +164,20 @@ def build_lut(atlas_name: str, subject_id: str | None = None,
 # Existing masks browser
 # ═════════════════════════════════════════════════════════════════════════════
 
-def expected_mask_path(subject_id: str, mask_type: str, name: str, project_dir: str = PROJECT_DIR) -> str:
+def expected_mask_path(subject_id: str, name: str, project_dir: str = PROJECT_DIR) -> str:
     """Mirrors the out_path construction in create_masks.py's
-    create_roi/create_non_roi/create_general_mask — keep in sync if those change.
-    `name` here is whatever the caller passes to create_roi/etc (the GUI page
-    is responsible for baking the atlas name into it to avoid collisions,
-    e.g. BNA vs Allen both producing a "hippocampus" mask).
+    create_named_mask — keep in sync if that changes. `name` here is
+    whatever the caller passes to create_named_mask (the GUI page is
+    responsible for baking the atlas name into it to avoid collisions, e.g.
+    BNA vs Allen both producing a "hippocampus" mask).
 
-    All three mask types share one "_label-{name}_mask.nii.gz" naming — this
+    One "_label-{name}_mask.nii.gz" naming regardless of what the mask is
+    conceptually used for (ROI/non-ROI/a constraint group/etc.) — this
     matches PipelineConfig.mask_path() in code/pipeline/config.py, which
     run_pipeline.py's Section 1 uses for its own skip-if-exists check for
     both roi and non_roi. A mask made here (any atlas) is directly usable by
     the pipeline as long as the name given to Config Generation matches.
     """
-    if mask_type not in ("ROI", "non-ROI", "general"):
-        raise ValueError(f"Unknown mask type: {mask_type}")
     roi_dir = os.path.join(project_dir, "derivatives", "SimNIBS", f"sub-{subject_id}", "roi")
     fname = f"sub-{subject_id}_label-{name}_mask.nii.gz"
     return os.path.join(roi_dir, fname)
@@ -201,14 +200,17 @@ def _build_source(atlas_name: str, subject_id: str, project_dir: str = PROJECT_D
     raise ValueError(f"Unknown atlas: {atlas_name}")
 
 
-def generate_masks(subject_ids: list[str], atlas_name: str, label_ids: dict, mask_type: str,
+def generate_masks(subject_ids: list[str], atlas_name: str, label_ids: dict,
                     name: str, hemisphere: str | None = None,
                     project_dir: str = PROJECT_DIR) -> list[dict]:
-    """Run MaskGeneratorEngine.create_roi/create_non_roi/create_general_mask for
-    each subject independently. `name` is the final (already atlas-suffixed,
-    if the caller wants that) mask identifier passed straight through to
-    create_masks.py. Returns [{"subject_id", "success", "voxel_count",
-    "out_path", "error"}] — one subject's failure doesn't stop the rest."""
+    """Run MaskGeneratorEngine.create_named_mask for each subject
+    independently. `name` is the final (already atlas-suffixed, if the
+    caller wants that) mask identifier passed straight through to
+    create_masks.py — there's no separate "type" anymore (ROI/non-ROI/
+    general used to be three identically-behaving methods; the name is all
+    that ever distinguished the output). Returns [{"subject_id", "success",
+    "voxel_count", "out_path", "error"}] — one subject's failure doesn't
+    stop the rest."""
     from create_masks import MaskGeneratorEngine
 
     results = []
@@ -216,20 +218,12 @@ def generate_masks(subject_ids: list[str], atlas_name: str, label_ids: dict, mas
         try:
             engine = MaskGeneratorEngine(subject=sid, project_dir=project_dir)
             source = _build_source(atlas_name, sid, project_dir)
-
-            if mask_type == "ROI":
-                mask = engine.create_roi(source, label_ids, name, hemisphere=hemisphere)
-            elif mask_type == "non-ROI":
-                mask = engine.create_non_roi(source, label_ids, name, hemisphere=hemisphere)
-            elif mask_type == "general":
-                mask = engine.create_general_mask(source, label_ids, name, hemisphere=hemisphere)
-            else:
-                raise ValueError(f"Unknown mask type: {mask_type}")
+            mask = engine.create_named_mask(source, label_ids, name, hemisphere=hemisphere)
 
             results.append({
                 "subject_id": sid, "success": True,
                 "voxel_count": int(mask.sum()),
-                "out_path": expected_mask_path(sid, mask_type, name, project_dir),
+                "out_path": expected_mask_path(sid, name, project_dir),
                 "error": None,
             })
         except Exception as e:
@@ -243,7 +237,7 @@ def _same_grid(img_a, img_b) -> bool:
     return img_a.shape == img_b.shape and np.allclose(img_a.affine, img_b.affine, atol=1e-3)
 
 
-def combine_masks(subject_id: str, mask_paths: list[str], mask_type: str, name: str,
+def combine_masks(subject_id: str, mask_paths: list[str], name: str,
                    project_dir: str = PROJECT_DIR) -> dict:
     """Unions (logical OR) 2+ existing mask files for one subject into a new
     mask — atlas-agnostic: works across masks built from different atlases
@@ -270,7 +264,7 @@ def combine_masks(subject_id: str, mask_paths: list[str], mask_type: str, name: 
                              f"{os.path.basename(mask_paths[0])}"}
         combined |= (np.asarray(img.dataobj) > 0)
 
-    out_path = expected_mask_path(subject_id, mask_type, name, project_dir)
+    out_path = expected_mask_path(subject_id, name, project_dir)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     img_out = nib.Nifti1Image(combined.astype(np.uint8), ref_img.affine, ref_img.header)
     img_out.set_data_dtype(np.uint8)

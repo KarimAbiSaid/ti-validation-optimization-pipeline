@@ -174,9 +174,9 @@ class MaskGeneratorEngine:
 
     def __init__(self, subject: str = None, project_dir: str = None,
                  simnibs_dir: str = None, m2m_path: str = None):
-        """Either pass (subject, project_dir) — needed for create_roi/
-        create_non_roi/create_general_mask, which derive their output paths
-        from those — or just m2m_path directly, sufficient for
+        """Either pass (subject, project_dir) — needed for create_named_mask,
+        which derives its output path from those — or just m2m_path directly,
+        sufficient for
         get_subject_space_labels/create_mask/get_hemisphere_mask (used by
         run_pipeline.py, which already has m2m_path but not a bare
         project_dir at some call sites)."""
@@ -340,24 +340,17 @@ class MaskGeneratorEngine:
               f"({int(mask.sum())*vox_vol:.1f} mm3)")
         return mask
 
-    def create_roi(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
-        out_path = os.path.join(self.simnibs_dir, f"sub-{self.subject}", "roi",
-                                 f"sub-{self.subject}_label-{name}_mask.nii.gz")
-        return self.create_mask(source, label_ids, out_path, hemisphere=hemisphere,
-                                fallback_label_ids=fallback_label_ids)
-
-    def create_non_roi(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
-        # Same "_label-{name}_mask.nii.gz" naming as create_roi (matches
-        # PipelineConfig.mask_path() in config.py, which run_pipeline.py's
-        # Section 1 uses for its own skip-if-exists check for BOTH roi and
-        # non_roi) — so a mask made here, from any atlas, is directly usable
-        # by the pipeline as long as the name matches.
-        out_path = os.path.join(self.simnibs_dir, f"sub-{self.subject}", "roi",
-                                 f"sub-{self.subject}_label-{name}_mask.nii.gz")
-        return self.create_mask(source, label_ids, out_path, hemisphere=hemisphere,
-                                fallback_label_ids=fallback_label_ids)
-
-    def create_general_mask(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
+    def create_named_mask(self, source, label_ids, name, hemisphere=None, fallback_label_ids=None):
+        """Builds a mask and saves it under this subject's roi/ folder as
+        sub-{subject}_label-{name}_mask.nii.gz — matches PipelineConfig.
+        mask_path() in config.py, which run_pipeline.py's Section 1 uses for
+        its own skip-if-exists check for both roi and non_roi, so a mask
+        made here (any atlas) is directly usable by the pipeline as long as
+        the name matches. Collapsed from three identically-behaving methods
+        (create_roi/create_non_roi/create_general_mask — the ROI/non-ROI/
+        general distinction never actually affected the output, only which
+        method name you called) into this one, since GUI callers now just
+        pick their own name instead of a redundant "type"."""
         out_path = os.path.join(self.simnibs_dir, f"sub-{self.subject}", "roi",
                                  f"sub-{self.subject}_label-{name}_mask.nii.gz")
         return self.create_mask(source, label_ids, out_path, hemisphere=hemisphere,
@@ -365,7 +358,7 @@ class MaskGeneratorEngine:
 
     def export_visualization_mesh(self, masks: dict, out_path: str, tags=(1, 2, 3)):
         """masks: {field_name: subject-space mask array (from create_mask/
-        create_roi/etc, or get_subject_space_labels)}. Exports one .msh with
+        create_named_mask, or get_subject_space_labels)}. Exports one .msh with
         each mask as its own scalar ElementData field on the subject's brain
         mesh — in Gmsh, toggle between fields (e.g. 'Allen_HC_R' vs
         'BNA_HC_R') to compare extents directly."""

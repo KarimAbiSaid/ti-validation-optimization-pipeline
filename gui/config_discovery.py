@@ -152,12 +152,11 @@ def electrode_tiers_preview(csv_path: str | None = None) -> dict:
     return {"tiers": tiers, "excluded": sorted(excluded), "csv_path": path, "error": None}
 
 
-def roi_mask_exists(subject_id: str, name: str, mask_type: str,
-                     project_dir: str = PROJECT_DIR) -> bool:
+def roi_mask_exists(subject_id: str, name: str, project_dir: str = PROJECT_DIR) -> bool:
     """Whether the on-disk mask this (subject, name) pair needs already
     exists locally — only meaningful for Allen-sourced ROI/non-ROI (see
-    build_roi_dict); mask_type: "ROI" or "non-ROI"."""
-    return os.path.exists(discovery.expected_mask_path(subject_id, mask_type, name, project_dir))
+    build_roi_dict)."""
+    return os.path.exists(discovery.expected_mask_path(subject_id, name, project_dir))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -186,7 +185,7 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
     missing: list[str] = []
 
     if roi_uses_existing_mask or uses_allen(roi_atlas):
-        if not roi_mask_exists(subject_id, roi_name, "ROI", project_dir):
+        if not roi_mask_exists(subject_id, roi_name, project_dir):
             missing.append(f"ROI mask not on disk — run Mask Generation first: {roi_name}")
     else:
         roi_check = discovery.full_atlas_check(roi_atlas, subject_id, project_dir)
@@ -195,7 +194,7 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
 
     if non_roi_name and (non_roi_atlas or non_roi_uses_existing_mask):
         if non_roi_uses_existing_mask or uses_allen(non_roi_atlas):
-            if not roi_mask_exists(subject_id, non_roi_name, "non-ROI", project_dir):
+            if not roi_mask_exists(subject_id, non_roi_name, project_dir):
                 missing.append(f"non-ROI mask not on disk — run Mask Generation first: {non_roi_name}")
         else:
             non_roi_check = discovery.full_atlas_check(non_roi_atlas, subject_id, project_dir)
@@ -208,7 +207,7 @@ def subject_readiness(subject_id: str, roi_atlas: str, roi_name: str,
             missing.append(f"cap not registered — run Cap Registration first: {cap_discovery.cap_stem(cap_path)}")
 
     for mask_name in (constraint_group_masks or []):
-        if not roi_mask_exists(subject_id, mask_name, "general", project_dir):
+        if not roi_mask_exists(subject_id, mask_name, project_dir):
             missing.append(f"hard-constraint mask not on disk — run Mask Generation first: {mask_name}")
 
     seen = set()

@@ -24,7 +24,6 @@ import discovery
 dash.register_page(__name__, path="/masks", name="Mask Generation", category="Preprocessing", order=2)
 
 ATLAS_NAMES = list(discovery.ATLAS_REGISTRY.keys())
-MASK_TYPES = ["ROI", "non-ROI", "general"]
 
 
 def _slice_figure(t1_slice, mask_slice, title, h_mm=1.0, v_mm=1.0):
@@ -106,14 +105,6 @@ layout = html.Div([
 
             html.H4("Mask output settings"),
             html.Div([
-                html.Label("Mask type"),
-                dcc.RadioItems(
-                    id="mg-mask-type",
-                    options=[{"label": t, "value": t} for t in MASK_TYPES],
-                    value="ROI", inline=True,
-                ),
-            ], style={"marginBottom": "0.75rem"}),
-            html.Div([
                 html.Label("Name  (atlas name is auto-appended, e.g. \"hippocampus\" → \"hippocampus_BNA\")"),
                 dcc.Input(id="mg-mask-name", type="text", placeholder="e.g. hippocampus",
                           style={"width": "100%"}),
@@ -191,20 +182,10 @@ layout = html.Div([
             ], style={"flex": "1 1 380px"}),
         ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "0.75rem"}),
         html.Div([
-            html.Div([
-                html.Label("Mask type"),
-                dcc.RadioItems(
-                    id="mg-combine-type",
-                    options=[{"label": t, "value": t} for t in MASK_TYPES],
-                    value="ROI", inline=True,
-                ),
-            ], style={"marginRight": "1.5rem"}),
-            html.Div([
-                html.Label("Name (atlas name is NOT auto-appended here — enter the full final name)"),
-                dcc.Input(id="mg-combine-name", type="text", placeholder="e.g. STN_L_M1_bilateral",
-                          style={"width": "100%"}),
-            ], style={"flex": "1 1 320px"}),
-        ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "0.75rem"}),
+            html.Label("Name (atlas name is NOT auto-appended here — enter the full final name)"),
+            dcc.Input(id="mg-combine-name", type="text", placeholder="e.g. STN_L_M1_bilateral",
+                      style={"width": "100%"}),
+        ], style={"marginBottom": "0.75rem", "maxWidth": "480px"}),
         html.Button("Combine", id="mg-combine-button", n_clicks=0, style={"padding": "0.5rem 1.5rem"}),
         dcc.Loading(html.Div(id="mg-combine-result", style={"marginTop": "1rem"})),
     ], style={"marginTop": "2rem"}),
@@ -335,11 +316,10 @@ def _load_combine_mask_options(subject_id):
     Input("mg-combine-button", "n_clicks"),
     State("mg-combine-subject-dropdown", "value"),
     State("mg-combine-masks-dropdown", "value"),
-    State("mg-combine-type", "value"),
     State("mg-combine-name", "value"),
     prevent_initial_call=True,
 )
-def _on_combine_click(_n_clicks, subject_id, mask_paths, mask_type, name):
+def _on_combine_click(_n_clicks, subject_id, mask_paths, name):
     if not subject_id:
         return html.Div("Select a subject first.", style={"color": "#a00"})
     if not mask_paths or len(mask_paths) < 2:
@@ -347,7 +327,7 @@ def _on_combine_click(_n_clicks, subject_id, mask_paths, mask_type, name):
     if not name or not name.strip():
         return html.Div("Enter a name for the combined mask.", style={"color": "#a00"})
 
-    result = discovery.combine_masks(subject_id, mask_paths, mask_type, name.strip())
+    result = discovery.combine_masks(subject_id, mask_paths, name.strip())
     if not result["success"]:
         return html.Div(f"✗ {result['error']}", style={"color": "#a00"})
     return html.Div(f"✓ Combined into {result['out_path']} ({result['voxel_count']} voxels).",
@@ -497,11 +477,10 @@ def _effective_name(name, atlas_name):
     Output("mg-generate-table", "selected_rows"),
     Input("mg-subject-dropdown", "value"),
     Input("mg-atlas-dropdown", "value"),
-    Input("mg-mask-type", "value"),
     Input("mg-mask-name", "value"),
     State("mg-generate-table", "selected_rows"),
 )
-def _update_generate_table(subject_ids, atlas_name, mask_type, name, prev_selected):
+def _update_generate_table(subject_ids, atlas_name, name, prev_selected):
     if not subject_ids or not atlas_name:
         return [], []
 
@@ -512,7 +491,7 @@ def _update_generate_table(subject_ids, atlas_name, mask_type, name, prev_select
     rows = []
     for sid in ready_subjects:
         if eff_name:
-            out_path = discovery.expected_mask_path(sid, mask_type or "ROI", eff_name)
+            out_path = discovery.expected_mask_path(sid, eff_name)
             overwrite_display = "⚠ will overwrite" if os.path.exists(out_path) else "new file"
         else:
             out_path = "(enter a name)"
@@ -590,13 +569,12 @@ def _update_generate_readiness(rows, selected_rows, name, label_ids, confirm_val
     State("mg-generate-table", "data"),
     State("mg-generate-table", "selected_rows"),
     State("mg-atlas-dropdown", "value"),
-    State("mg-mask-type", "value"),
     State("mg-mask-name", "value"),
     State("mg-hemisphere", "value"),
     State("mg-selected-label-ids-store", "data"),
     prevent_initial_call=True,
 )
-def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, mask_type, name, hemisphere, label_ids):
+def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisphere, label_ids):
     rows = rows or []
     selected_rows = selected_rows or []
     subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
@@ -607,7 +585,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, mask_type, na
                          style={"color": "#a00"})
 
     hemi = None if hemisphere in (None, "None") else hemisphere
-    results = discovery.generate_masks(subject_ids, atlas_name, label_ids, mask_type, eff_name, hemisphere=hemi)
+    results = discovery.generate_masks(subject_ids, atlas_name, label_ids, eff_name, hemisphere=hemi)
 
     return _styled_table("mg-generate-results-table", [
         {"name": "Subject", "id": "subject"},
