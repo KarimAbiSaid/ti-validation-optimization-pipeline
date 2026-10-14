@@ -14,9 +14,12 @@ charm alone can be a long, blocking operation.
 """
 from __future__ import annotations
 
+import os
+
 import cap_discovery
 import charm_discovery
 import config_discovery as cd
+import discovery
 import job_runner as jr
 import mask_recipe_discovery as mrd
 from common import PROJECT_DIR
@@ -62,6 +65,38 @@ def _resolve_recipe(masks: dict, name: str | None) -> tuple[str | None, dict]:
     if recipe.get("kind") == "combine":
         return None, {}
     return recipe.get("atlas"), recipe.get("label_ids") or {}
+
+
+def preview_preference_for_subject(subject_id: str, preference: dict, run_charm_locally: bool,
+                                   project_dir: str = PROJECT_DIR) -> dict:
+    """Read-only dry run — same checks apply_preference_to_subject() makes
+    before each step, but nothing is built/registered/written. For a page
+    to show, BEFORE Apply is clicked, what's already done vs what applying
+    would actually do. Returns {"subject_id", "charm": {"status": "done" |
+    "will_run_locally" | "needs_manual"}, "masks": [{"name","exists"}, ...],
+    "cap_registered": bool | None (None if the preference has no cap_path
+    at all)}."""
+    charm_st = charm_discovery.charm_status(subject_id, project_dir)
+    if charm_st["m2m_complete"]:
+        charm_status = "done"
+    elif run_charm_locally:
+        charm_status = "will_run_locally"
+    else:
+        charm_status = "needs_manual"
+
+    mask_rows = [
+        {"name": name, "exists": os.path.isfile(discovery.expected_mask_path(subject_id, name, project_dir))}
+        for name in _referenced_mask_names(preference)
+    ]
+
+    cap_path = preference.get("cap_path")
+    cap_registered = None
+    if cap_path:
+        reg = cap_discovery.cap_registration_matrix([subject_id], cap_path, project_dir)[subject_id]
+        cap_registered = reg["registered"]
+
+    return {"subject_id": subject_id, "charm": {"status": charm_status},
+           "masks": mask_rows, "cap_registered": cap_registered}
 
 
 def apply_preference_to_subject(subject_id: str, preference: dict, run_charm_locally: bool,

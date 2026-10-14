@@ -67,6 +67,8 @@ layout = html.Div([
         value=[], style={"marginBottom": "1rem"},
     ),
 
+    html.Div(id="ap-preview", style={"marginBottom": "1rem"}),
+
     html.Button("Apply", id="ap-apply-button", n_clicks=0, disabled=True),
     dcc.Store(id="ap-job-store"),
     dcc.Interval(id="ap-interval", interval=2000, disabled=True),
@@ -127,6 +129,64 @@ def _load_subjects(_):
 )
 def _toggle_apply_button(preset_name, subject_ids):
     return not (preset_name and subject_ids)
+
+
+_CHARM_STATUS_DISPLAY = {
+    "done":             "✓ already done",
+    "will_run_locally": "will run locally",
+    "needs_manual":     "✗ needs to run first — enable \"run charm locally\" above, or run it via "
+                        "Head Modeling, then come back",
+}
+
+
+@callback(
+    Output("ap-preview", "children"),
+    Input("ap-preset-dropdown", "value"),
+    Input("ap-subject-dropdown", "value"),
+    Input("ap-run-charm-locally", "value"),
+)
+def _render_preview(preset_name, subject_ids, run_charm_value):
+    """A read-only dry run, BEFORE Apply is clicked — green for whatever's
+    already done, a highlighted note for whatever Apply would actually do
+    (build a mask, register the cap, or run charm — only locally if the
+    toggle above is on, otherwise a clear "run it first" instruction
+    instead of silently blocking later)."""
+    if not preset_name or not subject_ids:
+        return ""
+    preset = pd.load_preset(preset_name)
+    if not preset:
+        return ""
+    run_charm_locally = "run_charm" in (run_charm_value or [])
+
+    rows = []
+    for sid in subject_ids:
+        p = osd.preview_preference_for_subject(sid, preset, run_charm_locally)
+        rows.append({"subject": sid, "step": "charm", "status": _CHARM_STATUS_DISPLAY[p["charm"]["status"]]})
+        for m in p["masks"]:
+            rows.append({"subject": sid, "step": f"mask: {m['name']}",
+                        "status": "✓ already exists" if m["exists"] else "will be built"})
+        if p["cap_registered"] is None:
+            rows.append({"subject": sid, "step": "cap registration",
+                        "status": "✗ this preference has no cap_path"})
+        else:
+            rows.append({"subject": sid, "step": "cap registration",
+                        "status": "✓ already registered" if p["cap_registered"] else "will be registered"})
+
+    return html.Div([
+        html.H4("Preview", style={"marginBottom": "0.1rem"}),
+        html.P("Green = already done. Yellow = not done yet, Apply will do it. Red = blocks the "
+               "chain for that subject until you address it.",
+               style={"fontSize": "12px", "color": "#666", "marginTop": 0, "marginBottom": "0.5rem"}),
+        _styled_table("ap-preview-table", [
+            {"name": "Subject", "id": "subject"}, {"name": "Step", "id": "step"}, {"name": "Status", "id": "status"},
+        ], data=rows, style_data_conditional=[
+            {"if": {"filter_query": '{status} contains "✓"'}, "backgroundColor": "#e6ffe6"},
+            {"if": {"filter_query": '{status} contains "✗"'}, "backgroundColor": "#ffe0e0"},
+            {"if": {"filter_query": '{status} contains "will be built"'}, "backgroundColor": "#fff8e1"},
+            {"if": {"filter_query": '{status} contains "will be registered"'}, "backgroundColor": "#fff8e1"},
+            {"if": {"filter_query": '{status} contains "will run locally"'}, "backgroundColor": "#fff8e1"},
+        ]),
+    ])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
