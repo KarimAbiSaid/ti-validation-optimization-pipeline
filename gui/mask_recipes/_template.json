@@ -1,0 +1,25 @@
+{
+  "_comment": "Template/example only — not a real recipe book, kept here so the shape survives git. Entries are added via Mask Generation's 'also save this as a recipe' option; consumed by Config Generation's recipe-book picker and 'Build missing masks'.",
+  "name": "example_recipes",
+  "created_at": "2026-10-14T12:00:00",
+
+  "masks": {
+    "hippo_r_BNA": {
+      "kind": "atlas_region",
+      "atlas": "BNA",
+      "label_ids": {"rHippocampus_R": 216, "cHippocampus_R": 218},
+      "hemisphere": null
+    },
+    "striatum_ROI_BNA": {
+      "kind": "atlas_region",
+      "atlas": "BNA",
+      "label_ids": {"Str_Cd_R": 225, "Str_Pu_R": 227},
+      "hemisphere": "R"
+    },
+    "_comment_combine": "A combine recipe's sources are other names in THIS book (built first, if missing) -- not arbitrary file paths, so it stays usable for any new subject.",
+    "STN_L_M1_bilateral": {
+      "kind": "combine",
+      "sources": ["STN_L_Allen", "M1_bilateral_Allen"]
+    }
+  }
+}

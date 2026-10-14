@@ -75,8 +75,15 @@ GM_TAG = 2
 GM_SURF_TAG = 1002
 SCALP_SURF_TAG = 1005
 
-CH1_COLOR = "#0073ff"
-CH2_COLOR = "#fe4444"
+# Electrode colors — by POSITION (anode/cathode-style red/blue), not by
+# which channel's "+"/"-" slot a name happens to occupy in the config
+# (swapping ch_plus/ch_minus labels is physically meaningless for TI, so
+# the picture must stay identical either way — see _electrode_color_pairs()).
+# Channel 1 = light shades, channel 2 = dark shades.
+CH1_RED  = "#ff8a80"
+CH1_BLUE = "#80d8ff"
+CH2_RED  = "#b71c1c"
+CH2_BLUE = "#01579b"
 
 # A boundary surface heavier than this gets decimated before being cached —
 # keeps a whole-cortex figure fast without visibly holing the mesh
@@ -384,6 +391,58 @@ def _load_volume(path):
     return grid
 
 
+# How big a gap (mm) along an axis counts as "this axis actually
+# distinguishes the pair" before falling through to the next-priority axis
+# — see _a_is_red()'s docstring. 10mm comfortably clears normal electrode-
+# position jitter/noise without being so large that a genuinely-but-subtly
+# offset pair gets wrongly treated as tied.
+_AXIS_MIN_SEPARATION_MM = 10.0
+
+
+def _a_is_red(pos_a: np.ndarray, pos_b: np.ndarray) -> bool | None:
+    """Which of a pair should be the "red" (vs "blue") electrode, by
+    POSITION only — never by which one happens to be named ch_plus vs
+    ch_minus in the config, since swapping that label is physically
+    meaningless for TI and must never change the picture.
+
+    Priority order: left/right (x) first, then front/back (y), then
+    up/down (z) — whichever axis actually separates THIS pair (axes the
+    pair is nearly level on are skipped, not forced). x: more-negative
+    (anatomical left) is red. y/z: more-positive (anterior / superior) is
+    red. Returns None if the pair is within _AXIS_MIN_SEPARATION_MM on
+    all three axes (near-coincident) — the caller falls back to proximity
+    to the other channel in that case."""
+    for axis in (0, 1, 2):  # x, y, z — world/RAS-style coords (see cap CSV)
+        diff = float(pos_a[axis] - pos_b[axis])
+        if abs(diff) < _AXIS_MIN_SEPARATION_MM:
+            continue
+        return (diff < 0) if axis == 0 else (diff > 0)
+    return None
+
+
+def _channel_colors(plus_name: str, minus_name: str, rows: dict, red: str, blue: str,
+                    other_red_pos: np.ndarray | None = None):
+    """{plus_name: color, minus_name: color} for one channel's pair, plus
+    (red_pos, blue_pos) so the OTHER channel can use this one as a
+    fallback reference. other_red_pos: the other channel's already-
+    resolved red position, used only when this pair is itself
+    near-coincident (_a_is_red returns None) — whichever of this pair sits
+    closer to it becomes red here too. With nothing to borrow from either
+    (both channels degenerate — vanishingly unlikely), defaults to
+    plus=red, arbitrary but deterministic."""
+    pos_plus, pos_minus = rows[plus_name], rows[minus_name]
+    is_red = _a_is_red(pos_plus, pos_minus)
+    if is_red is None:
+        if other_red_pos is not None:
+            is_red = (np.linalg.norm(pos_plus - other_red_pos)
+                     <= np.linalg.norm(pos_minus - other_red_pos))
+        else:
+            is_red = True
+    red_name, blue_name = (plus_name, minus_name) if is_red else (minus_name, plus_name)
+    red_pos, blue_pos = (pos_plus, pos_minus) if is_red else (pos_minus, pos_plus)
+    return {red_name: red, blue_name: blue}, red_pos, blue_pos
+
+
 def _load_electrodes(path, ch1, ch2):
     import csv
     rows = {}
@@ -394,7 +453,11 @@ def _load_electrodes(path, ch1, ch2):
     missing = [n for n in (*ch1, *ch2) if n not in rows]
     if missing:
         raise ValueError(f"electrodes {missing} not in {path}; found {sorted(rows)}")
-    return [(n, rows[n], CH1_COLOR) for n in ch1] + [(n, rows[n], CH2_COLOR) for n in ch2]
+
+    ch1_colors, ch1_red_pos, _ = _channel_colors(ch1[0], ch1[1], rows, CH1_RED, CH1_BLUE)
+    ch2_colors, _, _ = _channel_colors(ch2[0], ch2[1], rows, CH2_RED, CH2_BLUE,
+                                       other_red_pos=ch1_red_pos)
+    return [(n, rows[n], ch1_colors[n]) for n in ch1] + [(n, rows[n], ch2_colors[n]) for n in ch2]
 
 
 def _trim_white(img, pad=8):

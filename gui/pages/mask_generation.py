@@ -20,6 +20,7 @@ import dash
 from dash import html, dcc, dash_table, callback, Input, Output, State, ctx
 
 import discovery
+import mask_recipe_discovery as mrd
 
 dash.register_page(__name__, path="/masks", name="Mask Generation", category="Preprocessing", order=2)
 
@@ -122,6 +123,19 @@ layout = html.Div([
                 ),
             ], style={"marginBottom": "0.75rem"}),
 
+            html.Div([
+                dcc.Checklist(
+                    id="mg-save-recipe-check",
+                    options=[{"label": " Also save this as a recipe (so Config Generation can "
+                              "reference/build it by name for other subjects later)", "value": "save"}],
+                    value=[],
+                ),
+                dcc.Input(id="mg-recipe-book-name", type="text",
+                          placeholder="Recipe book name (existing to append, or new), e.g. default_recipes",
+                          style={"width": "100%", "marginTop": "0.25rem"}),
+                html.Div(id="mg-recipe-book-hint", style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+            ], style={"marginBottom": "0.75rem"}),
+
             html.H4("Subjects to generate"),
             html.Button("Select All Ready", id="mg-select-all-btn", n_clicks=0,
                         style={"marginBottom": "0.5rem"}),
@@ -186,6 +200,19 @@ layout = html.Div([
             dcc.Input(id="mg-combine-name", type="text", placeholder="e.g. STN_L_M1_bilateral",
                       style={"width": "100%"}),
         ], style={"marginBottom": "0.75rem", "maxWidth": "480px"}),
+        html.Div([
+            dcc.Checklist(
+                id="mg-combine-save-recipe-check",
+                options=[{"label": " Also save this as a recipe — sources are recorded by name, so "
+                          "it stays usable for any subject that already has them, not just this "
+                          "one", "value": "save"}],
+                value=[],
+            ),
+            dcc.Input(id="mg-combine-recipe-book-name", type="text",
+                      placeholder="Recipe book name (existing to append, or new), e.g. default_recipes",
+                      style={"width": "100%", "marginTop": "0.25rem", "maxWidth": "480px"}),
+            html.Div(id="mg-combine-recipe-book-hint", style={"fontSize": "12px", "color": "#666", "marginTop": "0.25rem"}),
+        ], style={"marginBottom": "0.75rem"}),
         html.Button("Combine", id="mg-combine-button", n_clicks=0, style={"padding": "0.5rem 1.5rem"}),
         dcc.Loading(html.Div(id="mg-combine-result", style={"marginTop": "1rem"})),
     ], style={"marginTop": "2rem"}),
@@ -235,6 +262,17 @@ layout = html.Div([
 # ═════════════════════════════════════════════════════════════════════════════
 # Subject / availability / existing-masks (unchanged from the validation-only screen)
 # ═════════════════════════════════════════════════════════════════════════════
+
+@callback(
+    Output("mg-recipe-book-hint", "children"),
+    Output("mg-combine-recipe-book-hint", "children"),
+    Input("mg-subject-dropdown", "id"),  # fires once on page load
+)
+def _load_recipe_book_hint(_):
+    names = [b["name"] for b in mrd.list_recipe_books()]
+    hint = ("existing recipe books: " + ", ".join(names)) if names else "no recipe books saved yet"
+    return hint, hint
+
 
 @callback(Output("mg-subject-dropdown", "options"), Input("mg-subject-dropdown", "id"))
 def _load_subjects(_):
@@ -317,21 +355,47 @@ def _load_combine_mask_options(subject_id):
     State("mg-combine-subject-dropdown", "value"),
     State("mg-combine-masks-dropdown", "value"),
     State("mg-combine-name", "value"),
+    State("mg-combine-save-recipe-check", "value"),
+    State("mg-combine-recipe-book-name", "value"),
     prevent_initial_call=True,
 )
-def _on_combine_click(_n_clicks, subject_id, mask_paths, name):
+def _on_combine_click(_n_clicks, subject_id, mask_paths, name, save_recipe_value, recipe_book_name):
     if not subject_id:
         return html.Div("Select a subject first.", style={"color": "#a00"})
     if not mask_paths or len(mask_paths) < 2:
         return html.Div("Select at least 2 masks to combine.", style={"color": "#a00"})
     if not name or not name.strip():
         return html.Div("Enter a name for the combined mask.", style={"color": "#a00"})
+    name = name.strip()
 
-    result = discovery.combine_masks(subject_id, mask_paths, name.strip())
+    result = discovery.combine_masks(subject_id, mask_paths, name)
     if not result["success"]:
         return html.Div(f"✗ {result['error']}", style={"color": "#a00"})
-    return html.Div(f"✓ Combined into {result['out_path']} ({result['voxel_count']} voxels).",
-                    style={"color": "#060"})
+
+    children = [html.Div(f"✓ Combined into {result['out_path']} ({result['voxel_count']} voxels).",
+                         style={"color": "#060"})]
+
+    if "save" in (save_recipe_value or []):
+        book_name = (recipe_book_name or "").strip()
+        if not book_name:
+            children.append(html.P("⚠ recipe not saved — enter a recipe book name.", style={"color": "#a00"}))
+        else:
+            source_names = [discovery.mask_name_from_path(p) for p in mask_paths]
+            unresolved = [p for p, n in zip(mask_paths, source_names) if n is None]
+            if unresolved:
+                children.append(html.P(
+                    f"⚠ recipe not saved — couldn't resolve a subject-agnostic name for: "
+                    f"{', '.join(os.path.basename(p) for p in unresolved)}", style={"color": "#a00"}))
+            else:
+                r = mrd.upsert_mask_recipe(book_name, name, {"kind": "combine", "sources": source_names})
+                if r["success"]:
+                    verb = "replaced" if r["replaced"] else "added"
+                    children.append(html.P(f"✓ recipe '{name}' {verb} in '{book_name}' → {r['path']}",
+                                           style={"color": "#060"}))
+                else:
+                    children.append(html.P(f"✗ recipe not saved — {r['error']}", style={"color": "#a00"}))
+
+    return html.Div(children)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -572,9 +636,12 @@ def _update_generate_readiness(rows, selected_rows, name, label_ids, confirm_val
     State("mg-mask-name", "value"),
     State("mg-hemisphere", "value"),
     State("mg-selected-label-ids-store", "data"),
+    State("mg-save-recipe-check", "value"),
+    State("mg-recipe-book-name", "value"),
     prevent_initial_call=True,
 )
-def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisphere, label_ids):
+def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisphere, label_ids,
+                       save_recipe_value, recipe_book_name):
     rows = rows or []
     selected_rows = selected_rows or []
     subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
@@ -587,7 +654,22 @@ def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisph
     hemi = None if hemisphere in (None, "None") else hemisphere
     results = discovery.generate_masks(subject_ids, atlas_name, label_ids, eff_name, hemisphere=hemi)
 
-    return _styled_table("mg-generate-results-table", [
+    recipe_note = None
+    if "save" in (save_recipe_value or []):
+        book_name = (recipe_book_name or "").strip()
+        if not book_name:
+            recipe_note = html.P("⚠ recipe not saved — enter a recipe book name.", style={"color": "#a00"})
+        else:
+            r = mrd.upsert_mask_recipe(book_name, eff_name, {
+                "kind": "atlas_region", "atlas": atlas_name, "label_ids": label_ids, "hemisphere": hemi})
+            if r["success"]:
+                verb = "replaced" if r["replaced"] else "added"
+                recipe_note = html.P(f"✓ recipe '{eff_name}' {verb} in '{book_name}' → {r['path']}",
+                                     style={"color": "#060"})
+            else:
+                recipe_note = html.P(f"✗ recipe not saved — {r['error']}", style={"color": "#a00"})
+
+    table = _styled_table("mg-generate-results-table", [
         {"name": "Subject", "id": "subject"},
         {"name": "Status", "id": "status"},
         {"name": "Voxel count", "id": "voxel_count"},
@@ -601,6 +683,7 @@ def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisph
         }
         for r in results
     ])
+    return html.Div([table] + ([recipe_note] if recipe_note is not None else []))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

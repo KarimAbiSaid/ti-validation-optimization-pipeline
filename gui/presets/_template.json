@@ -1,0 +1,76 @@
+{
+  "_comment": "Template/example only — not a real preset, kept here so the shape survives git. Saved by Config Generation's 'Save as Preference' button; consumed by the Apply Preference page.",
+  "name": "example_hippocampus_focality",
+  "created_at": "2026-10-14T12:00:00",
+
+  "cap_path": "D:/path/to/a/cap.csv  (an MNI-space cap -- project caps or SimNIBS built-in; see code/resources/caps/)",
+
+  "roi_name": "hippo_r_BNA",
+  "non_roi_name": "cortical_nonROI_BNA",
+
+  "_masks_comment": "Every mask this preference touches (ROI, non-ROI, and anything referenced by name in the optimizer's constraint-group tables or background_mask_name below) -- a FROZEN COPY of each one's recipe from whichever mask_recipes/*.json book they were picked from on Config Generation, not a live reference to that book. Frozen on purpose: this preference behaves identically later even if the book is edited or deleted afterward. Apply Preference builds whichever of these a given subject is still missing (mask_recipe_discovery.build_missing_masks -- same code Config Generation's own 'Build missing masks' button calls), in dependency order, before generating configs. Two recipe kinds -- see mask_recipes/_template.json for the full shape.",
+  "masks": {
+    "hippo_r_BNA": {
+      "kind": "atlas_region",
+      "atlas": "BNA",
+      "label_ids": {"rHippocampus_R": 216, "cHippocampus_R": 218},
+      "hemisphere": null
+    },
+    "cortical_nonROI_BNA": {
+      "kind": "atlas_region",
+      "atlas": "BNA",
+      "label_ids": {"PFC_frontal_pole": 1},
+      "hemisphere": null
+    },
+    "RSC_BNA": {
+      "kind": "atlas_region",
+      "atlas": "BNA",
+      "label_ids": {"RSC_L": 181, "RSC_R": 182},
+      "hemisphere": null
+    }
+  },
+
+  "goals": ["mean", "focality"],
+
+  "optimizer_overrides": {
+    "postproc": "max_TI",
+    "cpus": 8,
+    "focality_threshold": [0.24, 0.3],
+    "hard_roi_constraint": true,
+    "no_adjacent_electrodes": true,
+    "non_roi_hard_constraint_groups": [{"name": "rsc_floor", "mask_name": "RSC_BNA", "max_mean_V_m": 0.12}],
+    "roi_hard_constraint_groups": [],
+    "use_hierarchical_search": false,
+    "num_fine_iterations": 0,
+    "neighbours_per_iteration": [],
+    "early_stop_threshold": 0.03,
+    "use_amplitude_sweep": false,
+    "amplitude_sweep_top_n": 5,
+    "amplitude_sweep_min_mA": 1.8,
+    "amplitude_sweep_max_mA": 2.0,
+    "amplitude_sweep_step_mA": 0.02,
+    "amplitude_sweep_max_per_pair_mA": 2.0,
+    "amplitude_sweep_weights": {"roc": 0.7, "roi_mean": 0.1, "non_roi_mean": 0.1, "focality_ratio": 0.1},
+    "use_composite_location_score": false,
+    "minimize_background_field": false,
+    "background_mask_name": null,
+    "max_background_elements": 50000,
+    "background_hotspot_percentile": 85.0,
+    "use_electrode_scoring_tiers": false,
+    "electrode_tiers_csv": null,
+    "electrode_tier_weights": {"1": 0.02, "2": 0.05, "3": 0.15, "4": 0.40},
+    "location_score_weights": {"main": 1.0, "background": 0.2, "background_hotspot": 0.45, "tier_penalty": 1.0}
+  },
+  "electrode_overrides": {
+    "dimensions": [19.5, 19.5],
+    "gel_thickness": 1.0,
+    "max_total_current": 4.0
+  },
+  "flags": {
+    "run_roi_masks": true,
+    "run_optimization": true,
+    "run_simulation": false,
+    "run_analysis": true,
+    "run_visualization": true
+  }
+}

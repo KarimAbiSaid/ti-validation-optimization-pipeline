@@ -536,3 +536,13 @@ def list_mask_names(subject_ids: list[str], project_dir: str = PROJECT_DIR) -> l
             if name:
                 names.add(name)
     return sorted(names)
+
+
+def mask_name_from_path(path: str) -> str | None:
+    """Reverses a mask file's name back to the bare identifier used in
+    expected_mask_path()/generate_masks() — e.g. given .../sub-025_label-
+    hippo_r_BNA_mask.nii.gz, returns "hippo_r_BNA". Used by mask_recipe_
+    discovery.py to turn a Combine step's selected FILE PATHS (for one
+    specific subject) back into subject-agnostic names a recipe can
+    reference. None if path doesn't match any known mask filename pattern."""
+    return _extract_mask_name(os.path.basename(path))

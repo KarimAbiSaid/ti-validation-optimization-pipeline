@@ -28,6 +28,7 @@ import dash
 from dash import html, dcc, dash_table, callback, Input, Output, State, ctx
 
 import discovery
+import mask_recipe_discovery as mrd
 
 
 def _stepper_row(id_, value, step, minimum, width="70px"):
@@ -69,6 +70,7 @@ def _register_stepper_callback(id_, step, minimum, maximum=None):
     return _step
 import cap_discovery
 import config_discovery as cd
+import preset_discovery as pd
 
 dash.register_page(__name__, path="/config-generation", name="Config Generation",
                    category="Optimization", order=1)
@@ -109,175 +111,140 @@ def _styled_table(id_, columns, data=None, **kwargs):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ROI / non-ROI block — one layout + one set of callbacks per prefix
+# Recipe-book-backed masks — every mask this page references (ROI, non-ROI,
+# subgroup/background constraints) is picked BY NAME from one selected
+# recipe book (see mask_recipe_discovery.py), not built inline here. Mask
+# Generation is the only place that actually builds anything; this page
+# only resolves names to recipes (for the final config JSON / a frozen
+# Preference) and can trigger building whichever referenced names are
+# missing for the selected subject(s).
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _region_block_layout(prefix, title):
-    return html.Div([
-        html.H4(title),
-        dcc.Store(id=f"{prefix}-region-lut-store"),
-        dcc.Store(id=f"{prefix}-selected-label-ids-store", data={}),
-
-        html.Label("Name (short slug used in the config filename, e.g. \"hippo_r_phg\")"),
-        dcc.Input(id=f"{prefix}-name-input", type="text", style={"width": "100%"}),
-
-        html.Label("...or pick an already-generated mask (any atlas, or a Mask Generation "
-                   "combined mask) — fills in the name above and skips atlas/region selection "
-                   "entirely, same as an Allen-sourced mask", style={"marginTop": "0.5rem", "display": "block"}),
-        dcc.Dropdown(id=f"{prefix}-existing-mask-dropdown", placeholder="Pick an existing mask..."),
-
-        html.Label("Atlas source", style={"marginTop": "0.5rem", "display": "block"}),
-        dcc.Dropdown(
-            id=f"{prefix}-atlas-dropdown",
-            options=[
-                {"label": name + ("" if meta["usable"] else "  (not yet usable)"),
-                 "value": name, "disabled": not meta["usable"]}
-                for name, meta in discovery.ATLAS_REGISTRY.items()
-            ],
-            placeholder="Select atlas...",
-        ),
-        html.Div(id=f"{prefix}-atlas-note", style={"fontStyle": "italic", "fontSize": "13px", "margin": "0.5rem 0"}),
-        html.Div(id=f"{prefix}-region-picker"),
-    ], style={"flex": "1 1 380px", "border": "1px solid #ddd", "borderRadius": "6px",
-              "padding": "1rem", "marginRight": "1rem"})
+def _resolve_recipe(book_name, mask_name):
+    """(atlas, label_ids, kind) for mask_name inside book_name. atlas is
+    None and label_ids {} for a "combine" recipe — there's no single
+    atlas, so the final mask file must already exist (same convention
+    build_roi_dict() already uses for Allen-sourced masks). (None, {},
+    None) if the book or the name can't be resolved."""
+    if not book_name or not mask_name:
+        return None, {}, None
+    book = mrd.load_recipe_book(book_name)
+    if not book:
+        return None, {}, None
+    recipe = (book.get("masks") or {}).get(mask_name)
+    if not recipe:
+        return None, {}, None
+    if recipe.get("kind") == "combine":
+        return None, {}, "combine"
+    return recipe.get("atlas"), recipe.get("label_ids") or {}, "atlas_region"
 
 
-def _register_region_callbacks(prefix):
-
-    @callback(
-        Output(f"{prefix}-atlas-note", "children"),
-        Output(f"{prefix}-region-picker", "children"),
-        Output(f"{prefix}-region-lut-store", "data"),
-        Input("cg-subject-dropdown", "value"),
-        Input(f"{prefix}-atlas-dropdown", "value"),
-    )
-    def _update_atlas_panel(subject_ids, atlas_name):
-        if not subject_ids or not atlas_name:
-            return "", html.Div("Select at least one subject and an atlas first."), None
-
-        meta = discovery.ATLAS_REGISTRY[atlas_name]
-
-        if cd.uses_allen(atlas_name):
-            note = ("Allen-sourced masks aren't built by this pipeline directly — generate the "
-                    "mask first via Mask Generation, then pick it from the \"...or pick an "
-                    "already-generated mask\" dropdown above. The Subject Readiness table shows "
-                    "whether it already exists for every selected subject.")
-            return note, html.Div(), None
-
-        not_ready = [sid for sid in subject_ids if not discovery.full_atlas_check(atlas_name, sid)["ready"]]
-
-        if not meta["has_lut"]:
-            region_ui = html.Div([
-                html.P("No name lut for this atlas in the project — enter numeric label ids "
-                       "directly, one 'Display Name: id' pair per line:"),
-                dcc.Textarea(id=f"{prefix}-bna-region-input", style={"width": "100%", "height": "100px"},
-                             placeholder="PhG_R: 116\nrHippocampus_R: 216\ncHippocampus_R: 218"),
-                html.Div(id=f"{prefix}-bna-region-preview"),
-            ])
-            return meta["note"], region_ui, None
-
-        if not_ready:
-            region_ui = html.Div(
-                "Region list not shown — these subjects are missing required files for "
-                f"{atlas_name}: {', '.join(not_ready)}",
-                style={"color": "#a00"})
-            return meta["note"], region_ui, None
-
-        try:
-            lut = discovery.build_lut(atlas_name, subject_ids[0])
-        except Exception as e:
-            return meta["note"], html.Div(f"Failed to load region list: {e}", style={"color": "#a00"}), None
-
-        options = [{"label": f"{name}  (id {rid})", "value": rid}
-                   for rid, name in sorted(lut.items(), key=lambda kv: kv[1])]
-        region_ui = dcc.Dropdown(id=f"{prefix}-region-dropdown", options=options, multi=True,
-                                  placeholder="Search regions...")
-        return meta["note"], region_ui, lut
-
-    @callback(
-        Output(f"{prefix}-bna-region-preview", "children"),
-        Input(f"{prefix}-bna-region-input", "value"),
-        prevent_initial_call=True,
-    )
-    def _preview_bna_regions(text):
-        if not text:
-            return ""
-        items = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            name, _, rid = line.partition(":")
-            name, rid = name.strip(), rid.strip()
-            valid = rid.lstrip("-").isdigit()
-            label = f"{name} → {rid}" + ("" if valid else "  (not a valid integer)")
-            items.append(html.Li(label, style={"color": "#000" if valid else "#a00"}))
-        return html.Ul(items)
-
-    @callback(
-        Output(f"{prefix}-selected-label-ids-store", "data", allow_duplicate=True),
-        Input(f"{prefix}-atlas-dropdown", "value"),
-        prevent_initial_call=True,
-    )
-    def _reset_on_atlas_change(_atlas_name):
-        return {}
-
-    @callback(
-        Output(f"{prefix}-selected-label-ids-store", "data", allow_duplicate=True),
-        Input(f"{prefix}-region-dropdown", "value"),
-        State(f"{prefix}-region-lut-store", "data"),
-        prevent_initial_call=True,
-    )
-    def _sync_lut_selection(selected_ids, lut):
-        if not selected_ids or not lut:
-            return {}
-        lut = {int(k): v for k, v in lut.items()}
-        return {lut[rid]: rid for rid in selected_ids if rid in lut}
-
-    @callback(
-        Output(f"{prefix}-selected-label-ids-store", "data", allow_duplicate=True),
-        Input(f"{prefix}-bna-region-input", "value"),
-        prevent_initial_call=True,
-    )
-    def _sync_bna_selection(text):
-        out = {}
-        for line in (text or "").splitlines():
-            line = line.strip()
-            if not line or ":" not in line:
-                continue
-            name, _, rid = line.partition(":")
-            name, rid = name.strip(), rid.strip()
-            if rid.lstrip("-").isdigit():
-                out[name] = int(rid)
-        return out
-
-    @callback(
-        Output(f"{prefix}-existing-mask-dropdown", "options"),
-        Input("cg-subject-dropdown", "value"),
-    )
-    def _load_existing_mask_options(subject_ids):
-        return [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
-
-    @callback(
-        Output(f"{prefix}-name-input", "value"),
-        Output(f"{prefix}-selected-label-ids-store", "data", allow_duplicate=True),
-        Input(f"{prefix}-existing-mask-dropdown", "value"),
-        prevent_initial_call=True,
-    )
-    def _pick_existing_mask(mask_name):
-        # Clearing the label-ids store too, not just filling the name field —
-        # otherwise a region selection made under a DIFFERENT atlas before
-        # picking this mask would still be sitting in the store, and
-        # build_roi_dict() would build labels from that stale selection
-        # instead of trusting the picked mask file as-is (empty labels,
-        # same as today's Allen-only path).
-        if not mask_name:
-            return dash.no_update, dash.no_update
-        return mask_name, {}
+def _referenced_mask_names(roi_name, non_roi_name, constraint_group_rows,
+                           roi_constraint_group_rows, bg_mask_name):
+    names = set()
+    if roi_name and roi_name.strip():
+        names.add(roi_name.strip())
+    if non_roi_name and non_roi_name.strip():
+        names.add(non_roi_name.strip())
+    names |= set(_constraint_group_mask_names(constraint_group_rows))
+    names |= set(_constraint_group_mask_names(roi_constraint_group_rows))
+    if bg_mask_name and bg_mask_name.strip():
+        names.add(bg_mask_name.strip())
+    return sorted(names)
 
 
-_register_region_callbacks("cg-roi")
-_register_region_callbacks("cg-nonroi")
+def _freeze_recipes(book_masks, names, frozen=None):
+    """Recursively copies every recipe `names` depend on (transitively,
+    through a "combine" recipe's sources) out of the live book into a
+    standalone dict — so a saved Preference behaves identically later even
+    if the book it was built from is edited or deleted afterward. Returns
+    (frozen_dict, missing_names) — missing_names is every referenced name
+    with no recipe anywhere in the book (not even as a combine source),
+    which makes the whole thing unbuildable on a brand-new subject."""
+    frozen = frozen if frozen is not None else {}
+    missing = []
+    for name in names:
+        if name in frozen:
+            continue
+        recipe = book_masks.get(name)
+        if recipe is None:
+            missing.append(name)
+            continue
+        frozen[name] = recipe
+        if recipe.get("kind") == "combine":
+            _, sub_missing = _freeze_recipes(book_masks, recipe.get("sources") or [], frozen)
+            missing.extend(sub_missing)
+    return frozen, missing
+
+
+@callback(Output("cg-recipe-book-dropdown", "options"), Input("cg-recipe-book-dropdown", "id"))
+def _load_recipe_books(_):
+    return [{"label": b["name"], "value": b["name"]} for b in mrd.list_recipe_books()]
+
+
+@callback(
+    Output("cg-roi-name-dropdown", "options"),
+    Output("cg-nonroi-name-dropdown", "options"),
+    Input("cg-recipe-book-dropdown", "value"),
+)
+def _load_book_mask_options(book_name):
+    options = _mask_name_options(book_name)
+    return options, options
+
+
+def _mask_name_options(book_name):
+    if not book_name:
+        return []
+    book = mrd.load_recipe_book(book_name)
+    names = sorted((book or {}).get("masks", {}).keys())
+    return [{"label": n, "value": n} for n in names]
+
+
+@callback(
+    Output("cg-build-masks-result", "children"),
+    Input("cg-build-masks-btn", "n_clicks"),
+    State("cg-subject-dropdown", "value"),
+    State("cg-recipe-book-dropdown", "value"),
+    State("cg-roi-name-dropdown", "value"),
+    State("cg-nonroi-name-dropdown", "value"),
+    State("cg-opt-constraint-groups-table", "data"),
+    State("cg-opt-roi-constraint-groups-table", "data"),
+    State("cg-opt-bg-mask-dropdown", "value"),
+    prevent_initial_call=True,
+)
+def _on_build_masks_click(_n_clicks, subject_ids, book_name, roi_name, non_roi_name,
+                          constraint_group_rows, roi_constraint_group_rows, bg_mask_name):
+    if not subject_ids:
+        return html.Div("Select at least one subject first.", style={"color": "#a00"})
+    if not book_name:
+        return html.Div("Select a recipe book first.", style={"color": "#a00"})
+    book = mrd.load_recipe_book(book_name)
+    if not book:
+        return html.Div(f"Could not load recipe book '{book_name}'.", style={"color": "#a00"})
+
+    names = _referenced_mask_names(roi_name, non_roi_name, constraint_group_rows,
+                                   roi_constraint_group_rows, bg_mask_name)
+    if not names:
+        return html.Div("Nothing to build — pick ROI/non-ROI (or a constraint mask) first.",
+                        style={"color": "#a00"})
+
+    results = mrd.build_missing_masks(subject_ids, book.get("masks") or {}, names)
+    if not results:
+        return html.Div("✓ every referenced mask already exists for every selected subject — "
+                        "nothing to build.", style={"color": "#060"})
+    return _styled_table("cg-build-masks-results-table", [
+        {"name": "Subject", "id": "subject"},
+        {"name": "Mask", "id": "mask_name"},
+        {"name": "Status", "id": "status"},
+        {"name": "Detail", "id": "detail"},
+    ], data=[
+        {"subject": r["subject_id"], "mask_name": r["mask_name"],
+         "status": "✓ built" if r["success"] else "✗ failed",
+         "detail": (f"{r['voxel_count']} voxels" if r["success"] else (r["error"] or ""))}
+        for r in results
+    ], style_data_conditional=[
+        {"if": {"filter_query": '{status} contains "failed"'}, "backgroundColor": "#ffe0e0"},
+    ])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -295,11 +262,32 @@ layout = html.Div([
         dcc.Dropdown(id="cg-subject-dropdown", multi=True, placeholder="Select subject(s)..."),
     ], style={"maxWidth": "600px", "marginBottom": "1.5rem"}),
 
-    html.H3("ROI / non-ROI"),
+    html.H3("Recipe book"),
+    html.P("Every mask this config references — ROI, non-ROI, and any subgroup/background "
+           "constraint masks below — is picked by name from one recipe book, built on the "
+           "Mask Generation page's \"also save this as a recipe\" option (full access to "
+           "every atlas, including Allen, and hemisphere — not a cut-down picker here). A "
+           "name picked below becomes selectable in the subgroup/background pickers further "
+           "down too, whether or not it's built yet for the selected subject(s) — Subject "
+           "Readiness shows what's missing, and \"Build missing masks\" builds exactly that, "
+           "for exactly the subjects that need it; nothing already on disk is ever rebuilt.",
+           style={"fontSize": "13px", "color": "#666", "marginBottom": "0.5rem"}),
     html.Div([
-        _region_block_layout("cg-roi", "ROI"),
-        _region_block_layout("cg-nonroi", "non-ROI"),
-    ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "1.5rem"}),
+        dcc.Dropdown(id="cg-recipe-book-dropdown", placeholder="Select a recipe book..."),
+    ], style={"maxWidth": "420px", "marginBottom": "1rem"}),
+    html.Div([
+        html.Div([
+            html.Label("ROI"),
+            dcc.Dropdown(id="cg-roi-name-dropdown", placeholder="Select ROI mask..."),
+        ], style={"flex": "1 1 280px", "marginRight": "1rem"}),
+        html.Div([
+            html.Label("non-ROI"),
+            dcc.Dropdown(id="cg-nonroi-name-dropdown", placeholder="Select non-ROI mask..."),
+        ], style={"flex": "1 1 280px"}),
+    ], style={"display": "flex", "flexWrap": "wrap", "marginBottom": "1rem"}),
+    html.Button("Build missing masks for selected subject(s)", id="cg-build-masks-btn", n_clicks=0,
+               style={"marginBottom": "0.5rem"}),
+    dcc.Loading(html.Div(id="cg-build-masks-result", style={"marginBottom": "1.5rem"})),
 
     html.H3("Cap"),
     html.Div([
@@ -625,6 +613,25 @@ layout = html.Div([
         style={"marginBottom": "1.5rem"},
     ),
 
+    html.H3("Preference"),
+    html.P("Save everything above (cap, every mask — ROI, non-ROI, and any additional ones — "
+           "every optimizer/electrode/flag setting) as a named, reusable Preference — not tied "
+           "to any subject. Apply it to a new subject from the Apply Preference page: it builds "
+           "the masks, registers the cap, and generates the config, so you don't have to set "
+           "all of this up again every time.",
+           style={"fontSize": "13px", "color": "#666"}),
+    html.Div([
+        dcc.Input(id="cg-preset-name", type="text", placeholder="Preference name, e.g. hippocampus_focality",
+                  style={"marginRight": "0.5rem", "minWidth": "280px"}),
+        html.Button("Save as Preference", id="cg-preset-save-btn", n_clicks=0),
+    ], style={"display": "flex", "flexWrap": "wrap", "alignItems": "center", "marginBottom": "0.5rem"}),
+    dcc.Checklist(
+        id="cg-preset-overwrite-confirm",
+        options=[{"label": " overwrite the existing preference with this name", "value": "confirm"}],
+        value=[], style={"marginBottom": "0.5rem"},
+    ),
+    html.Div(id="cg-preset-save-status", style={"fontSize": "13px", "marginBottom": "1.5rem"}),
+
     html.H3("Subject Readiness"),
     _styled_table("cg-readiness-table", [
         {"name": "Subject", "id": "subject"},
@@ -722,29 +729,29 @@ def _constraint_group_mask_names(rows: list[dict] | None) -> list[str]:
 @callback(
     Output("cg-readiness-table", "data"),
     Input("cg-subject-dropdown", "value"),
-    Input("cg-roi-atlas-dropdown", "value"),
-    Input("cg-roi-name-input", "value"),
-    Input("cg-roi-existing-mask-dropdown", "value"),
-    Input("cg-nonroi-atlas-dropdown", "value"),
-    Input("cg-nonroi-name-input", "value"),
-    Input("cg-nonroi-existing-mask-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
+    Input("cg-roi-name-dropdown", "value"),
+    Input("cg-nonroi-name-dropdown", "value"),
     Input("cg-cap-dropdown", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
     Input("cg-opt-roi-constraint-groups-table", "data"),
     Input("cg-opt-bg-mask-dropdown", "value"),
 )
-def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
-                            non_roi_atlas, non_roi_name, non_roi_existing_mask,
+def _update_readiness_table(subject_ids, book_name, roi_name, non_roi_name,
                             cap_path, constraint_group_rows, roi_constraint_group_rows, bg_mask_name):
-    if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask):
+    if not subject_ids or not book_name or not roi_name:
         return []
     constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
                               + _constraint_group_mask_names(roi_constraint_group_rows)
                               + ([bg_mask_name.strip()] if bg_mask_name and bg_mask_name.strip() else []))
-    matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
+    # roi_atlas/non_roi_atlas are irrelevant here — roi_uses_existing_mask=
+    # True makes subject_readiness() check "does the mask file already
+    # exist" regardless of what built it (recipe book, Mask Generation
+    # directly, or anything else); the atlas value only matters for the
+    # final config JSON (build_roi_dict(), in _on_generate_click below).
+    matrix = cd.readiness_matrix(subject_ids, None, roi_name, None, non_roi_name,
                                  cap_path, constraint_group_masks=constraint_group_masks,
-                                 roi_uses_existing_mask=bool(roi_existing_mask),
-                                 non_roi_uses_existing_mask=bool(non_roi_existing_mask))
+                                 roi_uses_existing_mask=True, non_roi_uses_existing_mask=True)
     rows = []
     for sid in subject_ids:
         r = matrix[sid]
@@ -763,12 +770,9 @@ def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
     Output("cg-generate-table", "data"),
     Output("cg-generate-table", "selected_rows"),
     Input("cg-subject-dropdown", "value"),
-    Input("cg-roi-atlas-dropdown", "value"),
-    Input("cg-roi-name-input", "value"),
-    Input("cg-roi-existing-mask-dropdown", "value"),
-    Input("cg-nonroi-atlas-dropdown", "value"),
-    Input("cg-nonroi-name-input", "value"),
-    Input("cg-nonroi-existing-mask-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
+    Input("cg-roi-name-dropdown", "value"),
+    Input("cg-nonroi-name-dropdown", "value"),
     Input("cg-cap-dropdown", "value"),
     Input("cg-goals-checklist", "value"),
     Input("cg-opt-constraint-groups-table", "data"),
@@ -776,20 +780,18 @@ def _update_readiness_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
     Input("cg-opt-bg-mask-dropdown", "value"),
     State("cg-generate-table", "selected_rows"),
 )
-def _update_generate_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
-                           non_roi_atlas, non_roi_name, non_roi_existing_mask,
+def _update_generate_table(subject_ids, book_name, roi_name, non_roi_name,
                            cap_path, goals, constraint_group_rows, roi_constraint_group_rows,
                            bg_mask_name, prev_selected):
-    if not subject_ids or not roi_name or not (roi_atlas or roi_existing_mask) or not goals:
+    if not subject_ids or not book_name or not roi_name or not goals:
         return [], []
 
     constraint_group_masks = (_constraint_group_mask_names(constraint_group_rows)
                               + _constraint_group_mask_names(roi_constraint_group_rows)
                               + ([bg_mask_name.strip()] if bg_mask_name and bg_mask_name.strip() else []))
-    matrix = cd.readiness_matrix(subject_ids, roi_atlas, roi_name, non_roi_atlas, non_roi_name,
+    matrix = cd.readiness_matrix(subject_ids, None, roi_name, None, non_roi_name,
                                  cap_path, constraint_group_masks=constraint_group_masks,
-                                 roi_uses_existing_mask=bool(roi_existing_mask),
-                                 non_roi_uses_existing_mask=bool(non_roi_existing_mask))
+                                 roi_uses_existing_mask=True, non_roi_uses_existing_mask=True)
     ready_subjects = [sid for sid in subject_ids if matrix[sid]["ready"]]
 
     rows = []
@@ -800,10 +802,8 @@ def _update_generate_table(subject_ids, roi_atlas, roi_name, roi_existing_mask,
         overwrite_display = f"⚠ {len(existing)} will overwrite" if existing else "new file(s)"
         rows.append({"subject": sid, "files_display": files_display, "overwrite_display": overwrite_display})
 
-    if ctx.triggered_id in ("cg-subject-dropdown", "cg-roi-atlas-dropdown", "cg-roi-name-input",
-                           "cg-roi-existing-mask-dropdown", "cg-nonroi-atlas-dropdown",
-                           "cg-nonroi-name-input", "cg-nonroi-existing-mask-dropdown",
-                           "cg-cap-dropdown", "cg-goals-checklist") or not prev_selected:
+    if ctx.triggered_id in ("cg-subject-dropdown", "cg-recipe-book-dropdown", "cg-roi-name-dropdown",
+                           "cg-nonroi-name-dropdown", "cg-cap-dropdown", "cg-goals-checklist") or not prev_selected:
         selected_rows = list(range(len(rows)))
     else:
         selected_rows = [i for i in prev_selected if i < len(rows)]
@@ -826,19 +826,12 @@ def _select_all_ready(_n_clicks, data):
     Output("cg-generate-button", "disabled"),
     Input("cg-generate-table", "data"),
     Input("cg-generate-table", "selected_rows"),
-    Input("cg-roi-name-input", "value"),
-    Input("cg-roi-atlas-dropdown", "value"),
-    Input("cg-roi-selected-label-ids-store", "data"),
-    Input("cg-roi-existing-mask-dropdown", "value"),
-    Input("cg-nonroi-name-input", "value"),
-    Input("cg-nonroi-atlas-dropdown", "value"),
-    Input("cg-nonroi-selected-label-ids-store", "data"),
-    Input("cg-nonroi-existing-mask-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
+    Input("cg-roi-name-dropdown", "value"),
+    Input("cg-nonroi-name-dropdown", "value"),
     Input("cg-overwrite-confirm", "value"),
 )
-def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_label_ids, roi_existing_mask,
-                               non_roi_name, non_roi_atlas, non_roi_label_ids, non_roi_existing_mask,
-                               confirm_value):
+def _update_generate_readiness(rows, selected_rows, book_name, roi_name, non_roi_name, confirm_value):
     rows = rows or []
     selected_rows = selected_rows or []
     selected = [rows[i] for i in selected_rows if i < len(rows)]
@@ -846,17 +839,12 @@ def _update_generate_readiness(rows, selected_rows, roi_name, roi_atlas, roi_lab
     problems = []
     if not selected:
         problems.append("select at least one ready subject")
+    if not book_name:
+        problems.append("select a recipe book")
     if not roi_name:
-        problems.append("enter a ROI name")
-    # An explicitly-picked existing mask (any atlas, or no atlas at all)
-    # overrides needing a region selection — same as Allen already does,
-    # just not tied to one specific atlas (see build_roi_dict()).
-    if roi_atlas and not cd.uses_allen(roi_atlas) and not roi_label_ids and not roi_existing_mask:
-        problems.append("select at least one ROI region")
+        problems.append("select a ROI mask")
     if not non_roi_name:
-        problems.append("enter a non-ROI name")
-    if non_roi_atlas and not cd.uses_allen(non_roi_atlas) and not non_roi_label_ids and not non_roi_existing_mask:
-        problems.append("select at least one non-ROI region")
+        problems.append("select a non-ROI mask")
 
     overwrite_rows = [r for r in selected if r["overwrite_display"].startswith("⚠")]
     confirmed = "confirm" in (confirm_value or [])
@@ -891,11 +879,10 @@ def _add_constraint_group_row(_n_clicks, rows):
 
 @callback(
     Output("cg-opt-constraint-groups-table", "dropdown"),
-    Input("cg-subject-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
 )
-def _update_constraint_group_mask_options(subject_ids):
-    options = [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
-    return {"mask_name": {"options": options, "clearable": True}}
+def _update_constraint_group_mask_options(book_name):
+    return {"mask_name": {"options": _mask_name_options(book_name), "clearable": True}}
 
 
 @callback(
@@ -928,19 +915,18 @@ def _add_roi_constraint_group_row(_n_clicks, rows):
 
 @callback(
     Output("cg-opt-roi-constraint-groups-table", "dropdown"),
-    Input("cg-subject-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
 )
-def _update_roi_constraint_group_mask_options(subject_ids):
-    options = [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
-    return {"mask_name": {"options": options, "clearable": True}}
+def _update_roi_constraint_group_mask_options(book_name):
+    return {"mask_name": {"options": _mask_name_options(book_name), "clearable": True}}
 
 
 @callback(
     Output("cg-opt-bg-mask-dropdown", "options"),
-    Input("cg-subject-dropdown", "value"),
+    Input("cg-recipe-book-dropdown", "value"),
 )
-def _update_bg_mask_options(subject_ids):
-    return [{"label": n, "value": n} for n in discovery.list_mask_names(subject_ids or [])]
+def _update_bg_mask_options(book_name):
+    return _mask_name_options(book_name)
 
 
 @callback(
@@ -966,81 +952,28 @@ def _update_tiers_preview(csv_path_override):
     ])
 
 
-@callback(
-    Output("cg-generate-results", "children"),
-    Input("cg-generate-button", "n_clicks"),
-    State("cg-generate-table", "data"),
-    State("cg-generate-table", "selected_rows"),
-    State("cg-roi-name-input", "value"),
-    State("cg-roi-atlas-dropdown", "value"),
-    State("cg-roi-selected-label-ids-store", "data"),
-    State("cg-nonroi-name-input", "value"),
-    State("cg-nonroi-atlas-dropdown", "value"),
-    State("cg-nonroi-selected-label-ids-store", "data"),
-    State("cg-goals-checklist", "value"),
-    State("cg-cap-dropdown", "value"),
-    State("cg-opt-postproc", "value"),
-    State("cg-opt-cpus", "value"),
-    State("cg-opt-focality-nonroi", "value"),
-    State("cg-opt-focality-roi", "value"),
-    State("cg-opt-checkboxes", "value"),
-    State("cg-opt-hier-enable", "value"),
-    State("cg-opt-hier-num-iter", "value"),
-    State("cg-opt-hier-neighbours", "value"),
-    State("cg-opt-hier-early-stop", "value"),
-    State("cg-opt-constraint-groups-table", "data"),
-    State("cg-opt-roi-constraint-groups-table", "data"),
-    State("cg-opt-amp-enable", "value"),
-    State("cg-opt-amp-top-n", "value"),
-    State("cg-opt-amp-min-ma", "value"),
-    State("cg-opt-amp-max-ma", "value"),
-    State("cg-opt-amp-step-ma", "value"),
-    State("cg-opt-amp-max-per-pair-ma", "value"),
-    State("cg-opt-amp-weight-roc", "value"),
-    State("cg-opt-amp-weight-roi-mean", "value"),
-    State("cg-opt-amp-weight-non-roi-mean", "value"),
-    State("cg-opt-amp-weight-focality-ratio", "value"),
-    State("cg-opt-loc-enable", "value"),
-    State("cg-opt-bg-enable", "value"),
-    State("cg-opt-bg-mask-dropdown", "value"),
-    State("cg-opt-bg-max-elements", "value"),
-    State("cg-opt-bg-hotspot-pct", "value"),
-    State("cg-opt-tiers-enable", "value"),
-    State("cg-opt-tiers-csv-path", "value"),
-    State("cg-opt-tiers-weight-1", "value"),
-    State("cg-opt-tiers-weight-2", "value"),
-    State("cg-opt-tiers-weight-3", "value"),
-    State("cg-opt-tiers-weight-4", "value"),
-    State("cg-opt-loc-weight-main", "value"),
-    State("cg-opt-loc-weight-background", "value"),
-    State("cg-opt-loc-weight-background-hotspot", "value"),
-    State("cg-opt-loc-weight-tier-penalty", "value"),
-    State("cg-elec-diameter", "value"),
-    State("cg-elec-gel-thickness", "value"),
-    State("cg-elec-max-current", "value"),
-    State("cg-flags-checklist", "value"),
-    prevent_initial_call=True,
-)
-def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_label_ids,
-                       non_roi_name, non_roi_atlas, non_roi_label_ids, goals, cap_path,
-                       postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
-                       hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
-                       constraint_group_rows, roi_constraint_group_rows,
-                       amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
-                       amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
-                       loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
-                       tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
-                       tiers_weight_3, tiers_weight_4,
-                       loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
-                       loc_weight_tier_penalty,
-                       elec_diameter, elec_gel, elec_max_current, flags_checklist):
-    rows = rows or []
-    selected_rows = selected_rows or []
-    subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
-
-    if not subject_ids or not roi_name or not non_roi_name or not goals:
-        return html.Div("Nothing to generate — check subject/ROI/non-ROI/goal selection.",
-                         style={"color": "#a00"})
+def _build_overrides(roi_name, roi_atlas, non_roi_name, goals,
+                     postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+                     hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
+                     constraint_group_rows, roi_constraint_group_rows,
+                     amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+                     amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+                     loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+                     tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
+                     tiers_weight_3, tiers_weight_4,
+                     loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
+                     loc_weight_tier_penalty,
+                     elec_diameter, elec_gel, elec_max_current, flags_checklist):
+    """Shared by _on_generate_click (actually generate configs for selected
+    subjects) and _on_save_preference_click (bundle the same settings into
+    a reusable Preference, no subject involved) — both read from the exact
+    same page components, so this is the one place that turns "whatever's
+    currently filled in" into (optimizer_overrides, electrode_overrides,
+    flags). Returns (error_message_or_None, optimizer_overrides,
+    electrode_overrides, flags) — error_message is a ready-to-render
+    html.Div(...) on validation failure, None on success."""
+    if not roi_name or not non_roi_name or not goals:
+        return (html.Div("Check ROI/non-ROI/goal selection.", style={"color": "#a00"}), None, None, None)
 
     use_hierarchical = "use_hierarchical_search" in (hier_enable or [])
     num_fine_iter = int(hier_num_iter) if hier_num_iter else 0
@@ -1049,13 +982,13 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         try:
             neighbours_per_iter = [int(x.strip()) for x in hier_neighbours_str.split(",") if x.strip()]
         except ValueError:
-            return html.Div(f"neighbours per iteration must be comma-separated integers "
+            return (html.Div(f"neighbours per iteration must be comma-separated integers "
                              f"(e.g. 8,6,4) — got: {hier_neighbours_str!r}",
-                             style={"color": "#a00"})
+                             style={"color": "#a00"}), None, None, None)
     if use_hierarchical and num_fine_iter and len(neighbours_per_iter) != num_fine_iter:
-        return html.Div(f"neighbours per iteration must have exactly {num_fine_iter} value(s) "
+        return (html.Div(f"neighbours per iteration must have exactly {num_fine_iter} value(s) "
                          f"(one per fine iteration) — got {len(neighbours_per_iter)}.",
-                         style={"color": "#a00"})
+                         style={"color": "#a00"}), None, None, None)
 
     constraint_groups = []
     for row in (constraint_group_rows or []):
@@ -1065,14 +998,14 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         if not grp_name and not mask_name and max_v in (None, ""):
             continue   # blank row (added but never filled in) — skip silently
         if not grp_name or not mask_name or max_v in (None, ""):
-            return html.Div("each non-ROI subgroup constraint row needs name, mask_name, "
+            return (html.Div("each non-ROI subgroup constraint row needs name, mask_name, "
                              "and max_mean_V_m — remove any incomplete rows.",
-                             style={"color": "#a00"})
+                             style={"color": "#a00"}), None, None, None)
         try:
             max_v = float(max_v)
         except (TypeError, ValueError):
-            return html.Div(f"constraint group '{grp_name}': max_mean_V_m must be a number, "
-                             f"got {max_v!r}", style={"color": "#a00"})
+            return (html.Div(f"constraint group '{grp_name}': max_mean_V_m must be a number, "
+                             f"got {max_v!r}", style={"color": "#a00"}), None, None, None)
         constraint_groups.append({"name": grp_name, "mask_name": mask_name, "max_mean_V_m": max_v})
 
     roi_constraint_groups = []
@@ -1083,26 +1016,26 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         if not grp_name and not mask_name and min_v in (None, ""):
             continue   # blank row (added but never filled in) — skip silently
         if not grp_name or not mask_name or min_v in (None, ""):
-            return html.Div("each ROI subgroup constraint row needs name, mask_name, "
+            return (html.Div("each ROI subgroup constraint row needs name, mask_name, "
                              "and min_mean_V_m — remove any incomplete rows.",
-                             style={"color": "#a00"})
+                             style={"color": "#a00"}), None, None, None)
         try:
             min_v = float(min_v)
         except (TypeError, ValueError):
-            return html.Div(f"ROI constraint group '{grp_name}': min_mean_V_m must be a number, "
-                             f"got {min_v!r}", style={"color": "#a00"})
+            return (html.Div(f"ROI constraint group '{grp_name}': min_mean_V_m must be a number, "
+                             f"got {min_v!r}", style={"color": "#a00"}), None, None, None)
         roi_constraint_groups.append({"name": grp_name, "mask_name": mask_name, "min_mean_V_m": min_v})
 
     use_amplitude_sweep = "use_amplitude_sweep" in (amp_enable or [])
     if use_amplitude_sweep:
         if amp_min_ma is None or amp_max_ma is None or amp_step_ma is None:
-            return html.Div("amplitude sweep: min/max/step mA are all required when "
-                             "use_amplitude_sweep is enabled.", style={"color": "#a00"})
+            return (html.Div("amplitude sweep: min/max/step mA are all required when "
+                             "use_amplitude_sweep is enabled.", style={"color": "#a00"}), None, None, None)
         if amp_min_ma > amp_max_ma:
-            return html.Div(f"amplitude sweep: min mA ({amp_min_ma}) can't exceed max mA ({amp_max_ma}).",
-                             style={"color": "#a00"})
+            return (html.Div(f"amplitude sweep: min mA ({amp_min_ma}) can't exceed max mA ({amp_max_ma}).",
+                             style={"color": "#a00"}), None, None, None)
         if amp_step_ma <= 0:
-            return html.Div("amplitude sweep: step mA must be positive.", style={"color": "#a00"})
+            return (html.Div("amplitude sweep: step mA must be positive.", style={"color": "#a00"}), None, None, None)
 
     optimizer_overrides = {
         "postproc": postproc,
@@ -1171,6 +1104,101 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
     flags = {k: (k in (flags_checklist or [])) for k in all_flag_keys
               if k in ("run_roi_masks", "run_optimization", "run_simulation",
                        "run_analysis", "run_visualization")}
+    return None, optimizer_overrides, electrode_overrides, flags
+
+
+@callback(
+    Output("cg-generate-results", "children"),
+    Input("cg-generate-button", "n_clicks"),
+    State("cg-generate-table", "data"),
+    State("cg-generate-table", "selected_rows"),
+    State("cg-recipe-book-dropdown", "value"),
+    State("cg-roi-name-dropdown", "value"),
+    State("cg-nonroi-name-dropdown", "value"),
+    State("cg-goals-checklist", "value"),
+    State("cg-cap-dropdown", "value"),
+    State("cg-opt-postproc", "value"),
+    State("cg-opt-cpus", "value"),
+    State("cg-opt-focality-nonroi", "value"),
+    State("cg-opt-focality-roi", "value"),
+    State("cg-opt-checkboxes", "value"),
+    State("cg-opt-hier-enable", "value"),
+    State("cg-opt-hier-num-iter", "value"),
+    State("cg-opt-hier-neighbours", "value"),
+    State("cg-opt-hier-early-stop", "value"),
+    State("cg-opt-constraint-groups-table", "data"),
+    State("cg-opt-roi-constraint-groups-table", "data"),
+    State("cg-opt-amp-enable", "value"),
+    State("cg-opt-amp-top-n", "value"),
+    State("cg-opt-amp-min-ma", "value"),
+    State("cg-opt-amp-max-ma", "value"),
+    State("cg-opt-amp-step-ma", "value"),
+    State("cg-opt-amp-max-per-pair-ma", "value"),
+    State("cg-opt-amp-weight-roc", "value"),
+    State("cg-opt-amp-weight-roi-mean", "value"),
+    State("cg-opt-amp-weight-non-roi-mean", "value"),
+    State("cg-opt-amp-weight-focality-ratio", "value"),
+    State("cg-opt-loc-enable", "value"),
+    State("cg-opt-bg-enable", "value"),
+    State("cg-opt-bg-mask-dropdown", "value"),
+    State("cg-opt-bg-max-elements", "value"),
+    State("cg-opt-bg-hotspot-pct", "value"),
+    State("cg-opt-tiers-enable", "value"),
+    State("cg-opt-tiers-csv-path", "value"),
+    State("cg-opt-tiers-weight-1", "value"),
+    State("cg-opt-tiers-weight-2", "value"),
+    State("cg-opt-tiers-weight-3", "value"),
+    State("cg-opt-tiers-weight-4", "value"),
+    State("cg-opt-loc-weight-main", "value"),
+    State("cg-opt-loc-weight-background", "value"),
+    State("cg-opt-loc-weight-background-hotspot", "value"),
+    State("cg-opt-loc-weight-tier-penalty", "value"),
+    State("cg-elec-diameter", "value"),
+    State("cg-elec-gel-thickness", "value"),
+    State("cg-elec-max-current", "value"),
+    State("cg-flags-checklist", "value"),
+    prevent_initial_call=True,
+)
+def _on_generate_click(_n_clicks, rows, selected_rows, book_name, roi_name, non_roi_name, goals, cap_path,
+                       postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+                       hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
+                       constraint_group_rows, roi_constraint_group_rows,
+                       amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+                       amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+                       loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+                       tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
+                       tiers_weight_3, tiers_weight_4,
+                       loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
+                       loc_weight_tier_penalty,
+                       elec_diameter, elec_gel, elec_max_current, flags_checklist):
+    rows = rows or []
+    selected_rows = selected_rows or []
+    subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
+
+    if not subject_ids:
+        return html.Div("Nothing to generate — select at least one subject.", style={"color": "#a00"})
+
+    # Resolved for the final config JSON's roi/non_roi dicts (build_roi_dict()
+    # via cd.generate_configs() below) — "combine" kind resolves to
+    # (None, {}), same as an Allen-sourced mask: no atlas means the file
+    # must already exist, which "Build missing masks" above is responsible
+    # for, not this step.
+    roi_atlas, roi_label_ids, _ = _resolve_recipe(book_name, roi_name)
+    non_roi_atlas, non_roi_label_ids, _ = _resolve_recipe(book_name, non_roi_name)
+
+    error, optimizer_overrides, electrode_overrides, flags = _build_overrides(
+        roi_name, roi_atlas, non_roi_name, goals,
+        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+        hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
+        constraint_group_rows, roi_constraint_group_rows,
+        amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+        amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+        loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+        tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2, tiers_weight_3, tiers_weight_4,
+        loc_weight_main, loc_weight_background, loc_weight_background_hotspot, loc_weight_tier_penalty,
+        elec_diameter, elec_gel, elec_max_current, flags_checklist)
+    if error is not None:
+        return error
 
     all_results = []
     for goal in goals:
@@ -1196,6 +1224,163 @@ def _on_generate_click(_n_clicks, rows, selected_rows, roi_name, roi_atlas, roi_
         html.P(f"subject_configs.sh rebuilt from every config now in {cd.CONFIGS_DIR}",
                style={"fontSize": "13px", "color": "#666", "marginTop": "0.5rem"}),
     ])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Save current settings as a Preference — reuses _build_overrides (same
+# validation/shape _on_generate_click uses) plus the ROI/non-ROI/extra-mask
+# recipes, so a Preference and a one-off Generate are built from identical
+# logic and can never silently drift apart.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _resolve_source_cap_path(registered_cap_value: str | None) -> tuple[str | None, str | None]:
+    """cg-cap-dropdown's value is an ALREADY-REGISTERED, subject-specific
+    CSV (m2m_{id}/eeg_positions/{name}.csv — see _load_caps' own docstring)
+    — its coordinates are in that one subject's native space, not MNI, so
+    it can NOT be reused directly to register a DIFFERENT (new) subject;
+    doing so would silently warp already-native coordinates as if they
+    were MNI ones. Only the filename stem (the cap's identity) is usable
+    here — resolve it back to the real MNI-space source file (project or
+    SimNIBS built-in) that one_shot_discovery.register_cap() actually
+    needs. Returns (source_path, error)."""
+    if not registered_cap_value:
+        return None, "select a cap first"
+    stem = cap_discovery.cap_stem(registered_cap_value)
+    match = next((c for c in cap_discovery.list_available_caps() if c["name"] == stem), None)
+    if match is None:
+        return None, (f'cap "{stem}" has no matching MNI-space source in project caps or SimNIBS '
+                      "built-ins — can't be reused to register a different subject")
+    return match["path"], None
+
+
+@callback(
+    Output("cg-preset-save-status", "children"),
+    Input("cg-preset-save-btn", "n_clicks"),
+    State("cg-preset-name", "value"),
+    State("cg-preset-overwrite-confirm", "value"),
+    State("cg-cap-dropdown", "value"),
+    State("cg-recipe-book-dropdown", "value"),
+    State("cg-roi-name-dropdown", "value"),
+    State("cg-nonroi-name-dropdown", "value"),
+    State("cg-goals-checklist", "value"),
+    State("cg-opt-postproc", "value"),
+    State("cg-opt-cpus", "value"),
+    State("cg-opt-focality-nonroi", "value"),
+    State("cg-opt-focality-roi", "value"),
+    State("cg-opt-checkboxes", "value"),
+    State("cg-opt-hier-enable", "value"),
+    State("cg-opt-hier-num-iter", "value"),
+    State("cg-opt-hier-neighbours", "value"),
+    State("cg-opt-hier-early-stop", "value"),
+    State("cg-opt-constraint-groups-table", "data"),
+    State("cg-opt-roi-constraint-groups-table", "data"),
+    State("cg-opt-amp-enable", "value"),
+    State("cg-opt-amp-top-n", "value"),
+    State("cg-opt-amp-min-ma", "value"),
+    State("cg-opt-amp-max-ma", "value"),
+    State("cg-opt-amp-step-ma", "value"),
+    State("cg-opt-amp-max-per-pair-ma", "value"),
+    State("cg-opt-amp-weight-roc", "value"),
+    State("cg-opt-amp-weight-roi-mean", "value"),
+    State("cg-opt-amp-weight-non-roi-mean", "value"),
+    State("cg-opt-amp-weight-focality-ratio", "value"),
+    State("cg-opt-loc-enable", "value"),
+    State("cg-opt-bg-enable", "value"),
+    State("cg-opt-bg-mask-dropdown", "value"),
+    State("cg-opt-bg-max-elements", "value"),
+    State("cg-opt-bg-hotspot-pct", "value"),
+    State("cg-opt-tiers-enable", "value"),
+    State("cg-opt-tiers-csv-path", "value"),
+    State("cg-opt-tiers-weight-1", "value"),
+    State("cg-opt-tiers-weight-2", "value"),
+    State("cg-opt-tiers-weight-3", "value"),
+    State("cg-opt-tiers-weight-4", "value"),
+    State("cg-opt-loc-weight-main", "value"),
+    State("cg-opt-loc-weight-background", "value"),
+    State("cg-opt-loc-weight-background-hotspot", "value"),
+    State("cg-opt-loc-weight-tier-penalty", "value"),
+    State("cg-elec-diameter", "value"),
+    State("cg-elec-gel-thickness", "value"),
+    State("cg-elec-max-current", "value"),
+    State("cg-flags-checklist", "value"),
+    prevent_initial_call=True,
+)
+def _on_save_preference_click(_n_clicks, preset_name, overwrite_value, registered_cap_value,
+                              book_name, roi_name, non_roi_name,
+                              goals, postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+                              hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
+                              constraint_group_rows, roi_constraint_group_rows,
+                              amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+                              amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+                              loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+                              tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2,
+                              tiers_weight_3, tiers_weight_4,
+                              loc_weight_main, loc_weight_background, loc_weight_background_hotspot,
+                              loc_weight_tier_penalty,
+                              elec_diameter, elec_gel, elec_max_current, flags_checklist):
+    name_err = pd.validate_name((preset_name or "").strip())
+    if name_err:
+        return html.Div(f"✗ {name_err}", style={"color": "#a00"})
+
+    if not book_name:
+        return html.Div("✗ select a recipe book first.", style={"color": "#a00"})
+    book = mrd.load_recipe_book(book_name)
+    if not book:
+        return html.Div(f"✗ could not load recipe book '{book_name}'.", style={"color": "#a00"})
+    if not roi_name or not non_roi_name:
+        return html.Div("✗ select both a ROI and a non-ROI mask first.", style={"color": "#a00"})
+
+    # Freezes a COPY of every referenced recipe (ROI, non-ROI, every
+    # subgroup/background constraint mask, and anything a "combine" among
+    # them transitively depends on) into the preference itself — so it
+    # behaves identically later even if this book is edited or deleted
+    # afterward, and Apply Preference never needs to re-read it. Any name
+    # with no recipe anywhere in the book (even as a combine source) means
+    # this preference could never be fully built on a brand-new subject,
+    # so saving is refused rather than producing something that'll just
+    # fail later.
+    referenced = _referenced_mask_names(roi_name, non_roi_name, constraint_group_rows,
+                                        roi_constraint_group_rows, bg_mask_name)
+    frozen_masks, missing = _freeze_recipes(book.get("masks") or {}, referenced)
+    if missing:
+        return html.Div(
+            f"✗ referenced but not found anywhere in recipe book '{book_name}': "
+            f"{', '.join(sorted(set(missing)))} — add a recipe for it in Mask Generation, or "
+            "fix the name.", style={"color": "#a00"})
+
+    cap_path, cap_err = _resolve_source_cap_path(registered_cap_value)
+    if cap_err:
+        return html.Div(f"✗ {cap_err}", style={"color": "#a00"})
+
+    error, optimizer_overrides, electrode_overrides, flags = _build_overrides(
+        roi_name, None, non_roi_name, goals,
+        postproc, cpus, focality_nonroi, focality_roi, opt_checkboxes,
+        hier_enable, hier_num_iter, hier_neighbours_str, hier_early_stop_pct,
+        constraint_group_rows, roi_constraint_group_rows,
+        amp_enable, amp_top_n, amp_min_ma, amp_max_ma, amp_step_ma, amp_max_per_pair_ma,
+        amp_weight_roc, amp_weight_roi_mean, amp_weight_non_roi_mean, amp_weight_focality_ratio,
+        loc_enable, bg_enable, bg_mask_name, bg_max_elements, bg_hotspot_pct,
+        tiers_enable, tiers_csv_path, tiers_weight_1, tiers_weight_2, tiers_weight_3, tiers_weight_4,
+        loc_weight_main, loc_weight_background, loc_weight_background_hotspot, loc_weight_tier_penalty,
+        elec_diameter, elec_gel, elec_max_current, flags_checklist)
+    if error is not None:
+        return error
+
+    data = {
+        "cap_path": cap_path,
+        "roi_name": roi_name,
+        "non_roi_name": non_roi_name,
+        "masks": frozen_masks,
+        "goals": goals or [],
+        "optimizer_overrides": optimizer_overrides,
+        "electrode_overrides": electrode_overrides,
+        "flags": flags,
+    }
+    overwrite = "confirm" in (overwrite_value or [])
+    result = pd.save_preset((preset_name or "").strip(), data, overwrite=overwrite)
+    if not result["success"]:
+        return html.Div(f"✗ {result['error']}", style={"color": "#a00"})
+    return html.Div(f"✓ saved → {result['path']}", style={"color": "#060"})
 
 
 # ═════════════════════════════════════════════════════════════════════════════

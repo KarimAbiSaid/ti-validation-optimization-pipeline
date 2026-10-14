@@ -11,3 +11,16 @@ _results_okamoto_19.zip
 pipeline/configs/*.json
 pipeline/configs/_archive/
 pipeline/configs/_archive_pre_cleanup/
+# Context summary for claude
+pipeline/PROJECT_CONTEXT_SUMMARY.md
+
+# Config Generation presets are personal/local by default — the folder
+# itself stays tracked (README.md, _template.json), the actual saved
+# presets don't. See gui/presets/README.md.
+gui/presets/*.json
+!gui/presets/_template.json
+
+# Mask recipe books are personal/local by default — same convention as
+# presets above. See gui/mask_recipes/README.md.
+gui/mask_recipes/*.json
+!gui/mask_recipes/_template.json
