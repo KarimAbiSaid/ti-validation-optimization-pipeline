@@ -1,0 +1,7 @@
+# Force LF line endings for scripts that get submitted/run on SCITAS
+# (Linux) regardless of a contributor's local core.autocrlf setting —
+# Windows git clients commonly check these out as CRLF by default, and
+# sbatch flatly refuses a script with CRLF ("Batch script contains DOS
+# line breaks (\r\n) instead of expected UNIX line breaks (\n)").
+*.sbatch text eol=lf
+*.sh     text eol=lf
