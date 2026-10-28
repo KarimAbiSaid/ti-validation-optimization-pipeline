@@ -200,6 +200,23 @@ class OptimizerConfig:
     # current can shunt directly across the scalp between neighbouring electrodes.
     no_adjacent_electrodes: bool = False
 
+    # Require the montage's 4 electrodes to lie in 4 distinct scalp quadrants
+    # (anterior/posterior x left/right), rejecting any montage where two
+    # non-midline electrodes share a quadrant — a hard structural constraint
+    # on how spread-out the montage is, independent of adjacency/tiers/
+    # background scoring. Midline electrodes (and the anterior/posterior
+    # dividing line's own "vertex" reference point) are detected purely
+    # geometrically, not by name: an electrode is "midline" if, when its
+    # left/right coordinate is mirrored, the nearest real electrode to that
+    # mirrored point is itself — verified to exactly reproduce the named
+    # 10-10 "z" row (Fpz/AFz/Fz/.../Oz/Iz) on three real subjects, with no
+    # reliance on any particular cap's naming convention. Midline electrodes
+    # are exempt from the quadrant rule (can pair with any quadrant); the
+    # most superior midline electrode (by z-coordinate) is used as the
+    # anterior/posterior pivot, since there's no equivalent "named row" for
+    # that axis the way there is for left/right.
+    use_quadrant_constraint: bool = False
+
     # Per-subgroup non-ROI hard constraints.
     # A montage is rejected if mean TI in ANY listed group exceeds max_mean_V_m,
     # regardless of the overall non-ROI union mean (which stays a single

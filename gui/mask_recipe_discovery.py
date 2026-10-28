@@ -1,22 +1,33 @@
 """
 mask_recipe_discovery.py — named "recipe books": {mask_name: how-to-build-it}
 dicts. Saved from Mask Generation — every build action there (atlas+region,
-or Combine) can also upsert its own spec into a book, using Mask
-Generation's full real capability (any atlas including Allen, hemisphere,
-combine) rather than a separate, weaker reimplementation. Consumed by
-Config Generation — every mask_name field there (ROI, non-ROI, subgroup/
-background constraints) only ever offers names that exist in whichever
-book is currently selected, and a "Build missing masks" action builds
-exactly the ones a given subject doesn't already have.
+Combine, or registering an external mask file) can also upsert its own spec
+into a book, using Mask Generation's full real capability (any atlas
+including Allen, hemisphere, combine, arbitrary external files) rather than
+a separate, weaker reimplementation. Consumed by Config Generation — every
+mask_name field there (ROI, non-ROI, subgroup/background constraints) only
+ever offers names that exist in whichever book is currently selected, and a
+"Build missing masks" action builds exactly the ones a given subject
+doesn't already have.
 
-Two recipe kinds, matching Mask Generation's two build mechanisms:
-  "atlas_region" — {atlas, label_ids, hemisphere}, built via
-                    discovery.generate_masks().
-  "combine"      — {sources: [mask_name, ...]}, built via
-                    discovery.combine_masks() once every source already
-                    exists for that subject — sources can themselves be
-                    atlas_region OR combine entries in the SAME book;
-                    build_missing_masks() resolves the dependency order.
+Three recipe kinds, matching Mask Generation's three build mechanisms:
+  "atlas_region"  — {atlas, label_ids, hemisphere}, built via
+                     discovery.generate_masks().
+  "combine"       — {sources: [mask_name, ...]}, built via
+                     discovery.combine_masks() once every source already
+                     exists for that subject — sources can themselves be
+                     any kind of entry in the SAME book; build_missing_
+                     masks() resolves the dependency order.
+  "external_mask" — {path, hemisphere, space, native_subject_id}, built
+                     via discovery.register_external_mask(). space is
+                     "mni_external" (default — warped the same way as an
+                     atlas; see create_masks.ExternalMaskSource for the
+                     accuracy caveat, path's own space must already agree
+                     with charm's MNI target) or "subject" (path is
+                     already in native_subject_id's own native space, no
+                     warp — copied/resampled through as-is, and refused
+                     for any OTHER subject, since it's inherently specific
+                     to the one subject it was captured for).
 
 Pure Python, no Dash import.
 """
@@ -222,6 +233,20 @@ def build_missing_masks(subject_ids: list[str], masks: dict, mask_names: list[st
                                    "error": f"source mask(s) still missing: {missing_src}"})
                         continue
                     r = discovery.combine_masks(sid, src_paths, dep_name, project_dir)
+                    out.append({"subject_id": sid, "mask_name": dep_name, "success": r["success"],
+                               "voxel_count": r.get("voxel_count"), "error": r.get("error")})
+                elif recipe.get("kind") == "external_mask":
+                    recipe_space = recipe.get("space", "mni_external")
+                    native_sid = recipe.get("native_subject_id")
+                    if recipe_space == "subject" and sid != native_sid:
+                        out.append({"subject_id": sid, "mask_name": dep_name, "success": False,
+                                   "voxel_count": None,
+                                   "error": f"this mask is native to subject {native_sid} only — "
+                                           f"can't be built for {sid}"})
+                        continue
+                    r = discovery.register_external_mask(
+                        [sid], recipe["path"], dep_name, hemisphere=recipe.get("hemisphere"),
+                        space=recipe_space, project_dir=project_dir)[0]
                     out.append({"subject_id": sid, "mask_name": dep_name, "success": r["success"],
                                "voxel_count": r.get("voxel_count"), "error": r.get("error")})
                 else:

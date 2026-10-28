@@ -1163,11 +1163,12 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
     # A montage is rejected if ANY two of its four active electrodes are adjacent.
     adj_elec_pairs: set = set()
 
-    # Electrode positions are needed both for adjacency filtering (below) and
-    # for the hierarchical search (STEP 3) — parsed once, reused by whichever
-    # (or both) is enabled.
+    # Electrode positions are needed for adjacency filtering, the quadrant
+    # constraint (both below), and the hierarchical search (STEP 3) —
+    # parsed once, reused by whichever (or all) are enabled.
     _cap_pos: dict = {}
-    if cfg.optimizer.no_adjacent_electrodes or cfg.optimizer.use_hierarchical_search:
+    if (cfg.optimizer.no_adjacent_electrodes or cfg.optimizer.use_hierarchical_search
+            or cfg.optimizer.use_quadrant_constraint):
         _cap_pos = _load_cap_positions(cfg.eeg_csv_path)
 
     if cfg.optimizer.no_adjacent_electrodes:
@@ -1220,6 +1221,54 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
                       f"{len(_lf_elecs)} electrodes)")
 
     # ════════════════════════════════════════════════════════════════════════
+    # STEP 2c — Quadrant constraint (opt-in, independent of adjacency/tiers)
+    # ════════════════════════════════════════════════════════════════════════
+    # quadrant_pairs: same shape as adj_elec_pairs (frozenset({nameA, nameB}))
+    # — electrode pairs that may never co-occur in a 4-electrode montage,
+    # here because they'd fall in the same scalp quadrant. See
+    # use_quadrant_constraint's docstring in config.py for the geometric
+    # midline-detection method (mirror-symmetry, not name-based).
+    quadrant_pairs: set = set()
+    if cfg.optimizer.use_quadrant_constraint:
+        _lf_elecs = [n for n in all_elec_names if n in _cap_pos]
+        if len(_lf_elecs) < 4:
+            print(f"  WARNING: quadrant constraint enabled but fewer than 4 "
+                  f"electrodes have known positions — skipping.")
+        else:
+            _pos_arr = np.array([_cap_pos[n] for n in _lf_elecs])
+            _mirrored = _pos_arr.copy()
+            _mirrored[:, 0] *= -1   # reflect left/right coordinate
+            _dist_to_mirror = np.linalg.norm(_mirrored[:, None, :] - _pos_arr[None, :, :], axis=2)
+            _nearest_to_mirror = _dist_to_mirror.argmin(axis=1)
+            _is_midline = (_nearest_to_mirror == np.arange(len(_lf_elecs)))
+            _mid_idx = np.flatnonzero(_is_midline)
+            if len(_mid_idx) == 0:
+                print(f"  WARNING: quadrant constraint enabled but no midline "
+                      f"electrode was detected on this cap (none is its own "
+                      f"left/right mirror match) — skipping.")
+            else:
+                _vtx_i   = _mid_idx[np.argmax(_pos_arr[_mid_idx, 2])]   # most superior midline electrode
+                _y_pivot = _pos_arr[_vtx_i, 1]
+                _quad: dict = {}
+                for _i, _n in enumerate(_lf_elecs):
+                    if not _is_midline[_i]:
+                        _quad[_n] = (float(np.sign(_pos_arr[_i, 0])), float(np.sign(_pos_arr[_i, 1] - _y_pivot)))
+                _qnames = list(_quad.keys())
+                for _ia in range(len(_qnames)):
+                    for _ib in range(_ia + 1, len(_qnames)):
+                        if _quad[_qnames[_ia]] == _quad[_qnames[_ib]]:
+                            quadrant_pairs.add(frozenset([_qnames[_ia], _qnames[_ib]]))
+                print(f"  Quadrant constraint: {len(_mid_idx)} midline electrode(s) exempt "
+                      f"(vertex: {_lf_elecs[_vtx_i]}) — {len(_quad)} electrodes split across "
+                      f"4 quadrants, {len(quadrant_pairs)} same-quadrant pairs excluded")
+
+    # Pairs that may never co-occur in a montage, from either mechanism above
+    # — adjacency and the quadrant constraint are independent opt-ins (each
+    # its own flag, its own log line, no shared logic) that happen to share
+    # the same "forbidden pair" enforcement mechanism below.
+    excluded_pairs = adj_elec_pairs | quadrant_pairs
+
+    # ════════════════════════════════════════════════════════════════════════
     # STEP 3 — Exhaustive search over all electrode pair combinations
     # ════════════════════════════════════════════════════════════════════════
     '''The part of the code where the exhaustive search is performed. 
@@ -1240,12 +1289,13 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         return TI.get_field([e_plus, e_minus, I], lf_subset, idx_lf)
 
     # Pre-filter: build neighbour lookup from the (subset-independent) global
-    # adjacency set once — reused unchanged by every round of search below,
-    # since it only depends on cap topology, not on which electrodes are
-    # currently being searched.
+    # excluded-pairs set once — reused unchanged by every round of search
+    # below, since it only depends on cap topology, not on which electrodes
+    # are currently being searched. Covers both adjacency and the quadrant
+    # constraint (see excluded_pairs above).
     nb_dict: dict = {}
-    if adj_elec_pairs:
-        for _p in adj_elec_pairs:
+    if excluded_pairs:
+        for _p in excluded_pairs:
             _a, _b = list(_p)
             nb_dict.setdefault(_a, set()).add(_b)
             nb_dict.setdefault(_b, set()).add(_a)
@@ -1297,8 +1347,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         for the default (non-hierarchical) path, or iteratively with growing/
         shrinking subsets for the hierarchical path."""
         pairs = list(combinations(candidate_names, 2))
-        valid_pairs = ([p for p in pairs if frozenset(p) not in adj_elec_pairs]
-                       if adj_elec_pairs else pairs)
+        valid_pairs = ([p for p in pairs if frozenset(p) not in excluded_pairs]
+                       if excluded_pairs else pairs)
         n_valid  = len(valid_pairs)
         n_combos = _count_combos(valid_pairs)
         print(f"\n  Searching {n_combos} montages ({n_valid} valid single-channel "
@@ -1825,6 +1875,8 @@ def run_exhaustive_cap_optimization(cfg: PipelineConfig, force: bool = False,
         "n_montages_searched": n_eval,
         "no_adjacent_electrodes": cfg.optimizer.no_adjacent_electrodes,
         "n_adjacent_pairs_excluded": len(adj_elec_pairs),
+        "use_quadrant_constraint": cfg.optimizer.use_quadrant_constraint,
+        "n_quadrant_pairs_excluded": len(quadrant_pairs),
         "elapsed_s":         round(elapsed, 1),
         "best_montage": {
             "ch1_plus":    best_ch1[0],

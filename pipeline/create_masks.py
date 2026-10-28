@@ -21,10 +21,20 @@ FreeSurferAtlas  aparc+aseg from recon-all — NOT YET USABLE. Defined as a
                placeholder; needs recon-all to have been run for the subject,
                and the subject-native transform hasn't been verified (may not
                coincide with charm's own "Conform" space).
+ExternalMaskSource  any single pre-built binary/label NIfTI mask, by file path
+               — for a one-off mask that isn't part of a registered atlas
+               (e.g. a confidential externally-supplied ROI). Same warp
+               mechanism as BNAAtlas/AllenAtlas; accuracy depends entirely on
+               how well the file's own space agrees with charm's MNI target —
+               see code/resources/atlases/BF/ for an example that was first
+               corrected (one-time registration to SimNIBS's own MNI152_T1_1mm)
+               before being used this way, since its native template space
+               was neither of the above.
 
-Both BNAAtlas and AllenAtlas share the exact same warp mechanism (nearest-
-neighbour lookup through charm's Conform2MNI_nonl.nii.gz field) — that logic
-lives once in MaskGeneratorEngine._warp_to_subject, not duplicated per source.
+BNAAtlas, AllenAtlas, and ExternalMaskSource all share the exact same warp
+mechanism (nearest-neighbour lookup through charm's Conform2MNI_nonl.nii.gz
+field) — that logic lives once in MaskGeneratorEngine._warp_to_subject, not
+duplicated per source.
 """
 
 from __future__ import annotations
@@ -85,21 +95,35 @@ class BNAAtlas(LabelSourceBase):
     """Brainnetome atlas, FSL MNI152 space."""
     space = "mni_fsl152"
 
-    def __init__(self, atlas_path):
+    def __init__(self, atlas_path, lut_path=None):
         # No hardcoded default: SCITAS runs inside the Apptainer container
         # (Linux, /mnt/BIDS_TI_Toolbox/...), not this Windows machine — the
         # caller must always pass the correct path for its own environment.
+        # lut_path is optional (some callers, e.g. run_pipeline.py's own
+        # BNA warp step, only need _load_labels() and never call lut()).
         self.atlas_path = atlas_path
+        self.lut_path = lut_path
 
     def _load_labels(self):
         img = nib.load(self.atlas_path)
         return np.asarray(img.dataobj), img.affine
 
     def lut(self):
-        """No BNA label-name CSV is present in this project (only the
-        .nii.gz volume) — name-based lookup isn't available for BNA yet,
-        only numeric ids. Returns None."""
-        return None
+        """{id: name} from the official Brainnetome Atlas region table (Fan
+        et al. 2016), FSL-LUT-style format ("index name R G B A", one row
+        per region, e.g. "187 A32sg_L ..."). Names already carry their own
+        _L/_R hemisphere suffix. Returns None if this instance was built
+        without a lut_path (not every caller needs name-based lookup)."""
+        if not self.lut_path:
+            return None
+        out = {}
+        with open(self.lut_path) as f:
+            next(f)  # header: "index name R G B A"
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    out[int(parts[0])] = parts[1]
+        return out
 
 
 class AllenAtlas(LabelSourceBase):
@@ -125,6 +149,50 @@ class AllenAtlas(LabelSourceBase):
             for row in csv.DictReader(f):
                 out[int(row["id"])] = row["acronym"]
         return out
+
+
+class ExternalMaskSource(LabelSourceBase):
+    """Any single pre-built NIfTI mask, by file path — generalizes "atlas"
+    to "arbitrary file", so a one-off external mask never needs its own
+    registered ATLAS_REGISTRY entry or LabelSource subclass. Treated as
+    purely binary (nonzero -> included) regardless of what values the file
+    actually holds; callers always pass label_ids={name: 1} since there's
+    no per-region lut (no lut() override — base class default of None is
+    correct here: _resolve_ids() already passes numeric selectors through
+    unvalidated when lut() is None).
+
+    space is caller-chosen, not fixed — the file could be in either of the
+    two kinds every other source here already is:
+      "mni_external" (default) — needs charm's nonlinear MNI warp, same
+                     non-"subject" branch BNAAtlas/AllenAtlas use. Accuracy
+                     depends entirely on how well mask_path's own affine
+                     already agrees with charm's MNI target; if it doesn't
+                     (a template this project hasn't seen before), that's a
+                     one-time registration to fix BEFORE using this class —
+                     see code/resources/atlases/BF/ for a worked example.
+      "subject"      — mask_path is ALREADY in THIS ONE SPECIFIC subject's
+                     own native space (e.g. produced by some other tool
+                     directly there) — copied through as-is if the grid
+                     already matches exactly, or resampled onto the
+                     reference grid with NO MNI warp otherwise (identical
+                     to how SimNIBSAtlas/FreeSurferAtlas already behave).
+                     Inherently specific to one subject, unlike every other
+                     source here — passing it for a DIFFERENT subject would
+                     silently place one subject's anatomy into another's
+                     roi/ folder. Callers (discovery.register_external_mask)
+                     are responsible for refusing that, not this class."""
+
+    def __init__(self, mask_path, space="mni_external"):
+        self.mask_path = mask_path
+        self.space = space
+
+    def _load_labels(self):
+        img = nib.load(self.mask_path)
+        data = (np.asarray(img.dataobj) > 0.5).astype(np.int32)
+        return data, img.affine
+
+    def cache_key(self):
+        return ("ExternalMaskSource", self.mask_path, self.space)
 
 
 def _load_freesurfer_lut():

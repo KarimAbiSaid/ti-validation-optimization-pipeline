@@ -54,15 +54,15 @@ def _referenced_mask_names(preference: dict) -> list[str]:
 
 def _resolve_recipe(masks: dict, name: str | None) -> tuple[str | None, dict]:
     """(atlas, label_ids) for name in `masks` (the preference's own frozen
-    recipe dict). None/{} for a "combine" recipe, or an unknown name — same
-    "the file must already exist" convention build_roi_dict() already uses
-    for Allen-sourced masks; actually building it is "masks" step's job
-    (via mask_recipe_discovery.build_missing_masks), already done by the
-    time config generation runs."""
+    recipe dict). None/{} for a "combine" or "external_mask" recipe (no
+    single atlas), or an unknown name — same "the file must already exist"
+    convention build_roi_dict() already uses for Allen-sourced masks;
+    actually building it is "masks" step's job (via mask_recipe_discovery.
+    build_missing_masks), already done by the time config generation runs."""
     if not name:
         return None, {}
     recipe = masks.get(name) or {}
-    if recipe.get("kind") == "combine":
+    if recipe.get("kind") in ("combine", "external_mask"):
         return None, {}
     return recipe.get("atlas"), recipe.get("label_ids") or {}
 

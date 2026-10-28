@@ -472,7 +472,15 @@ def _build_ti_figure(result, plot_type, normalize_hist=False):
         xaxis_title="TI amplitude (V/m)",
         yaxis_title=("Normalized (peak = 1)" if normalized
                     else "Tissue volume (mm³)" if plot_type == "hist" else "Density (volume-weighted)"),
-        margin=dict(l=10, r=10, t=30, b=10), height=420, legend=dict(font=dict(size=11)),
+        margin=dict(l=10, r=10, t=30, b=90),
+        height=420,
+        # Below the plot instead of Plotly's default right-hand-side column —
+        # long "{region} — {subject/run}" trace names otherwise squeeze the
+        # plot area width-wise. Horizontal orientation wraps across multiple
+        # rows on its own as entries accumulate; the bottom margin above
+        # leaves room for a couple of wrapped rows without the legend
+        # overlapping the x-axis title.
+        legend=dict(font=dict(size=11), orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0),
     )
     return fig
 
@@ -495,7 +503,9 @@ def _build_angle_figure(result):
     fig.update_layout(
         barmode="overlay", xaxis_title="Angle between E_ch1 and E_ch2 (degrees)",
         yaxis_title="Tissue volume (mm³)",
-        margin=dict(l=10, r=10, t=30, b=10), height=340, legend=dict(font=dict(size=11)),
+        margin=dict(l=10, r=10, t=30, b=90),
+        height=340,
+        legend=dict(font=dict(size=11), orientation="h", yanchor="top", y=-0.18, xanchor="left", x=0),
     )
     return fig
 
@@ -739,7 +749,7 @@ def _on_preview_click(_n_clicks, run_idx, roi_name, mode, cap_name, rows):
         # specifically "where is this region", a location question, so
         # coloring only inside it against an otherwise-grayscale backdrop
         # makes that location the most legible thing on screen.
-        jr.start_local_job(job_dir, vz.build_slice_frames, subject_id, msh_path, [roi_name], roi_only=True)
+        jr.start_local_job(job_dir, vz.build_slice_frames, subject_id, msh_path, [roi_name], roi_only=False)
         return job_dir, mode, False, html.Div("Building — polling every 2s...", style={"color": "#666"})
 
     if not cap_name:

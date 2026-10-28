@@ -38,6 +38,7 @@
     "focality_threshold": [0.24, 0.3],
     "hard_roi_constraint": true,
     "no_adjacent_electrodes": true,
+    "use_quadrant_constraint": false,
     "non_roi_hard_constraint_groups": [{"name": "rsc_floor", "mask_name": "RSC_BNA", "max_mean_V_m": 0.12}],
     "roi_hard_constraint_groups": [],
     "use_hierarchical_search": false,

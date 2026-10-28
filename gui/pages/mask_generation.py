@@ -26,6 +26,13 @@ dash.register_page(__name__, path="/masks", name="Mask Generation", category="Pr
 
 ATLAS_NAMES = list(discovery.ATLAS_REGISTRY.keys())
 
+# A sentinel "atlas" value, alongside the real ATLAS_REGISTRY entries in the
+# same dropdown — picking it swaps the region-picker for a bare path input
+# (see _update_atlas_panel) and _on_generate_click routes to
+# discovery.register_external_mask() instead of generate_masks(). Not a
+# real atlas: no registry entry, no suffix auto-appended to the name.
+EXTERNAL_MASK_VALUE = "__external_mask__"
+
 
 def _slice_figure(t1_slice, mask_slice, title, h_mm=1.0, v_mm=1.0):
     v_dim, h_dim = t1_slice.shape
@@ -88,7 +95,8 @@ layout = html.Div([
                     {"label": name + ("" if meta["usable"] else "  (not yet usable)"),
                      "value": name, "disabled": not meta["usable"]}
                     for name, meta in discovery.ATLAS_REGISTRY.items()
-                ],
+                ] + [{"label": "External mask — type a path to any NIfTI mask",
+                     "value": EXTERNAL_MASK_VALUE}],
                 placeholder="Select atlas...",
             ),
             html.Div(id="mg-atlas-note", style={"fontStyle": "italic", "fontSize": "13px", "margin": "0.5rem 0"}),
@@ -103,6 +111,31 @@ layout = html.Div([
 
             html.H4("Region selection"),
             html.Div(id="mg-region-picker"),
+
+            # Always present (never conditionally mounted/unmounted) even
+            # though it's only relevant for the "External mask" atlas
+            # choice — Dash's front-end throws "nonexistent object" errors
+            # for callbacks referencing a component that gets torn down and
+            # rebuilt on every atlas switch, even with prevent_initial_call.
+            # Visibility (not existence) is toggled by _update_atlas_panel.
+            html.Div(id="mg-ext-mask-container", style={"display": "none"}, children=[
+                html.Label("Path to mask file (.nii / .nii.gz)"),
+                dcc.Input(id="mg-ext-mask-path", type="text", style={"width": "100%"},
+                          placeholder=r"e.g. D:\project\external_masks\hippocampus.nii.gz"),
+                html.Label("This mask is already in:", style={"marginTop": "0.5rem", "display": "block"}),
+                dcc.RadioItems(
+                    id="mg-ext-mask-space",
+                    options=[
+                        {"label": " MNI-ish space — needs warping into each selected subject, same as "
+                                  "an atlas region", "value": "mni_external"},
+                        {"label": " One specific subject's own native space already — no warping, just "
+                                  "placed into that subject's roi/ folder (resampled onto the reference "
+                                  "grid if needed, but no MNI warp). Only usable for exactly one "
+                                  "subject — select just that one above.", "value": "subject"},
+                    ],
+                    value="mni_external",
+                ),
+            ]),
 
             html.H4("Mask output settings"),
             html.Div([
@@ -399,7 +432,10 @@ def _on_combine_click(_n_clicks, subject_id, mask_paths, name, save_recipe_value
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Atlas panel: path check + region picker (now also feeds the lut store)
+# Atlas panel: path check + region picker (now also feeds the lut store) —
+# or, for EXTERNAL_MASK_VALUE, a bare path input in place of both, since
+# there's no registry/region list for a one-off external mask.
+# ═════════════════════════════════════════════════════════════════════════════
 # ═════════════════════════════════════════════════════════════════════════════
 
 @callback(
@@ -407,12 +443,25 @@ def _on_combine_click(_n_clicks, subject_id, mask_paths, name, save_recipe_value
     Output("mg-path-table", "data"),
     Output("mg-region-picker", "children"),
     Output("mg-region-lut-store", "data"),
+    Output("mg-ext-mask-container", "style"),
     Input("mg-subject-dropdown", "value"),
     Input("mg-atlas-dropdown", "value"),
 )
 def _update_atlas_panel(subject_ids, atlas_name):
+    hidden = {"display": "none"}
+    shown = {"display": "block"}
+
     if not subject_ids or not atlas_name:
-        return "", [], html.Div("Select at least one subject and an atlas first."), None
+        return "", [], html.Div("Select at least one subject and an atlas first."), None, hidden
+
+    if atlas_name == EXTERNAL_MASK_VALUE:
+        note = ("Any standalone NIfTI mask, warped into each selected subject through the same "
+                "per-subject MNI warp every atlas above uses — no registry entry needed. Only "
+                "accurate if the file's own space already agrees with charm's MNI target (same "
+                "template SimNIBS itself registers to); a template this project hasn't used "
+                "before needs a one-time correction first, not something this page does for you. "
+                "The name below is used exactly as typed — no atlas suffix is added.")
+        return note, [], html.Div(), None, shown
 
     meta = discovery.ATLAS_REGISTRY[atlas_name]
 
@@ -458,7 +507,7 @@ def _update_atlas_panel(subject_ids, atlas_name):
                                       placeholder="Search regions...")
             lut_data = lut
 
-    return meta["note"], table_data, region_ui, lut_data
+    return meta["note"], table_data, region_ui, lut_data, hidden
 
 
 @callback(
@@ -533,6 +582,8 @@ def _sync_bna_selection(text):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _effective_name(name, atlas_name):
+    if atlas_name == EXTERNAL_MASK_VALUE:
+        return name.strip() if name and name.strip() else None
     return f"{name}_{atlas_name}" if name and atlas_name else None
 
 
@@ -548,8 +599,14 @@ def _update_generate_table(subject_ids, atlas_name, name, prev_selected):
     if not subject_ids or not atlas_name:
         return [], []
 
-    matrix = discovery.atlas_availability_matrix(subject_ids)
-    ready_subjects = [sid for sid in subject_ids if matrix[sid][atlas_name]["ready"]]
+    if atlas_name == EXTERNAL_MASK_VALUE:
+        # Only real prerequisite is an m2m folder (same as ExternalMaskSource's
+        # own warp needs) — no atlas-specific files to check.
+        has_m2m = {s["subject_id"]: s["has_m2m"] for s in discovery.discover_subjects()}
+        ready_subjects = [sid for sid in subject_ids if has_m2m.get(sid)]
+    else:
+        matrix = discovery.atlas_availability_matrix(subject_ids)
+        ready_subjects = [sid for sid in subject_ids if matrix[sid][atlas_name]["ready"]]
 
     eff_name = _effective_name(name, atlas_name)
     rows = []
@@ -591,11 +648,18 @@ def _select_all_ready(_n_clicks, data):
     Output("mg-generate-button", "disabled"),
     Input("mg-generate-table", "data"),
     Input("mg-generate-table", "selected_rows"),
+    Input("mg-atlas-dropdown", "value"),
     Input("mg-mask-name", "value"),
     Input("mg-selected-label-ids-store", "data"),
+    Input("mg-ext-mask-path", "value"),
+    Input("mg-ext-mask-space", "value"),
     Input("mg-overwrite-confirm", "value"),
+    prevent_initial_call=True,  # mg-generate-button already defaults to
+    # disabled=True in the static layout, so skipping the initial automatic
+    # firing here costs nothing.
 )
-def _update_generate_readiness(rows, selected_rows, name, label_ids, confirm_value):
+def _update_generate_readiness(rows, selected_rows, atlas_name, name, label_ids, ext_mask_path,
+                               ext_mask_space, confirm_value):
     rows = rows or []
     selected_rows = selected_rows or []
     selected = [rows[i] for i in selected_rows if i < len(rows)]
@@ -605,7 +669,13 @@ def _update_generate_readiness(rows, selected_rows, name, label_ids, confirm_val
         problems.append("select at least one ready subject")
     if not name:
         problems.append("enter a mask name")
-    if not label_ids:
+    if atlas_name == EXTERNAL_MASK_VALUE:
+        if not ext_mask_path or not os.path.isfile(ext_mask_path):
+            problems.append("enter a valid path to an existing mask file")
+        if ext_mask_space == "subject" and len(selected) > 1:
+            problems.append("a subject-space mask can only be built for one subject at a time — "
+                            "select just one")
+    elif not label_ids:
         problems.append("select at least one region")
 
     overwrite_rows = [r for r in selected if r["overwrite_display"].startswith("⚠")]
@@ -636,32 +706,57 @@ def _update_generate_readiness(rows, selected_rows, name, label_ids, confirm_val
     State("mg-mask-name", "value"),
     State("mg-hemisphere", "value"),
     State("mg-selected-label-ids-store", "data"),
+    State("mg-ext-mask-path", "value"),
+    State("mg-ext-mask-space", "value"),
     State("mg-save-recipe-check", "value"),
     State("mg-recipe-book-name", "value"),
     prevent_initial_call=True,
 )
 def _on_generate_click(_n_clicks, rows, selected_rows, atlas_name, name, hemisphere, label_ids,
-                       save_recipe_value, recipe_book_name):
+                       ext_mask_path, ext_mask_space, save_recipe_value, recipe_book_name):
     rows = rows or []
     selected_rows = selected_rows or []
     subject_ids = [rows[i]["subject"] for i in selected_rows if i < len(rows)]
     eff_name = _effective_name(name, atlas_name)
-
-    if not subject_ids or not label_ids or not eff_name:
-        return html.Div("Nothing to generate — check subject/region/name selection.",
-                         style={"color": "#a00"})
-
+    is_external = atlas_name == EXTERNAL_MASK_VALUE
     hemi = None if hemisphere in (None, "None") else hemisphere
-    results = discovery.generate_masks(subject_ids, atlas_name, label_ids, eff_name, hemisphere=hemi)
+
+    if not subject_ids or not eff_name:
+        return html.Div("Nothing to generate — check subject/name selection.", style={"color": "#a00"})
+
+    if is_external:
+        if not ext_mask_path or not os.path.isfile(ext_mask_path):
+            return html.Div(f"Mask file not found: {ext_mask_path!r}", style={"color": "#a00"})
+        if ext_mask_space == "subject" and len(subject_ids) > 1:
+            return html.Div("A subject-space mask can only be built for one subject at a time — "
+                            "select just one.", style={"color": "#a00"})
+        results = discovery.register_external_mask(subject_ids, ext_mask_path, eff_name,
+                                                    hemisphere=hemi, space=ext_mask_space)
+    else:
+        if not label_ids:
+            return html.Div("Nothing to generate — check subject/region/name selection.",
+                            style={"color": "#a00"})
+        results = discovery.generate_masks(subject_ids, atlas_name, label_ids, eff_name, hemisphere=hemi)
 
     recipe_note = None
     if "save" in (save_recipe_value or []):
         book_name = (recipe_book_name or "").strip()
         if not book_name:
             recipe_note = html.P("⚠ recipe not saved — enter a recipe book name.", style={"color": "#a00"})
-        else:
+        elif is_external and ext_mask_space == "subject":
+            recipe_note = html.P(
+                f"ℹ recipe '{eff_name}' saved as subject-space, native to {subject_ids[0]} only — "
+                "applying it to any other subject will be refused, by design.", style={"color": "#666"})
             r = mrd.upsert_mask_recipe(book_name, eff_name, {
-                "kind": "atlas_region", "atlas": atlas_name, "label_ids": label_ids, "hemisphere": hemi})
+                "kind": "external_mask", "path": ext_mask_path, "hemisphere": hemi,
+                "space": "subject", "native_subject_id": subject_ids[0]})
+            if not r["success"]:
+                recipe_note = html.P(f"✗ recipe not saved — {r['error']}", style={"color": "#a00"})
+        else:
+            recipe = ({"kind": "external_mask", "path": ext_mask_path, "hemisphere": hemi,
+                      "space": "mni_external"} if is_external
+                     else {"kind": "atlas_region", "atlas": atlas_name, "label_ids": label_ids, "hemisphere": hemi})
+            r = mrd.upsert_mask_recipe(book_name, eff_name, recipe)
             if r["success"]:
                 verb = "replaced" if r["replaced"] else "added"
                 recipe_note = html.P(f"✓ recipe '{eff_name}' {verb} in '{book_name}' → {r['path']}",

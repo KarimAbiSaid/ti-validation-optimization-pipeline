@@ -39,10 +39,13 @@ ATLAS_REGISTRY = {
     },
     "BNA": {
         "usable": True,
-        "note": "Brainnetome atlas, MNI FSL152 space. No name lut in this project — numeric ids only.",
-        "has_lut": False,
+        "note": "Brainnetome atlas, MNI FSL152 space. Region names are the official Fan et al. "
+               "2016 scheme (e.g. A32sg = subgenual ACC, A23v = retrosplenial/posterior cingulate) "
+               "— odd ids are left hemisphere, even are right.",
+        "has_lut": True,
         "extra_paths": {
             "atlas_path": os.path.join(RESOURCES_DIR, "atlases", "BN_Atlas_246_1mm.nii.gz"),
+            "lut_path": os.path.join(RESOURCES_DIR, "atlases", "BN_Atlas_246_LUT.txt"),
         },
     },
     "Allen": {
@@ -144,10 +147,14 @@ def build_lut(atlas_name: str, subject_id: str | None = None,
     if not entry["has_lut"]:
         return None
 
-    from create_masks import SimNIBSAtlas, AllenAtlas, FreeSurferAtlas
+    from create_masks import SimNIBSAtlas, BNAAtlas, AllenAtlas, FreeSurferAtlas
 
     if atlas_name == "SimNIBS":
         return SimNIBSAtlas(get_m2m_path(subject_id, project_dir)).lut()
+
+    if atlas_name == "BNA":
+        p = atlas_check_paths("BNA", project_dir=project_dir)
+        return BNAAtlas(p["atlas_path"], p["lut_path"]).lut()
 
     if atlas_name == "Allen":
         p = atlas_check_paths("Allen", project_dir=project_dir)
@@ -190,7 +197,7 @@ def _build_source(atlas_name: str, subject_id: str, project_dir: str = PROJECT_D
         return SimNIBSAtlas(get_m2m_path(subject_id, project_dir))
     if atlas_name == "BNA":
         p = atlas_check_paths("BNA", subject_id, project_dir)
-        return BNAAtlas(p["atlas_path"])
+        return BNAAtlas(p["atlas_path"], p["lut_path"])
     if atlas_name == "Allen":
         p = atlas_check_paths("Allen", subject_id, project_dir)
         return AllenAtlas(p["atlas_path"], p["roi_list_path"])
@@ -219,6 +226,54 @@ def generate_masks(subject_ids: list[str], atlas_name: str, label_ids: dict,
             engine = MaskGeneratorEngine(subject=sid, project_dir=project_dir)
             source = _build_source(atlas_name, sid, project_dir)
             mask = engine.create_named_mask(source, label_ids, name, hemisphere=hemisphere)
+
+            results.append({
+                "subject_id": sid, "success": True,
+                "voxel_count": int(mask.sum()),
+                "out_path": expected_mask_path(sid, name, project_dir),
+                "error": None,
+            })
+        except Exception as e:
+            results.append({"subject_id": sid, "success": False, "voxel_count": None,
+                             "out_path": None, "error": str(e)})
+    return results
+
+
+def register_external_mask(subject_ids: list[str], mask_path: str, name: str,
+                           hemisphere: str | None = None, space: str = "mni_external",
+                           project_dir: str = PROJECT_DIR) -> list[dict]:
+    """Same per-subject warp as generate_masks(), for an arbitrary one-off
+    mask file instead of a registered ATLAS_REGISTRY atlas — no "type"/lut,
+    always binary (nonzero -> included).
+
+    space: "mni_external" (default) — mask_path is in an MNI-ish space and
+           gets charm's nonlinear warp, same as an atlas. See create_masks.
+           ExternalMaskSource for the accuracy caveat (mask_path's own
+           space must already agree with charm's MNI target, or needs a
+           one-time correction first).
+           "subject" — mask_path is ALREADY in one specific subject's own
+           native space (copied/resampled through with NO MNI warp). This
+           is inherently tied to exactly one subject (unlike every other
+           option here) — refused for more than one subject_id, since
+           applying one subject's native-space mask to a different subject
+           would silently place the wrong anatomy in their roi/ folder.
+
+    Returns the same shape generate_masks() does — one subject's failure
+    doesn't stop the rest."""
+    if space == "subject" and len(subject_ids) > 1:
+        return [{"subject_id": sid, "success": False, "voxel_count": None, "out_path": None,
+                "error": "a subject-space mask belongs to exactly one subject — select only "
+                        "that one subject, not multiple"}
+               for sid in subject_ids]
+
+    from create_masks import ExternalMaskSource, MaskGeneratorEngine
+
+    results = []
+    for sid in subject_ids:
+        try:
+            engine = MaskGeneratorEngine(subject=sid, project_dir=project_dir)
+            source = ExternalMaskSource(mask_path, space=space)
+            mask = engine.create_named_mask(source, {name: 1}, name, hemisphere=hemisphere)
 
             results.append({
                 "subject_id": sid, "success": True,

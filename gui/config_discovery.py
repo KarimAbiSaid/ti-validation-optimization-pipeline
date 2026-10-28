@@ -46,6 +46,7 @@ OPTIMIZER_DEFAULTS = {
     "max_non_roi_elements":   150_000,
     "hard_roi_constraint":    True,
     "no_adjacent_electrodes": True,
+    "use_quadrant_constraint": True,
     "non_roi_hard_constraint_groups": [],
     "roi_hard_constraint_groups": [],
     "use_hierarchical_search":   False,
